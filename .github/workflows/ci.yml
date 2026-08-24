@@ -65,12 +65,12 @@ jobs:
 
       - name: Tests and coverage
         run: |
-          uv run pytest -q --junitxml=junit.xml --cov=sniper_bot --cov-fail-under=70 --cov-report=term-missing --cov-report=xml:coverage.xml
+          uv run python -m pytest -q --junitxml=junit.xml --cov=sniper_bot --cov-fail-under=70 --cov-report=term-missing --cov-report=xml:coverage.xml
           printf '%s tests\n' "$GITHUB_SHA" > ci-gates/tests.ok
 
       - name: Deterministic golden replay
         run: |
-          uv run pytest -q tests/test_replay.py tests/test_replay_golden.py
+          uv run python -m pytest -q tests/test_replay.py tests/test_replay_golden.py
           printf '%s deterministic_replay\n' "$GITHUB_SHA" > ci-gates/deterministic_replay.ok
 
       - name: Internal latency NFR
