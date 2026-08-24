@@ -18,3 +18,5 @@ tmp*/
 .uv-cache/
 .coverage
 *.egg-info/
+coverage.xml
+junit.xml
