@@ -16,6 +16,7 @@ from sniper_bot.runtime import SniperRuntime
 def _base_config(*, mode: str, replay_seed: int | None = 17, time_zone: str = "Europe/Kyiv") -> dict[str, object]:
     return {
         "APP_MODE": mode,
+        "APP_REVISION": "",
         "HELIUS_API_KEY": "helius-key",
         "JUPITER_API_KEY": "jupiter-key",
         "POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db",
