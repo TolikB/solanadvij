@@ -1,0 +1,87 @@
+services:
+  migrate:
+    build: .
+    env_file: .env
+    command: ["/bin/sh", "-ec", "python -m alembic upgrade head && python scripts/grant_app_role.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  sniper-bot:
+    build: .
+    env_file: .env
+    environment:
+      APP_REVISION: ${APP_REVISION:?APP_REVISION is required}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    volumes:
+      - bot-data:/app/data
+    read_only: true
+    tmpfs:
+      - /app/tmp:size=64m,mode=1777
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  postgres:
+    image: postgres:16
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      SNIPER_DB_USER: ${SNIPER_DB_USER:?SNIPER_DB_USER is required}
+      SNIPER_DB_PASSWORD: ${SNIPER_DB_PASSWORD:?SNIPER_DB_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sh:/docker-entrypoint-initdb.d/10-sniper-role.sh:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  backup:
+    image: postgres:16
+    env_file: .env
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      while true; do
+        /scripts/backup.sh;
+        sleep 86400;
+      done
+    volumes:
+      - ./scripts:/scripts:ro
+      - backups:/backups
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  bot-data:
+  pg-data:
+  backups:

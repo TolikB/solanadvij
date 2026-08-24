@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+from decimal import Decimal
+
+import pytest
+
+from sniper_bot.config import AppConfig
+from sniper_bot.runtime import SniperRuntime
+
+
+def _base_config(mode: str) -> dict[str, object]:
+    return {
+        "APP_MODE": mode,
+        "HELIUS_API_KEY": "helius-key",
+        "JUPITER_API_KEY": "jupiter-key",
+        "POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db",
+        "TELEGRAM_BOT_TOKEN": "telegram-token",
+        "TELEGRAM_ADMIN_CHAT_ID": 123456,
+        "STARTING_EQUITY_USD": Decimal("500"),
+    }
+
+
+def test_reports_build_with_no_trades(tmp_path) -> None:
+    runtime = SniperRuntime(AppConfig(**_base_config("paper")), data_dir=tmp_path)
+
+    daily = runtime.build_daily_report("2026-08-18")
+    all_time = runtime.build_all_time_report()
+
+    assert daily["period"] == "daily"
+    assert all_time["period"] == "all_time"
+    assert daily["date"] == "2026-08-18"
+    assert all_time["date"] == "all_time"
+    assert daily["equity_usd"] == "500"
+    assert daily["reconcile"]["is_reconciled"] is True
+    assert daily["sample_size_warning"] is True
+    assert daily["open_positions"] == []
+    assert daily["reconcile"]["equity_usd"] == all_time["reconcile"]["equity_usd"]
+    assert daily["reconcile"]["realized_pnl_usd"] == all_time["reconcile"]["realized_pnl_usd"]
+    assert daily["reconcile"]["expected_equity_usd"] == "500"
+    assert daily["pnl"] == "0"
+    assert all_time["pnl"] == "0"
+    assert all_time["period"] != daily["period"]
+
+
+def test_daily_report_matches_ledger_reconcile_in_realized_pnl(tmp_path) -> None:
+    runtime = SniperRuntime(AppConfig(**_base_config("paper")), data_dir=tmp_path)
+    # create one entry + one close fill to produce realized PnL and verify report aggregation
+    runtime.ledger.open_position(
+        token_mint="TOKEN",
+        usd_amount=Decimal("10"),
+        token_amount=Decimal("2"),
+        order_id="entry-1",
+        quote_id="quote-entry-1",
+    )
+    runtime.ledger.close_position(
+        token_mint="TOKEN",
+        usd_received=Decimal("11"),
+        token_closed=Decimal("2"),
+        order_id="exit-1",
+        quote_id="quote-exit-1",
+    )
+
+    reconcile = runtime.ledger.reconcile()
+    daily = runtime.build_daily_report()
+
+    assert daily["period"] == "daily"
+    assert daily["pnl"] == str(reconcile["realized_pnl_usd"])
+    assert daily["reconcile"]["is_reconciled"] is True
+    assert daily["reconcile"]["realized_pnl_usd"] == str(reconcile["realized_pnl_usd"])
+
+
+@pytest.mark.asyncio
+async def test_daily_report_if_not_sent_is_idempotent(tmp_path) -> None:
+    runtime = SniperRuntime(AppConfig(**_base_config("record")), data_dir=tmp_path)
+
+    first = await runtime.daily_report_if_not_sent(date="2026-08-18")
+    second = await runtime.daily_report_if_not_sent(date="2026-08-18")
+
+    assert first is not None
+    assert second is None
+    assert runtime._report_runs["last_daily_report_date"] == "2026-08-18"
+    assert runtime._report_runs["last_daily_report_id"] == str(first["report_id"])

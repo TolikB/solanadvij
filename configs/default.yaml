@@ -1,0 +1,110 @@
+APP_MODE: paper
+TIME_ZONE: "Europe/Kyiv"
+BASE_QUOTE_MINT: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+BASE_QUOTE_DECIMALS: 6
+HELIUS_API_KEY: ""
+JUPITER_API_KEY: ""
+POSTGRES_DSN: "postgresql+asyncpg://sniper:sniper@localhost:5432/sniper"
+TELEGRAM_BOT_TOKEN: ""
+TELEGRAM_ADMIN_CHAT_ID: 123456
+STARTING_EQUITY_USD: 500
+JUPITER_REPLAY_MODE: false
+REPLAY_SEED: null
+JUPITER_QUOTE_JOURNAL_PATH: "data/jupiter_quotes.ndjson"
+JUPITER_QUOTE_JOURNAL_RECORD: false
+risk:
+  risk_per_trade_pct: 0.005
+  hard_stop_pct: 0.15
+  max_position_usdc: 20
+  min_position_usdc: 8
+  max_exposure_usdc: 50
+  max_open_positions: 3
+  daily_loss_limit_usdc: 10
+  all_time_drawdown_limit_pct: 10
+  max_trades_per_day: 12
+  max_consecutive_losses: 3
+  daily_halt_after_consecutive_losses: 4
+  pause_minutes: 60
+  adverse_fill_bps: 50
+chain:
+  network: "mainnet-beta"
+  primary_commitment: "confirmed"
+  max_stream_lag_ms: 3000
+  warmup_seconds: 60
+paper:
+  execution_delay_ms: 1200
+  adverse_fill_bps: 50
+  exit_retry_interval_ms: 1000
+  exit_retry_timeout_seconds: 30
+  account_currency: "USDC"
+candidate:
+  min_pool_age_seconds: 45
+  max_pool_age_seconds: 180
+  min_observation_seconds: 45
+  max_return_since_pool_creation_pct: 2.50
+  min_pullback_pct: 0.10
+  max_pullback_pct: 0.25
+  score_watchlist: 72
+  score_entry: 80
+  score_confirmation_windows: 2
+  score_window_seconds: 5
+liquidity:
+  min_quote_liquidity_usd: 40000
+  max_market_cap_to_quote_liquidity: 25
+  max_position_to_quote_liquidity_pct: 0.0025
+  max_liquidity_drop_entry_30s_pct: 0.03
+  emergency_liquidity_drop_pct: 0.08
+execution:
+  quote_timeout_ms: 2500
+  max_quote_age_ms: 1500
+  max_quote_retries: 2
+  max_buy_price_impact_pct: 0.025
+  max_sell_price_impact_pct: 0.035
+  max_round_trip_loss_pct: 0.08
+  min_external_sellers: 5
+flow:
+  min_unique_buyers_60s: 25
+  min_buyer_acceleration: 1.3
+  min_unique_buyer_ratio: 0.30
+  max_transactions_per_trader: 4.0
+  min_buy_sell_volume_ratio: 1.5
+  max_buy_sell_volume_ratio: 5.0
+  max_top_5_buy_volume_share: 0.35
+  max_same_funder_buy_share: 0.20
+holders:
+  max_largest_holder_pct: 0.07
+  max_top_5_pct: 0.22
+  max_top_10_pct: 0.30
+  max_dev_holding_pct: 0.02
+  max_dev_cluster_pct: 0.05
+  max_related_cluster_pct: 0.15
+  max_unknown_supply_pct: 0.05
+exits:
+  take_profit_1_pct: 0.30
+  take_profit_1_size_pct: 0.50
+  take_profit_2_pct: 0.60
+  take_profit_2_size_pct: 0.25
+  trailing_stop_pct: 0.15
+  momentum_exit_windows: 2
+  no_new_high_timeout_seconds: 120
+  maximum_holding_seconds: 600
+telegram:
+  enabled: true
+  daily_report_time: "00:05"
+  include_all_time_with_daily: true
+enrichment:
+  enabled: true
+  timeout_ms: 2500
+  cache_seconds: 300
+  minimum_interval_ms: 250
+storage:
+  raw_events_enabled: true
+  raw_compression: "zstd"
+  raw_retention_days: 90
+reporting:
+  include_operational_costs: true
+  monthly_infrastructure_cost_usd: 0
+  minimum_sample_warning_trades: 30
+logging:
+  level: "INFO"
+  json_logs: true

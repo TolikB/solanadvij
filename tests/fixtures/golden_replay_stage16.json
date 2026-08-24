@@ -1,0 +1,35 @@
+{
+  "name": "golden_replay_v1",
+  "description": "Stage 16 baseline paper replay fixture",
+  "strategy_version": "aedc95ea47dda29a",
+  "config_hash": "aedc95ea47dda29a412e1e9b0d99576d86f946260d2d72d82719cc16a3f5f9dc",
+  "strategy_seed": 17,
+  "time_zone": "Europe/Kyiv",
+  "input_hash": "2bd54b7ff11310a3a0d8690b6b4e2b6dbd53475708953fa9991b111536e9264b",
+  "output_hash": "8de958fe1a323aa0b5007b7f89fbfd592ed2a7232b1b81f8eaffccf84f88d377",
+  "actions": [
+    {
+      "kind": "open",
+      "token_mint": "TOKEN",
+      "amount": "20",
+      "order_id": "open-1",
+      "delay_seconds": 0
+    },
+    {
+      "kind": "close",
+      "token_mint": "TOKEN",
+      "amount": "49",
+      "order_id": "close-1",
+      "delay_seconds": 0
+    }
+  ],
+  "final_reconcile": {
+    "equity_usd": "540.0015075376884422110552764",
+    "expected_realized_pnl_usd": "40.00150753768844221105527638",
+    "is_reconciled": "True",
+    "open_positions_count": "1",
+    "open_positions_notional_usd": "0.30150753768844221105527638",
+    "realized_pnl_usd": "40.00150753768844221105527638",
+    "total_exit_notional_usd": "59.700"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "period": "all_time",
+  "date": "all_time",
+  "timezone": "Europe/Kyiv",
+  "starting_equity_usd": "500.00",
+  "current_equity_usd": "537.60",
+  "net_pnl_usd": "37.60",
+  "return_pct": "0.0752",
+  "max_drawdown_pct": "0.0421",
+  "paper_entries": 126,
+  "closed_trades": 126,
+  "sample_size_warning": false,
+  "report_id": "example-only"
+}

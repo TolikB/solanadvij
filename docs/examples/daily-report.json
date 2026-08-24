@@ -1,0 +1,15 @@
+{
+  "period": "daily",
+  "date": "2026-08-18",
+  "timezone": "Europe/Kyiv",
+  "capital": {
+    "starting_equity_usd": "500.00",
+    "ending_equity_usd": "506.42",
+    "realized_pnl_usd": "6.42",
+    "economic_pnl_usd": "6.42"
+  },
+  "signals": {"new_pools": 824, "hard_rejects": 759, "paper_entries": 7},
+  "trades": {"closed": 7, "profitable": 4, "losing": 3, "win_rate": "0.5714"},
+  "sample_size_warning": true,
+  "report_id": "example-only"
+}

@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import pytest
+
+from sniper_bot.metrics import BotMetrics
+from sniper_bot.solana_rpc import SolanaRpcClient
+from sniper_bot.stream import (
+    EntryGate,
+    HeliusStreamGateway,
+    _SubscriptionHandshakeError,
+    _UseLogsFallback,
+)
+
+
+async def _handler(*_args: Any) -> None:
+    return None
+
+
+def _gateway() -> HeliusStreamGateway:
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=_handler,
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+    )
+    gateway.SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 0.01
+    return gateway
+
+
+class FakeWebSocket:
+    def __init__(self, responses: list[dict[str, Any]]) -> None:
+        self.responses = list(responses)
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, value: str) -> None:
+        self.sent.append(json.loads(value))
+
+    async def recv(self) -> str:
+        if self.responses:
+            return json.dumps(self.responses.pop(0))
+        await asyncio.sleep(60)
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_transaction_subscription_timeout_requires_new_fallback_connection() -> None:
+    websocket = FakeWebSocket([])
+
+    with pytest.raises(_UseLogsFallback, match="timed out"):
+        await _gateway()._subscribe(websocket)
+
+    assert [item["method"] for item in websocket.sent] == [
+        "transactionSubscribe",
+        "transactionSubscribe",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partial_transaction_ack_requires_new_fallback_connection() -> None:
+    websocket = FakeWebSocket([{"jsonrpc": "2.0", "id": 1, "result": 11}])
+
+    with pytest.raises(_UseLogsFallback, match="timed out"):
+        await _gateway()._subscribe(websocket)
+
+
+@pytest.mark.asyncio
+async def test_invalid_transaction_ack_requires_fallback() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "error": {}},
+        ]
+    )
+
+    with pytest.raises(_UseLogsFallback, match="unavailable"):
+        await _gateway()._subscribe(websocket)
+
+
+@pytest.mark.asyncio
+async def test_transaction_subscriptions_accept_only_valid_numeric_results() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ]
+    )
+
+    await _gateway()._subscribe(websocket)
+
+    assert [item["method"] for item in websocket.sent] == [
+        "transactionSubscribe",
+        "transactionSubscribe",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_logs_only_connection_uses_separate_program_subscriptions() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": 101, "result": 201},
+            {"jsonrpc": "2.0", "id": 102, "result": 202},
+        ]
+    )
+
+    await _gateway()._subscribe(websocket, logs_only=True)
+
+    assert [item["method"] for item in websocket.sent] == [
+        "logsSubscribe",
+        "logsSubscribe",
+    ]
+    mentions = [item["params"][0]["mentions"] for item in websocket.sent]
+    assert all(len(addresses) == 1 for addresses in mentions)
+    assert mentions[0] != mentions[1]
+
+
+@pytest.mark.asyncio
+async def test_logs_subscription_timeout_fails_closed() -> None:
+    websocket = FakeWebSocket([])
+
+    with pytest.raises(_SubscriptionHandshakeError, match="acknowledgement failed"):
+        await _gateway()._subscribe(websocket, logs_only=True)
+
+
+@pytest.mark.asyncio
+async def test_interleaved_notification_is_buffered_until_handshake_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "transactionNotification",
+        "params": {},
+    }
+    websocket = FakeWebSocket(
+        [
+            notification,
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ]
+    )
+    gateway = _gateway()
+    monkeypatch.setattr(gateway, "handle_message", pytest.fail)
+
+    buffered = await gateway._subscribe(websocket)
+
+    assert websocket.responses == []
+    assert buffered == [notification]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_id", [True, 1.0, "1"])
+async def test_acknowledgement_id_requires_exact_integer_type(invalid_id: object) -> None:
+    websocket = FakeWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": invalid_id, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ]
+    )
+
+    with pytest.raises(_UseLogsFallback, match="invalid acknowledgement id"):
+        await _gateway()._subscribe(websocket)
+
+
+@pytest.mark.asyncio
+async def test_acknowledgement_requires_jsonrpc_version() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ]
+    )
+
+    with pytest.raises(_UseLogsFallback, match="JSON-RPC version"):
+        await _gateway()._subscribe(websocket)
+
+
+class FakeConnection(FakeWebSocket):
+    def __init__(
+        self,
+        responses: list[dict[str, Any]],
+        *,
+        finish_iteration: bool,
+        ready_event: asyncio.Event | None = None,
+    ) -> None:
+        super().__init__(responses)
+        self.finish_iteration = finish_iteration
+        self.ready_event = ready_event
+
+    async def send(self, value: str) -> None:
+        await super().send(value)
+        if self.ready_event is not None and len(self.sent) >= 2:
+            self.ready_event.set()
+
+    def __aiter__(self) -> FakeConnection:
+        return self
+
+    async def __anext__(self) -> str:
+        if self.finish_iteration:
+            raise StopAsyncIteration
+        await asyncio.sleep(60)
+        raise StopAsyncIteration
+
+
+class FakeConnectionContext:
+    def __init__(
+        self,
+        connection: FakeConnection,
+        events: list[str],
+        name: str,
+        *,
+        exit_started: asyncio.Event | None = None,
+        release_exit: asyncio.Event | None = None,
+    ) -> None:
+        self.connection = connection
+        self.events = events
+        self.name = name
+        self.exit_started = exit_started
+        self.release_exit = release_exit
+
+    async def __aenter__(self) -> FakeConnection:
+        self.events.append(f"open:{self.name}")
+        return self.connection
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.events.append(f"close:{self.name}")
+        if self.exit_started is not None:
+            self.exit_started.set()
+        if self.release_exit is not None:
+            await self.release_exit.wait()
+
+
+@pytest.mark.asyncio
+async def test_run_closes_transaction_socket_and_persists_logs_only_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = FakeConnection([], finish_iteration=False)
+    fallback_acks = [
+        {"jsonrpc": "2.0", "id": 101, "result": 201},
+        {"jsonrpc": "2.0", "id": 102, "result": 202},
+    ]
+    second = FakeConnection(fallback_acks, finish_iteration=True)
+    third_ready = asyncio.Event()
+    third = FakeConnection(
+        fallback_acks,
+        finish_iteration=False,
+        ready_event=third_ready,
+    )
+    connections = [first, second, third]
+    events: list[str] = []
+
+    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+        index = 3 - len(connections)
+        connection = connections.pop(0)
+        return FakeConnectionContext(connection, events, str(index + 1))
+
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
+    gateway = _gateway()
+    run_task = asyncio.create_task(gateway._run())
+    try:
+        async with asyncio.timeout(1):
+            await third_ready.wait()
+        assert events[:5] == ["open:1", "close:1", "open:2", "close:2", "open:3"]
+        assert [item["method"] for item in second.sent] == [
+            "logsSubscribe",
+            "logsSubscribe",
+        ]
+        assert [item["method"] for item in third.sent] == [
+            "logsSubscribe",
+            "logsSubscribe",
+        ]
+        assert gateway.entry_gate.enabled is True
+    finally:
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+
+@pytest.mark.asyncio
+async def test_triggering_overflow_message_forces_fail_closed_buffer() -> None:
+    gateway = _gateway()
+    gateway.SUBSCRIPTION_MESSAGE_BUFFER_LIMIT = 1
+    notification = {"jsonrpc": "2.0", "method": "transactionNotification"}
+    websocket = FakeWebSocket([notification, notification])
+
+    with pytest.raises(_UseLogsFallback) as caught:
+        await gateway._subscribe(websocket)
+
+    assert len(caught.value.buffered_messages) == 2
+    pending: list[dict[str, Any]] = []
+    assert gateway._extend_handshake_buffer(pending, caught.value.buffered_messages) is False
+    assert "stream_disconnected" in gateway.entry_gate.reasons
+
+
+@pytest.mark.asyncio
+async def test_gate_blocks_before_connection_context_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ],
+        finish_iteration=True,
+    )
+    exit_started = asyncio.Event()
+    release_exit = asyncio.Event()
+    events: list[str] = []
+
+    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+        return FakeConnectionContext(
+            connection,
+            events,
+            "only",
+            exit_started=exit_started,
+            release_exit=release_exit,
+        )
+
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
+    gateway = _gateway()
+    run_task = asyncio.create_task(gateway._run())
+    try:
+        async with asyncio.timeout(1):
+            await exit_started.wait()
+        assert gateway.entry_gate.enabled is False
+        assert "stream_disconnected" in gateway.entry_gate.reasons
+        gateway._stopping.set()
+        release_exit.set()
+        await run_task
+    finally:
+        if not run_task.done():
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+
+@pytest.mark.asyncio
+async def test_failed_buffer_handler_retries_only_unconfirmed_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notification = {"jsonrpc": "2.0", "method": "transactionNotification"}
+    first = FakeConnection(
+        [
+            notification,
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ],
+        finish_iteration=True,
+    )
+    second = FakeConnection(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 21},
+            {"jsonrpc": "2.0", "id": 2, "result": 22},
+        ],
+        finish_iteration=False,
+    )
+    connections = [first, second]
+    events: list[str] = []
+
+    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+        connection = connections.pop(0)
+        return FakeConnectionContext(connection, events, str(len(events)))
+
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
+    gateway = _gateway()
+    gateway.BACKOFF_SECONDS = (0,)
+    calls: list[dict[str, Any]] = []
+    handled = asyncio.Event()
+
+    async def handle(message: dict[str, Any]) -> None:
+        calls.append(message)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        handled.set()
+
+    monkeypatch.setattr(gateway, "handle_message", handle)
+    run_task = asyncio.create_task(gateway._run())
+    try:
+        async with asyncio.timeout(1):
+            await handled.wait()
+        assert calls == [notification, notification]
+    finally:
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task

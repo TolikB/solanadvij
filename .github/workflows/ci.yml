@@ -1,0 +1,168 @@
+name: quality-gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: sniper_ci
+          POSTGRES_USER: sniper
+          POSTGRES_PASSWORD: sniper-ci-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sniper -d sniper_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_ci
+      MIGRATION_POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_ci
+      POSTGRES_HARDENING_PROBE_CONFIRM: EPHEMERAL_CI_ONLY
+      APP_MODE: paper
+      APP_REVISION: ${{ github.sha }}
+      HELIUS_API_KEY: ci-helius-placeholder
+      JUPITER_API_KEY: ci-jupiter-placeholder
+      TELEGRAM_BOT_TOKEN: ci-telegram-placeholder
+      TELEGRAM_ADMIN_CHAT_ID: "1"
+      STARTING_EQUITY_USD: "500"
+      TIME_ZONE: Europe/Kyiv
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff
+        run: |
+          mkdir -p ci-gates
+          uv run ruff check src tests migrations scripts
+          printf '%s ruff\n' "$GITHUB_SHA" > ci-gates/ruff.ok
+
+      - name: Strict mypy
+        run: |
+          uv run mypy --strict src
+          printf '%s strict_mypy\n' "$GITHUB_SHA" > ci-gates/strict_mypy.ok
+
+      - name: Tests and coverage
+        run: |
+          uv run pytest -q --junitxml=junit.xml --cov=sniper_bot --cov-fail-under=70 --cov-report=term-missing --cov-report=xml:coverage.xml
+          printf '%s tests\n' "$GITHUB_SHA" > ci-gates/tests.ok
+
+      - name: Deterministic golden replay
+        run: |
+          uv run pytest -q tests/test_replay.py tests/test_replay_golden.py
+          printf '%s deterministic_replay\n' "$GITHUB_SHA" > ci-gates/deterministic_replay.ok
+
+      - name: Internal latency NFR
+        run: |
+          uv run python scripts/benchmark_internal.py
+          printf '%s internal_latency\n' "$GITHUB_SHA" > ci-gates/internal_latency.ok
+
+      - name: PostgreSQL previous-revision migration
+        run: |
+          uv run alembic upgrade 20260824_0005
+          uv run alembic upgrade head
+          uv run alembic downgrade 20260824_0005
+          uv run alembic upgrade head
+          printf '%s postgres_previous_migration\n' "$GITHUB_SHA" > ci-gates/postgres_previous_migration.ok
+
+      - name: Previous-revision migration smoke
+        run: |
+          uv run python scripts/smoke_previous_migration.py
+          printf '%s sqlite_previous_migration\n' "$GITHUB_SHA" > ci-gates/sqlite_previous_migration.ok
+
+      - name: PostgreSQL trigger and concurrency hardening
+        run: |
+          uv run python scripts/verify_postgres_hardening.py
+          printf '%s postgres_hardening\n' "$GITHUB_SHA" > ci-gates/postgres_hardening.ok
+
+      - name: Data-integrity queries
+        run: |
+          uv run python scripts/verify_data.py
+          printf '%s data_integrity\n' "$GITHUB_SHA" > ci-gates/data_integrity.ok
+
+      - name: No-live audit
+        run: |
+          uv run python scripts/audit_no_live.py
+          printf '%s no_live_audit\n' "$GITHUB_SHA" > ci-gates/no_live_audit.ok
+
+      - name: Compose configuration
+        run: |
+          cp .env.example .env
+          docker compose --env-file .env.example config --quiet
+          printf '%s compose_config\n' "$GITHUB_SHA" > ci-gates/compose_config.ok
+
+      - name: Docker image build
+        run: docker build --tag solana-sniper-ci .
+
+      - name: Docker Compose startup smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker compose --env-file .env down -v --remove-orphans' EXIT
+          docker compose --env-file .env up --build -d postgres migrate
+          migrate_id="$(docker compose --env-file .env ps --all -q migrate)"
+          test -n "$migrate_id"
+          migrate_status=""
+          for _ in $(seq 1 60); do
+            migrate_status="$(docker inspect --format '{{.State.Status}}' "$migrate_id")"
+            if [ "$migrate_status" = "exited" ]; then
+              break
+            fi
+            sleep 2
+          done
+          test "$migrate_status" = "exited"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$migrate_id")" = "0"
+          docker compose --env-file .env run --rm --no-deps migrate python scripts/verify_app_role.py
+          docker compose --env-file .env up --build -d sniper-bot
+          live_ok=0
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/health/live; then
+              live_ok=1
+              break
+            fi
+            sleep 2
+          done
+          test "$live_ok" = "1"
+          test "$(docker compose --env-file .env exec -T sniper-bot printenv APP_REVISION)" = "$GITHUB_SHA"
+          test "$(docker compose --env-file .env exec -T sniper-bot id -u)" != "0"
+          test "$(docker compose --env-file .env port sniper-bot 8080)" = "127.0.0.1:8080"
+          printf '%s docker_startup\n' "$GITHUB_SHA" > ci-gates/docker_startup.ok
+
+      - name: Write revision-specific CI evidence
+        run: >-
+          uv run python scripts/write_ci_acceptance.py
+          --junit junit.xml
+          --coverage coverage.xml
+          --gates-dir ci-gates
+          --output ci-acceptance.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quality-evidence
+          path: |
+            coverage.xml
+            junit.xml
+            ci-acceptance.json
+            ci-gates
+          if-no-files-found: error
