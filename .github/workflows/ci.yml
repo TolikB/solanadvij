@@ -149,7 +149,10 @@ jobs:
             fi
             sleep 2
           done
-          test "$live_ok" = "1"
+          if [ "$live_ok" != "1" ]; then
+            docker compose --env-file .env logs --no-color sniper-bot
+            exit 1
+          fi
           test "$(docker compose --env-file .env exec -T sniper-bot printenv APP_REVISION)" = "$GITHUB_SHA"
           test "$(docker compose --env-file .env exec -T sniper-bot id -u)" != "0"
           test "$(docker compose --env-file .env port sniper-bot 8080)" = "127.0.0.1:8080"
