@@ -119,6 +119,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export POSTGRES_DSN="$(sed -n 's/^POSTGRES_DSN=//p' .env)"
+          export MIGRATION_POSTGRES_DSN="$(sed -n 's/^MIGRATION_POSTGRES_DSN=//p' .env)"
           trap 'docker compose --env-file .env down -v --remove-orphans' EXIT
           docker compose --env-file .env up --build -d postgres migrate
           migrate_id="$(docker compose --env-file .env ps --all -q migrate)"
@@ -132,7 +134,11 @@ jobs:
             sleep 2
           done
           test "$migrate_status" = "exited"
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$migrate_id")" = "0"
+          migrate_exit="$(docker inspect --format '{{.State.ExitCode}}' "$migrate_id")"
+          if [ "$migrate_exit" != "0" ]; then
+            docker logs "$migrate_id"
+            exit "$migrate_exit"
+          fi
           docker compose --env-file .env run --rm --no-deps migrate python scripts/verify_app_role.py
           docker compose --env-file .env up --build -d sniper-bot
           live_ok=0
