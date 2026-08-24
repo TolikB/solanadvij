@@ -1,7 +1,9 @@
 services:
   migrate:
     build: .
-    env_file: .env
+    environment:
+      MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:?MIGRATION_POSTGRES_DSN is required}
+      SNIPER_DB_USER: ${SNIPER_DB_USER:?SNIPER_DB_USER is required}
     command: ["/bin/sh", "-ec", "python -m alembic upgrade head && python scripts/grant_app_role.py"]
     depends_on:
       postgres:
@@ -10,9 +12,26 @@ services:
 
   sniper-bot:
     build: .
-    env_file: .env
     environment:
+      APP_MODE: ${APP_MODE:?APP_MODE is required}
       APP_REVISION: ${APP_REVISION:?APP_REVISION is required}
+      TIME_ZONE: ${TIME_ZONE:-Europe/Kyiv}
+      HELIUS_API_KEY: ${HELIUS_API_KEY:?HELIUS_API_KEY is required}
+      HELIUS_WSS_URL: ${HELIUS_WSS_URL:-}
+      HELIUS_RPC_URL: ${HELIUS_RPC_URL:-}
+      JUPITER_API_KEY: ${JUPITER_API_KEY:?JUPITER_API_KEY is required}
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN is required}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required}
+      TELEGRAM_ADMIN_CHAT_ID: ${TELEGRAM_ADMIN_CHAT_ID:?TELEGRAM_ADMIN_CHAT_ID is required}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-[]}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-[]}
+      STARTING_EQUITY_USD: ${STARTING_EQUITY_USD:-500}
+      BASE_QUOTE_MINT: ${BASE_QUOTE_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
+      BASE_QUOTE_DECIMALS: ${BASE_QUOTE_DECIMALS:-6}
+      JUPITER_REPLAY_MODE: ${JUPITER_REPLAY_MODE:-false}
+      JUPITER_QUOTE_JOURNAL_PATH: ${JUPITER_QUOTE_JOURNAL_PATH:-./data/jupiter_quotes.ndjson}
+      JUPITER_QUOTE_JOURNAL_RECORD: ${JUPITER_QUOTE_JOURNAL_RECORD:-false}
+      CONFIG_PATH: ${CONFIG_PATH:-configs/default.yaml}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -40,7 +59,6 @@ services:
 
   postgres:
     image: postgres:16
-    env_file: .env
     environment:
       POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
       POSTGRES_USER: ${POSTGRES_ADMIN_USER:?POSTGRES_ADMIN_USER is required}
@@ -64,7 +82,9 @@ services:
 
   backup:
     image: postgres:16
-    env_file: .env
+    environment:
+      MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:?MIGRATION_POSTGRES_DSN is required}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
     entrypoint: ["/bin/sh", "-ec"]
     command: >-
       while true; do

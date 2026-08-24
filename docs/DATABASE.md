@@ -12,7 +12,8 @@ startup; candidate runtime state and momentum windows are persisted for determin
 A partial unique index permits only one open or partial position per mint.
 
 The application role receives only schema usage and DML privileges. Migrations run with the
-admin DSN before the application starts. Trade fills atomically update the order, fill, position,
+admin DSN before the application starts. Compose passes MIGRATION_POSTGRES_DSN only to the
+one-shot migration and backup services; the runtime bot receives only the app-role POSTGRES_DSN. Trade fills atomically update the order, fill, position,
 paper account, risk audit, external quote reference, and outbox. Account initialization, fills,
 exits, and executable marks also append immutable `paper_equity_marks`; calendar-day reports use
 these snapshots for boundary equity, unrealized PnL, and intraday drawdown.
