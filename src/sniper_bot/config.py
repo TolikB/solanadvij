@@ -426,11 +426,34 @@ class AppConfig(BaseSettings):
                 )
             yaml_values = cls._coerce_yaml_values(loaded)
 
-        # Environment variables should have priority over YAML.
+        # Pydantic init values outrank BaseSettings environment sources, so
+        # remove every YAML spelling when a non-empty environment value exists.
+        # BaseSettings then performs its normal case handling and JSON decoding.
+        case_sensitive = bool(cls.model_config.get("case_sensitive", False))
+        environment = {
+            key if case_sensitive else key.casefold(): value
+            for key, value in os.environ.items()
+        }
         for field_name, model_field in cls.model_fields.items():
-            env_name = str(model_field.alias)
-            if env_name in os.environ and os.environ[env_name] != "":
-                yaml_values[field_name] = os.environ[env_name]
+            validation_aliases: list[str] = []
+            for alias in (model_field.alias, model_field.validation_alias):
+                if isinstance(alias, str):
+                    validation_aliases.append(alias)
+                elif isinstance(alias, AliasChoices):
+                    validation_aliases.extend(
+                        choice for choice in alias.choices if isinstance(choice, str)
+                    )
+
+            env_names = list(dict.fromkeys(validation_aliases or [field_name]))
+            for env_name in env_names:
+                lookup_name = env_name if case_sensitive else env_name.casefold()
+                if not environment.get(lookup_name):
+                    continue
+
+                yaml_values.pop(field_name, None)
+                for alias in env_names:
+                    yaml_values.pop(alias, None)
+                break
 
         return cls(**yaml_values)
 

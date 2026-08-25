@@ -48,6 +48,50 @@ def test_telegram_allowlist_supports_comma_separated_env_values() -> None:
     assert config.telegram_allowlist_chat_ids == [100, 200]
 
 
+def test_load_environment_aliases_override_empty_yaml(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "default.yaml"
+    config_path.write_text(
+        "\n".join(
+            (
+                "APP_MODE: paper",
+                'HELIUS_API_KEY: ""',
+                'JUPITER_API_KEY: ""',
+                'POSTGRES_DSN: ""',
+                'TELEGRAM_BOT_TOKEN: ""',
+                "TELEGRAM_ADMIN_CHAT_ID: 123456",
+                "TELEGRAM_ALLOWED_CHAT_IDS: []",
+                "TELEGRAM_ALLOWED_USER_IDS: []",
+                "risk:",
+                '  max_position_usdc: "25"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    environment = {
+        "HELIUS_API_KEY": "helius-from-env",
+        "JUPITER_API_KEY": "jupiter-from-env",
+        "POSTGRES_DSN": "postgresql://user:pass@localhost:5432/db",
+        "TELEGRAM_BOT_TOKEN": "telegram-from-env",
+        "TELEGRAM_ADMIN_CHAT_ID": "654321",
+        "TELEGRAM_ALLOWED_CHAT_IDS": "[654321]",
+        "TELEGRAM_ALLOWED_USER_IDS": "[654321]",
+        "RISK": '{"max_position_usdc":"30"}',
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    config = AppConfig.load(str(config_path))
+
+    assert config.helius_api_key == "helius-from-env"
+    assert config.jupiter_api_key.get_secret_value() == "jupiter-from-env"
+    assert config.postgres_dsn == environment["POSTGRES_DSN"]
+    assert config.telegram_bot_token.get_secret_value() == "telegram-from-env"
+    assert config.telegram_admin_chat_id == 654321
+    assert config.telegram_allowlist_chat_ids == [654321]
+    assert config.telegram_allowlist_user_ids == [654321]
+    assert config.risk.max_position_usdc == Decimal("30")
+
+
 def test_release_revision_creates_distinct_immutable_strategy_identity() -> None:
     first = AppConfig(**{**_base_config(), "APP_REVISION": "a" * 40})
     second = AppConfig(**{**_base_config(), "APP_REVISION": "b" * 40})
