@@ -604,6 +604,96 @@ async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
     assert dispatched == ["first", "second"]
 
 
+@pytest.mark.asyncio
+async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=_handler,
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        log_fetch_concurrency=2,
+    )
+    first_dispatch_started = asyncio.Event()
+    release_first_dispatch = asyncio.Event()
+    dispatched: list[str] = []
+
+    async def get_transaction(signature: str) -> dict[str, Any]:
+        return {
+            "slot": 1 if signature == "first" else 2,
+            "blockTime": 1_787_646_900,
+            "signature": signature,
+        }
+
+    async def dispatch(
+        transaction: dict[str, Any],
+        _source: EventSource,
+        **_kwargs: Any,
+    ) -> None:
+        signature = str(transaction["signature"])
+        if signature == "first":
+            first_dispatch_started.set()
+            await release_first_dispatch.wait()
+            raise RuntimeError("dispatch failed")
+        dispatched.append(signature)
+
+    def notification(signature: str, slot: int) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": slot},
+                    "value": {"signature": signature},
+                }
+            },
+        }
+
+    monkeypatch.setattr(gateway.rpc, "get_transaction", get_transaction)
+    monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
+
+    await gateway.handle_message(notification("first", 1))
+    await gateway.handle_message(notification("second", 2))
+    await asyncio.wait_for(first_dispatch_started.wait(), timeout=1)
+    tasks = tuple(gateway._log_fetch_tasks)
+    release_first_dispatch.set()
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True),
+        timeout=1,
+    )
+
+    assert all(isinstance(result, RuntimeError) for result in results)
+    assert dispatched == []
+    assert gateway._fetch_error_sequences
+    assert gateway._reconnect_requested.is_set()
+    assert gateway._dispatch_recovery_pending is True
+    assert "stream_fetch_error" in gateway.entry_gate.reasons
+
+
+def test_dispatch_recovery_gate_clears_only_after_new_baseline() -> None:
+    gateway = _gateway()
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    gateway._dispatch_recovery_pending = True
+    gateway.entry_gate.block("stream_fetch_error")
+    gateway._reconnect_requested.clear()
+    gateway._baseline_started_at = now
+    gateway.last_observed_at = now
+    gateway.last_processed_block_time = now
+    gateway.last_processing_lag_seconds = 0
+
+    assert gateway.refresh_freshness(now) is False
+    assert "stream_fetch_error" in gateway.entry_gate.reasons
+
+    ready_at = now + gateway.LIVE_BASELINE_WARMUP
+    gateway.last_observed_at = ready_at
+    gateway.last_processed_block_time = ready_at
+    assert gateway.refresh_freshness(ready_at) is True
+    assert gateway._dispatch_recovery_pending is False
+    assert "stream_fetch_error" not in gateway.entry_gate.reasons
+
+
 def test_processing_lag_blocks_freshness_even_with_live_notifications() -> None:
     gateway = _gateway()
     now = datetime.now(tz=timezone.utc)
@@ -617,3 +707,22 @@ def test_processing_lag_blocks_freshness_even_with_live_notifications() -> None:
     gateway.last_processing_lag_seconds = gateway.max_processing_lag_seconds - 1
     assert gateway.refresh_freshness(now) is True
     assert "stream_stale" not in gateway.entry_gate.reasons
+
+
+def test_processing_freshness_age_advances_with_injected_clock() -> None:
+    gateway = _gateway()
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    gateway._baseline_started_at = now - gateway.LIVE_BASELINE_WARMUP
+    gateway.last_observed_at = now
+    gateway.last_processed_block_time = now - timedelta(seconds=1)
+    gateway.last_processing_lag_seconds = 1
+
+    assert gateway.refresh_freshness(now) is True
+
+    advanced = now + timedelta(
+        seconds=gateway.max_processing_lag_seconds + 1
+    )
+    gateway.last_observed_at = advanced
+
+    assert gateway.refresh_freshness(advanced) is False
+    assert "stream_stale" in gateway.entry_gate.reasons

@@ -126,6 +126,8 @@ class HeliusStreamGateway:
         self._log_fetch_tasks: set[asyncio.Task[None]] = set()
         self._log_fetch_tail: asyncio.Task[None] | None = None
         self._fetch_error_sequences: set[int] = set()
+        self._reconnect_requested = asyncio.Event()
+        self._dispatch_recovery_pending = False
 
     async def start(self) -> None:
         if self._run_task is not None:
@@ -153,14 +155,7 @@ class HeliusStreamGateway:
             except asyncio.CancelledError:
                 pass
             self._run_task = None
-        fetch_tasks = tuple(self._log_fetch_tasks)
-        for task in fetch_tasks:
-            task.cancel()
-        if fetch_tasks:
-            await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        self._log_fetch_tasks.clear()
-        self._log_fetch_tail = None
-        self._fetch_error_sequences.clear()
+        await self._cancel_log_fetch_tasks()
         if self._worker_task is not None:
             await self._queue.put(None)
             await self._worker_task
@@ -181,6 +176,7 @@ class HeliusStreamGateway:
                     max_queue=1024,
                 ) as websocket:
                     try:
+                        self._reconnect_requested.clear()
                         self._begin_live_baseline()
                         buffered = await self._subscribe(websocket, logs_only=logs_only)
                         if (
@@ -228,10 +224,15 @@ class HeliusStreamGateway:
                         self.entry_gate.unblock("stream_disconnected")
                         self.refresh_freshness()
                         attempt = 0
-                        async for raw_message in websocket:
+                        while True:
+                            try:
+                                raw_message = await self._receive_or_reconnect(websocket)
+                            except StopAsyncIteration:
+                                break
                             await self.handle_message(json.loads(raw_message))
                     finally:
                         self.entry_gate.block("stream_disconnected")
+                        await self._cancel_log_fetch_tasks()
             except _UseLogsFallback as exc:
                 if not self._extend_handshake_buffer(
                     pending_handshake_messages, exc.buffered_messages
@@ -409,6 +410,25 @@ class HeliusStreamGateway:
         result = message.get("result")
         return type(result) is int and result >= 0
 
+    async def _receive_or_reconnect(self, websocket: Any) -> Any:
+        receive_task = asyncio.create_task(
+            anext(websocket), name="solana-websocket-receive"
+        )
+        reconnect_task = asyncio.create_task(
+            self._reconnect_requested.wait(), name="solana-reconnect-request"
+        )
+        waiters: set[asyncio.Task[Any]] = {receive_task, reconnect_task}
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waiters:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+        if self._reconnect_requested.is_set():
+            raise RuntimeError("ordered Solana transaction dispatch requested reconnect")
+        return receive_task.result()
+
     async def handle_message(self, message: dict[str, Any]) -> None:
         if message.get("error"):
             raise RuntimeError("Helius subscription returned an error")
@@ -479,6 +499,7 @@ class HeliusStreamGateway:
         previous: asyncio.Task[None] | None,
     ) -> None:
         attempt = 0
+        dispatched = False
         try:
             while True:
                 try:
@@ -499,13 +520,12 @@ class HeliusStreamGateway:
                     )
                     await asyncio.sleep(min(5, 0.25 * (2 ** min(attempt - 1, 5))))
                     continue
-                self._fetch_error_sequences.discard(sequence)
-                if not self._fetch_error_sequences:
-                    self.entry_gate.unblock("stream_fetch_error")
                 break
 
             if previous is not None:
                 await previous
+            if any(failed < sequence for failed in self._fetch_error_sequences):
+                raise RuntimeError("an earlier ordered transaction dispatch failed")
             transaction.setdefault("slot", slot)
             await self._queue_transaction(
                 transaction,
@@ -513,16 +533,48 @@ class HeliusStreamGateway:
                 received_at=received_at,
                 generation=generation,
             )
+            dispatched = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._fetch_error_sequences.add(sequence)
+            self._dispatch_recovery_pending = True
+            self.entry_gate.block("stream_fetch_error")
+            self._reconnect_requested.set()
+            logger.exception(
+                "Solana ordered transaction dispatch failed; reconnect requested",
+                extra={"sequence": sequence},
+            )
+            raise
         finally:
-            self._fetch_error_sequences.discard(sequence)
-            if not self._fetch_error_sequences:
-                self.entry_gate.unblock("stream_fetch_error")
+            if dispatched:
+                self._fetch_error_sequences.discard(sequence)
+                if (
+                    not self._fetch_error_sequences
+                    and not self._dispatch_recovery_pending
+                ):
+                    self.entry_gate.unblock("stream_fetch_error")
             self._log_fetch_semaphore.release()
 
     def _forget_log_fetch_task(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
         self._log_fetch_tasks.discard(task)
         if self._log_fetch_tail is task:
             self._log_fetch_tail = None
+        self._sync_queue_depth()
+
+    async def _cancel_log_fetch_tasks(self) -> None:
+        fetch_tasks = tuple(self._log_fetch_tasks)
+        for task in fetch_tasks:
+            task.cancel()
+        if fetch_tasks:
+            await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        self._log_fetch_tasks.clear()
+        self._log_fetch_tail = None
+        self._fetch_error_sequences.clear()
         self._sync_queue_depth()
 
     async def _queue_transaction(
@@ -751,9 +803,16 @@ class HeliusStreamGateway:
             or (now - self.last_observed_at).total_seconds()
             > self.max_processing_lag_seconds
         )
+        processing_lag = self.last_processing_lag_seconds
+        if self.last_processed_block_time is not None:
+            advancing_lag = max(
+                0.0,
+                (now - self.last_processed_block_time).total_seconds(),
+            )
+            processing_lag = max(processing_lag or 0.0, advancing_lag)
         processing_stale = (
-            self.last_processing_lag_seconds is None
-            or self.last_processing_lag_seconds > self.max_processing_lag_seconds
+            processing_lag is None
+            or processing_lag > self.max_processing_lag_seconds
         )
         stale = transport_stale or processing_stale
         if stale:
@@ -767,6 +826,13 @@ class HeliusStreamGateway:
         )
         if baseline_ready:
             self.entry_gate.unblock("stream_baseline")
+            if (
+                self._dispatch_recovery_pending
+                and not self._reconnect_requested.is_set()
+                and not self._fetch_error_sequences
+            ):
+                self._dispatch_recovery_pending = False
+                self.entry_gate.unblock("stream_fetch_error")
         else:
             self.entry_gate.block("stream_baseline")
         return not stale and baseline_ready
