@@ -73,6 +73,8 @@ def test_daily_report_matches_ledger_reconcile_in_realized_pnl(tmp_path) -> None
 async def test_daily_report_if_not_sent_is_idempotent(tmp_path) -> None:
     runtime = SniperRuntime(AppConfig(**_base_config("record")), data_dir=tmp_path)
 
+    runtime._today_key = lambda: "2026-08-18"  # type: ignore[method-assign]
+
     first = await runtime.daily_report_if_not_sent(date="2026-08-18")
     second = await runtime.daily_report_if_not_sent(date="2026-08-18")
 
@@ -83,16 +85,25 @@ async def test_daily_report_if_not_sent_is_idempotent(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_historical_snapshot_queues_explicit_no_data_report(tmp_path) -> None:
+async def test_missing_historical_snapshot_notifies_once_and_allows_backfill(tmp_path) -> None:
     class MissingHistoricalSnapshotDatabase:
         def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
+            self.bounds: dict[str, object] | None = None
+            self.lookup_error = False
+            self.outbox_calls: list[dict[str, object]] = []
+            self.store_calls: list[dict[str, object]] = []
 
-        async def load_daily_equity_bounds(self, **_kwargs: object) -> None:
-            return None
+        async def load_daily_equity_bounds(self, **_kwargs: object) -> dict[str, object] | None:
+            if self.lookup_error:
+                raise RuntimeError("lookup failed")
+            return self.bounds
+
+        async def enqueue_outbox(self, **kwargs: object) -> bool:
+            self.outbox_calls.append(kwargs)
+            return len(self.outbox_calls) == 1
 
         async def store_daily_report(self, **kwargs: object) -> bool:
-            self.calls.append(kwargs)
+            self.store_calls.append(kwargs)
             return True
 
     runtime = SniperRuntime(AppConfig(**_base_config("paper")), data_dir=tmp_path)
@@ -102,19 +113,38 @@ async def test_missing_historical_snapshot_queues_explicit_no_data_report(tmp_pa
     runtime.config.telegram.include_all_time_with_daily = False
     runtime._today_key = lambda: "2026-08-19"  # type: ignore[method-assign]
 
+    database.lookup_error = True
+    lookup_failure = await runtime.daily_report_if_not_sent(date="2026-08-18")
+    database.lookup_error = False
     first = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
     second = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
 
+    assert lookup_failure is not None
+    assert lookup_failure["data_status"] == "unavailable"
     assert first is not None
-    assert first["data_status"] == "unavailable"
     assert first["equity_usd"] is None
     assert first["pnl"] is None
+    assert first["open_positions"] is None
     assert first["reconcile"] == {
         "is_reconciled": False,
         "reason": "historical_equity_snapshot_unavailable",
     }
     assert second is None
-    assert len(database.calls) == 1
-    assert database.calls[0]["report"] == first
-    assert "status=NO_DATA" in str(database.calls[0]["telegram_text"])
-    assert "values_not_inferred=true" in str(database.calls[0]["telegram_text"])
+    assert len(database.outbox_calls) == 2
+    assert "status=NO_DATA" in str(database.outbox_calls[0]["payload"])
+    assert "values_not_inferred=true" in str(database.outbox_calls[0]["payload"])
+    assert database.store_calls == []
+
+    database.bounds = {
+        "starting_equity_usd": "500",
+        "ending_equity_usd": "500",
+        "starting_unrealized_pnl_usd": "0",
+        "ending_unrealized_pnl_usd": "0",
+        "equity_path_usd": ["500"],
+    }
+    recovered = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
+
+    assert recovered is not None
+    assert "data_status" not in recovered
+    assert len(database.store_calls) == 1
+    assert database.store_calls[0]["report"] == recovered

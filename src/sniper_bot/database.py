@@ -1018,7 +1018,6 @@ class Database:
         *,
         report: dict[str, Any],
         include_all_time: dict[str, Any] | None = None,
-        telegram_text: str | None = None,
     ) -> bool:
         report_date = datetime.strptime(str(report["date"]), "%Y-%m-%d").date()
         now = datetime.now(tz=timezone.utc)
@@ -1047,7 +1046,7 @@ class Database:
                     "idempotency_key": f"telegram:daily-report:{report['report_id']}",
                     "event_type": "daily_report",
                     "payload_json": {
-                        "text": telegram_text or _telegram_report_text(report),
+                        "text": _telegram_report_text(report),
                         "_daily_report": {
                             "date": report["date"],
                             "timezone": report["timezone"],

@@ -425,15 +425,21 @@ class SniperRuntime:
         if self._daily_report_already_sent(target):
             return None
         capital_bounds = None
-        historical_snapshot_unavailable = False
+        historical_target = target < self._today_key()
+        snapshot_lookup_failed = False
         if self.database is not None and self.database_available:
-            capital_bounds = await self.database.load_daily_equity_bounds(
-                account_id="paper-main",
-                report_date=target,
-                timezone_name=self.config.time_zone,
-            )
-            historical_snapshot_unavailable = capital_bounds is None and target < self._today_key()
-        if historical_snapshot_unavailable:
+            try:
+                capital_bounds = await self.database.load_daily_equity_bounds(
+                    account_id="paper-main",
+                    report_date=target,
+                    timezone_name=self.config.time_zone,
+                )
+            except Exception:
+                if not historical_target:
+                    raise
+                snapshot_lookup_failed = True
+                logger.exception("historical daily equity snapshot lookup failed")
+        if historical_target and capital_bounds is None:
             unavailable_reason = "historical_equity_snapshot_unavailable"
             report: dict[str, object] = {
                 "period": "daily",
@@ -454,16 +460,29 @@ class SniperRuntime:
                     "is_reconciled": False,
                     "reason": unavailable_reason,
                 },
-                "open_positions": [],
+                "open_positions": None,
             }
             report["report_id"] = self._report_id(report)
-            telegram_text = (
-                f"DAILY PAPER REPORT | date={target} | status=NO_DATA | "
-                "reason=historical_equity_snapshot_unavailable | values_not_inferred=true"
+            if not send:
+                return report
+            if self.database is None or not self.database_available or snapshot_lookup_failed:
+                return None
+            inserted = await self.database.enqueue_outbox(
+                idempotency_key=(
+                    f"telegram:daily-report-unavailable:{target}:"
+                    f"{self.config.strategy_version}"
+                ),
+                event_type="daily_report_unavailable",
+                payload={
+                    "text": (
+                        f"DAILY PAPER REPORT | date={target} | status=NO_DATA | "
+                        "reason=historical_equity_snapshot_unavailable | "
+                        "values_not_inferred=true"
+                    )
+                },
             )
-        else:
-            report = self.report_builder.daily(target, capital_bounds=capital_bounds)
-            telegram_text = None
+            return report if inserted else None
+        report = self.report_builder.daily(target, capital_bounds=capital_bounds)
         all_time_report = (
             await self.build_all_time_report_with_history()
             if self.config.telegram.include_all_time_with_daily
@@ -473,7 +492,6 @@ class SniperRuntime:
             inserted = await self.database.store_daily_report(
                 report=report,
                 include_all_time=all_time_report,
-                telegram_text=telegram_text,
             )
             if not inserted:
                 return None
