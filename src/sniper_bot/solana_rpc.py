@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -54,6 +56,7 @@ class SolanaRpcClient:
         recorder: Callable[..., Awaitable[str]] | None = None,
         transaction_batch_size: int = 20,
         transaction_batch_window_seconds: float = 0.05,
+        rpc_requests_per_second: float = 8.0,
     ) -> None:
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds
@@ -69,13 +72,20 @@ class SolanaRpcClient:
             raise ValueError(
                 "transaction_batch_window_seconds must be greater than zero"
             )
+        if not math.isfinite(rpc_requests_per_second) or rpc_requests_per_second <= 0:
+            raise ValueError("rpc_requests_per_second must be greater than zero")
         self.transaction_batch_size = transaction_batch_size
         self.transaction_batch_window_seconds = transaction_batch_window_seconds
+        self.rpc_requests_per_second = rpc_requests_per_second
         self._transaction_batch_lock = asyncio.Lock()
         self._transaction_batch_pending: list[
             tuple[dict[str, Any], asyncio.Future[_RpcResponse]]
         ] = []
         self._transaction_batch_flush_task: asyncio.Task[None] | None = None
+        self._rpc_rate_limit_lock = asyncio.Lock()
+        self._next_rpc_send_at = 0.0
+        self._monotonic: Callable[[], float] = time.monotonic
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
         self._clock: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
@@ -262,8 +272,44 @@ class SolanaRpcClient:
     ) -> httpx.Response | _RpcResponse:
         if method == "getTransaction":
             return await self._enqueue_transaction_batch(body)
+        await self._acquire_rpc_capacity(1)
         async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
             return await client.post(self.endpoint, json=body)
+
+    async def _acquire_rpc_capacity(self, request_count: int) -> None:
+        """Pace sustained RPC load, counting each JSON-RPC batch item."""
+        if request_count <= 0:
+            raise ValueError("request_count must be greater than zero")
+        async with self._rpc_rate_limit_lock:
+            await self._wait_for_rpc_capacity()
+            self._reserve_rpc_capacity(request_count)
+
+    async def _acquire_transaction_batch_capacity(
+        self,
+        batch: list[tuple[dict[str, Any], asyncio.Future[_RpcResponse]]],
+    ) -> list[tuple[dict[str, Any], asyncio.Future[_RpcResponse]]]:
+        async with self._rpc_rate_limit_lock:
+            active = [item for item in batch if not item[1].done()]
+            if not active:
+                return []
+            await self._wait_for_rpc_capacity()
+            active = [item for item in active if not item[1].done()]
+            if not active:
+                return []
+            self._reserve_rpc_capacity(len(active))
+            return active
+
+    async def _wait_for_rpc_capacity(self) -> None:
+        delay = max(0.0, self._next_rpc_send_at - self._monotonic())
+        if delay > 0:
+            await self._sleep(delay)
+
+    def _reserve_rpc_capacity(self, request_count: int) -> None:
+        now = self._monotonic()
+        self._next_rpc_send_at = (
+            max(now, self._next_rpc_send_at)
+            + request_count / self.rpc_requests_per_second
+        )
 
     async def _enqueue_transaction_batch(
         self,
@@ -365,6 +411,9 @@ class SolanaRpcClient:
     ) -> None:
         try:
             async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                batch = await self._acquire_transaction_batch_capacity(batch)
+                if not batch:
+                    return
                 batch = [
                     (body, future)
                     for body, future in batch

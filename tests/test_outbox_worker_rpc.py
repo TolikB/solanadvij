@@ -226,6 +226,8 @@ async def test_solana_rpc_batches_concurrent_transaction_reads(
         transaction_batch_size=20,
         transaction_batch_window_seconds=0.001,
     )
+    pacing = AsyncMock(wraps=client._acquire_transaction_batch_capacity)
+    monkeypatch.setattr(client, "_acquire_transaction_batch_capacity", pacing)
 
     signatures = [f"SIGNATURE_{index}" for index in range(20)]
     results = await asyncio.gather(
@@ -235,6 +237,79 @@ async def test_solana_rpc_batches_concurrent_transaction_reads(
     assert len(_BatchHttpClient.posts) == 1
     assert len(_BatchHttpClient.posts[0]) == 20
     assert [result["signature"] if result else None for result in results] == signatures
+    pacing.assert_awaited_once()
+    assert len(pacing.await_args.args[0]) == 20
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_paces_requests_by_batch_weight() -> None:
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        rpc_requests_per_second=8,
+    )
+    clock = [100.0]
+    delays: list[float] = []
+
+    async def advance(delay: float) -> None:
+        delays.append(delay)
+        clock[0] += delay
+
+    client._monotonic = lambda: clock[0]
+    client._sleep = advance
+
+    await client._acquire_rpc_capacity(20)
+    await client._acquire_rpc_capacity(1)
+
+    assert delays == [pytest.approx(2.5)]
+    assert client._next_rpc_send_at == pytest.approx(102.625)
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_does_not_reserve_cancelled_batch_capacity() -> None:
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        rpc_requests_per_second=8,
+    )
+    clock = [100.0]
+    pacing_started = asyncio.Event()
+    release_pacing = asyncio.Event()
+    client._next_rpc_send_at = 101.0
+
+    async def advance(delay: float) -> None:
+        pacing_started.set()
+        await release_pacing.wait()
+        clock[0] += delay
+
+    client._monotonic = lambda: clock[0]
+    client._sleep = advance
+    loop = asyncio.get_running_loop()
+    cancelled = loop.create_future()
+    retained = loop.create_future()
+    batch = [({"id": 1}, cancelled), ({"id": 2}, retained)]
+    pacing = asyncio.create_task(
+        client._acquire_transaction_batch_capacity(batch)
+    )
+    await pacing_started.wait()
+    cancelled.cancel()
+    release_pacing.set()
+
+    active = await pacing
+
+    assert active == [({"id": 2}, retained)]
+    assert client._next_rpc_send_at == pytest.approx(101.125)
+    retained.cancel()
+
+
+@pytest.mark.parametrize("rate", [0.0, -1.0, float("nan"), float("inf")])
+def test_solana_rpc_rejects_invalid_request_rate(rate: float) -> None:
+    with pytest.raises(
+        ValueError,
+        match="rpc_requests_per_second must be greater than zero",
+    ):
+        SolanaRpcClient(
+            "https://rpc.invalid",
+            rpc_requests_per_second=rate,
+        )
 
 
 @pytest.mark.asyncio
@@ -339,6 +414,7 @@ async def test_solana_rpc_filters_cancellation_during_http_enter(
         "https://rpc.invalid",
         transaction_batch_window_seconds=0.001,
     )
+    client._monotonic = lambda: 100.0
     cancelled = asyncio.create_task(client.get_transaction("CANCELLED"))
     retained = asyncio.create_task(client.get_transaction("RETAINED"))
     await asyncio.wait_for(
@@ -355,6 +431,7 @@ async def test_solana_rpc_filters_cancellation_during_http_enter(
     assert result == {"signature": "RETAINED"}
     sent = _BlockingEnterBatchHttpClient.posts[0]
     assert [item["params"][0] for item in sent] == ["RETAINED"]
+    assert client._next_rpc_send_at == pytest.approx(100.125)
 
 
 @pytest.mark.asyncio
