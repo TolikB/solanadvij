@@ -56,7 +56,7 @@ class SolanaRpcClient:
         recorder: Callable[..., Awaitable[str]] | None = None,
         transaction_batch_size: int = 20,
         transaction_batch_window_seconds: float = 0.05,
-        rpc_requests_per_second: float = 8.0,
+        rpc_requests_per_second: float = 4.0,
     ) -> None:
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds

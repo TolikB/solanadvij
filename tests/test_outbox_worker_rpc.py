@@ -431,7 +431,7 @@ async def test_solana_rpc_filters_cancellation_during_http_enter(
     assert result == {"signature": "RETAINED"}
     sent = _BlockingEnterBatchHttpClient.posts[0]
     assert [item["params"][0] for item in sent] == ["RETAINED"]
-    assert client._next_rpc_send_at == pytest.approx(100.125)
+    assert client._next_rpc_send_at == pytest.approx(100.25)
 
 
 @pytest.mark.asyncio
