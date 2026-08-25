@@ -86,11 +86,12 @@ services:
       MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:?MIGRATION_POSTGRES_DSN is required}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
     entrypoint: ["/bin/sh", "-ec"]
-    command: >-
-      while true; do
-        /scripts/backup.sh;
-        sleep 86400;
-      done
+    command:
+      - |
+        while true; do
+          /scripts/backup.sh
+          sleep 86400
+        done
     volumes:
       - ./scripts:/scripts:ro
       - backups:/backups

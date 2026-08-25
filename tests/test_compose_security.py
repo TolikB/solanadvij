@@ -46,6 +46,17 @@ def test_compose_requires_admin_dsn_for_migrations() -> None:
     assert migration_dsn.startswith("${MIGRATION_POSTGRES_DSN:?")
 
 
+def test_backup_command_is_one_complete_shell_script_argument() -> None:
+    command = _compose_services()["backup"]["command"]
+
+    assert isinstance(command, list)
+    assert len(command) == 1
+    assert "while true; do" in command[0]
+    assert "/scripts/backup.sh" in command[0]
+    assert "sleep 86400" in command[0]
+    assert command[0].strip().endswith("done")
+
+
 def test_example_telegram_allowlists_are_json_arrays() -> None:
     values = {}
     for line in Path(".env.example").read_text(encoding="utf-8").splitlines():

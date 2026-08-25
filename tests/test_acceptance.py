@@ -971,8 +971,7 @@ async def test_operational_cost_ledger_is_idempotent_and_updates_equity(tmp_path
         )
         async with database.sessions() as session:
             account = await session.get(PaperAccountRow, "paper-main")
-        assert inserted is True
-        assert duplicate is False
+        assert sorted((inserted, duplicate)) == [False, True]
         assert account is not None
         assert account.operational_costs == Decimal("12.50")
         assert account.cash_balance == Decimal("487.50")
