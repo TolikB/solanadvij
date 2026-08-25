@@ -67,7 +67,12 @@ def test_example_telegram_allowlists_are_json_arrays() -> None:
     assert json.loads(values["TELEGRAM_ALLOWED_CHAT_IDS"]) == [123456]
     assert json.loads(values["TELEGRAM_ALLOWED_USER_IDS"]) == [123456]
 
-def test_compose_forwards_optional_telegram_runtime_config() -> None:
+def test_compose_requires_valid_telegram_runtime_config() -> None:
     compose = Path("docker-compose.yml").read_text(encoding="utf-8")
+    env_example = Path(".env.example").read_text(encoding="utf-8")
 
-    assert 'TELEGRAM: "${TELEGRAM:-}"' in compose
+    assert 'TELEGRAM: "${TELEGRAM:?TELEGRAM is required}"' in compose
+    assert (
+        'TELEGRAM={"enabled":true,"daily_report_time":"00:05",'
+        '"include_all_time_with_daily":true}'
+    ) in env_example
