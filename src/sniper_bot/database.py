@@ -74,6 +74,19 @@ RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
 MAX_EVENT_PROCESSING_ATTEMPTS = 3
 
 
+def _processed_prefix_condition() -> Any:
+    first_unresolved = (
+        select(func.min(RawChainEventRow.ingest_sequence))
+        .join(EventDedupRow, EventDedupRow.event_id == RawChainEventRow.event_id)
+        .where(EventDedupRow.processing_status != "PROCESSED")
+        .correlate(None)
+        .scalar_subquery()
+    )
+    return first_unresolved.is_(None) | (
+        RawChainEventRow.ingest_sequence < first_unresolved
+    )
+
+
 class Database:
     def __init__(self, dsn: str, *, metrics: BotMetrics | None = None) -> None:
         self.dsn = _async_dsn(dsn)
@@ -351,87 +364,165 @@ class Database:
         ]
         return profiles, relations
 
-    async def record_event(self, event: EventEnvelope, *, reclaim: bool = False) -> bool:
-        """Claim an event for processing, returning False when another claim owns it."""
+    async def record_events(
+        self,
+        events: list[EventEnvelope],
+        *,
+        reclaim: bool = False,
+        resume_owned: bool = False,
+    ) -> list[bool]:
+        """Durably claim an ordered event batch in one synchronous transaction."""
+        if not events:
+            return []
         started = time.perf_counter()
         now = datetime.now(tz=timezone.utc)
-        claim_token = str(uuid4())
-        inserted = False
+        accepted: list[bool] = []
+        seen_event_ids: set[str] = set()
+        claim_tokens: dict[str, str] = {}
+        new_claim_token_ids: set[str] = set()
+        for event in events:
+            if event.event_id in claim_tokens:
+                continue
+            existing_token = self._event_claim_tokens.get(event.event_id)
+            if existing_token is None:
+                existing_token = str(uuid4())
+                new_claim_token_ids.add(event.event_id)
+            claim_tokens[event.event_id] = existing_token
+        self._event_claim_tokens.update(claim_tokens)
+        claimed_event_ids: set[str] = set()
         async with self.sessions.begin() as session:
-            values = {
-                "event_id": event.event_id,
-                "block_date": event.block_time.date(),
-                "first_seen_at": event.observed_at,
-                "processing_status": "PROCESSING",
-                "processing_attempts": 1,
-                "last_attempt_at": now,
-                "processed_at": None,
-                "last_error": None,
-                "processing_token": claim_token,
-            }
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "postgresql":
-                statement: Any = pg_insert(EventDedupRow).values(**values).on_conflict_do_nothing(
-                    index_elements=[EventDedupRow.event_id]
-                )
-            elif dialect == "sqlite":
-                statement = sqlite_insert(EventDedupRow).values(**values).on_conflict_do_nothing(
-                    index_elements=[EventDedupRow.event_id]
-                )
-            else:
-                existing = await session.get(EventDedupRow, event.event_id)
-                if existing is None:
-                    session.add(EventDedupRow(**values))
-                    inserted = True
-                statement = None
-            if statement is not None:
-                result = await session.execute(statement)
-                rowcount = getattr(result, "rowcount", None)
-                inserted = bool(rowcount and rowcount > 0)
-            if not inserted:
-                existing = await session.get(EventDedupRow, event.event_id, with_for_update=True)
-                if existing is None:
-                    raise RuntimeError("event claim disappeared during conflict handling")
-                stale_claim = (
-                    existing.last_attempt_at is None
-                    or now - _as_utc(existing.last_attempt_at) >= timedelta(minutes=2)
-                )
-                if existing.processing_status == "PROCESSED" or (
-                    existing.processing_status == "PROCESSING"
-                    and not stale_claim
-                    and not reclaim
-                ):
-                    return False
-                existing.processing_status = "PROCESSING"
-                existing.processing_attempts += 1
-                existing.last_attempt_at = now
-                existing.last_error = None
-                existing.processing_token = claim_token
-            else:
-                session.add(
-                    RawChainEventRow(
-                        id=str(uuid4()),
-                        block_date=event.block_time.date(),
-                        event_id=event.event_id,
-                        source=event.source.value,
-                        protocol=event.protocol.value,
-                        event_type=event.event_type.value,
-                        slot=event.slot,
-                        signature=event.signature,
-                        instruction_index=event.instruction_index,
-                        inner_instruction_index=event.inner_instruction_index,
-                        block_time=event.block_time,
-                        observed_at=event.observed_at,
-                        commitment=event.commitment,
-                        mint=event.mint,
-                        pool_address=event.pool_address,
-                        payload_json=event.payload,
-                        created_at=now,
+                sequence_rows = (
+                    await session.scalars(
+                        text(
+                            "SELECT nextval('raw_chain_events_ingest_sequence_seq') "
+                            "FROM generate_series(1, :batch_size)"
+                        ),
+                        {"batch_size": len(events)},
                     )
+                ).all()
+                ingest_sequences = [int(value) for value in sequence_rows]
+            else:
+                last_sequence = await session.scalar(
+                    select(func.max(RawChainEventRow.ingest_sequence))
                 )
-        self._event_claim_tokens[event.event_id] = claim_token
+                first_sequence = int(last_sequence or 0) + 1
+                ingest_sequences = list(
+                    range(first_sequence, first_sequence + len(events))
+                )
+            for event, ingest_sequence in zip(
+                events, ingest_sequences, strict=True
+            ):
+                if event.event_id in seen_event_ids:
+                    accepted.append(False)
+                    continue
+                seen_event_ids.add(event.event_id)
+                claim_token = claim_tokens[event.event_id]
+                inserted = False
+                values = {
+                    "event_id": event.event_id,
+                    "block_date": event.block_time.date(),
+                    "first_seen_at": event.observed_at,
+                    "processing_status": "PROCESSING",
+                    "processing_attempts": 1,
+                    "last_attempt_at": now,
+                    "processed_at": None,
+                    "last_error": None,
+                    "processing_token": claim_token,
+                }
+                if dialect == "postgresql":
+                    statement: Any = (
+                        pg_insert(EventDedupRow)
+                        .values(**values)
+                        .on_conflict_do_nothing(index_elements=[EventDedupRow.event_id])
+                    )
+                elif dialect == "sqlite":
+                    statement = (
+                        sqlite_insert(EventDedupRow)
+                        .values(**values)
+                        .on_conflict_do_nothing(index_elements=[EventDedupRow.event_id])
+                    )
+                else:
+                    existing = await session.get(EventDedupRow, event.event_id)
+                    if existing is None:
+                        session.add(EventDedupRow(**values))
+                        inserted = True
+                    statement = None
+                if statement is not None:
+                    result = await session.execute(statement)
+                    rowcount = getattr(result, "rowcount", None)
+                    inserted = bool(rowcount and rowcount > 0)
+                if not inserted:
+                    existing = await session.get(
+                        EventDedupRow, event.event_id, with_for_update=True
+                    )
+                    if existing is None:
+                        raise RuntimeError("event claim disappeared during conflict handling")
+                    owned_token = self._event_claim_tokens.get(event.event_id)
+                    if (
+                        resume_owned
+                        and owned_token is not None
+                        and existing.processing_status == "PROCESSING"
+                        and existing.processing_token == owned_token
+                    ):
+                        claimed_event_ids.add(event.event_id)
+                        accepted.append(True)
+                        continue
+                    stale_claim = (
+                        existing.last_attempt_at is None
+                        or now - _as_utc(existing.last_attempt_at) >= timedelta(minutes=2)
+                    )
+                    if existing.processing_status == "PROCESSED" or (
+                        existing.processing_status == "PROCESSING"
+                        and not stale_claim
+                        and not reclaim
+                    ):
+                        accepted.append(False)
+                        continue
+                    existing.processing_status = "PROCESSING"
+                    existing.processing_attempts += 1
+                    existing.last_attempt_at = now
+                    existing.last_error = None
+                    existing.processing_token = claim_token
+                else:
+                    session.add(
+                        RawChainEventRow(
+                            id=str(uuid4()),
+                            ingest_sequence=ingest_sequence,
+                            block_date=event.block_time.date(),
+                            event_id=event.event_id,
+                            source=event.source.value,
+                            protocol=event.protocol.value,
+                            event_type=event.event_type.value,
+                            slot=event.slot,
+                            signature=event.signature,
+                            instruction_index=event.instruction_index,
+                            inner_instruction_index=event.inner_instruction_index,
+                            block_time=event.block_time,
+                            observed_at=event.observed_at,
+                            commitment=event.commitment,
+                            mint=event.mint,
+                            pool_address=event.pool_address,
+                            payload_json=event.payload,
+                            created_at=now,
+                        )
+                    )
+                claimed_event_ids.add(event.event_id)
+                accepted.append(True)
+        for event_id, claim_token in claim_tokens.items():
+            if (
+                event_id in new_claim_token_ids
+                and event_id not in claimed_event_ids
+                and self._event_claim_tokens.get(event_id) == claim_token
+            ):
+                self._event_claim_tokens.pop(event_id, None)
         self._observe_query(started)
-        return True
+        return accepted
+
+    async def record_event(self, event: EventEnvelope, *, reclaim: bool = False) -> bool:
+        """Claim one event through the ordered batch implementation."""
+        return (await self.record_events([event], reclaim=reclaim))[0]
 
     async def mark_event_processed(self, event_id: str, *, processed_at: datetime) -> None:
         claim_token = self._event_claim_tokens.get(event_id)
@@ -483,6 +574,25 @@ class Database:
                 raise RuntimeError("event processing claim was superseded")
         self._event_claim_tokens.pop(event_id, None)
 
+    async def update_raw_event_context(self, event: EventEnvelope) -> None:
+        """Persist decoder-enriched context within the active event transaction."""
+        started = time.perf_counter()
+        async with self._write_session() as session:
+            result = await session.execute(
+                update(RawChainEventRow)
+                .where(
+                    RawChainEventRow.event_id == event.event_id,
+                    RawChainEventRow.block_date == event.block_time.date(),
+                )
+                .values(mint=event.mint, pool_address=event.pool_address)
+            )
+            rowcount = getattr(result, "rowcount", None)
+            if rowcount != 1:
+                raise RuntimeError(
+                    f"raw event context update affected {rowcount} rows"
+                )
+        self._observe_query(started)
+
     async def load_processed_events_since(self, since: datetime) -> list[EventEnvelope]:
         async with self.sessions() as session:
             rows = (
@@ -492,13 +602,10 @@ class Database:
                     .where(
                         EventDedupRow.processing_status == "PROCESSED",
                         RawChainEventRow.block_time >= since,
+                        _processed_prefix_condition(),
                     )
-                    .order_by(
-                        RawChainEventRow.slot,
-                        RawChainEventRow.signature,
-                        RawChainEventRow.instruction_index,
-                        RawChainEventRow.inner_instruction_index,
-                    )
+                    .order_by(RawChainEventRow.ingest_sequence)
+
                 )
             ).all()
         return [_event_from_row(row) for row in rows]
@@ -524,42 +631,83 @@ class Database:
                         (EventDedupRow.processing_status == "FAILED")
                         | processing_filter,
                     )
-                    .order_by(
-                        RawChainEventRow.slot,
-                        RawChainEventRow.signature,
-                        RawChainEventRow.instruction_index,
-                        RawChainEventRow.inner_instruction_index,
-                    )
+                    .order_by(RawChainEventRow.ingest_sequence)
+
                 )
             ).all()
         return [_event_from_row(row) for row in rows]
 
     async def load_quarantined_event_protocols(self) -> set[str]:
         async with self.sessions() as session:
-            protocols = (
-                await session.scalars(
-                    select(RawChainEventRow.protocol)
-                    .join(
-                        EventDedupRow,
-                        EventDedupRow.event_id == RawChainEventRow.event_id,
+            protocols = set(
+                str(protocol)
+                for protocol in (
+                    await session.scalars(
+                        select(RawChainEventRow.protocol)
+                        .join(
+                            EventDedupRow,
+                            EventDedupRow.event_id == RawChainEventRow.event_id,
+                        )
+                        .where(
+                            EventDedupRow.processing_status.in_(
+                                ("FAILED", "PROCESSING")
+                            ),
+                            EventDedupRow.processing_attempts
+                            >= MAX_EVENT_PROCESSING_ATTEMPTS,
+                        )
+                        .distinct()
                     )
-                    .where(
-                        EventDedupRow.processing_status.in_(("FAILED", "PROCESSING")),
-                        EventDedupRow.processing_attempts
-                        >= MAX_EVENT_PROCESSING_ATTEMPTS,
-                    )
-                    .distinct()
+                ).all()
+            )
+            first_unresolved = await session.scalar(
+                select(func.min(RawChainEventRow.ingest_sequence))
+                .join(
+                    EventDedupRow,
+                    EventDedupRow.event_id == RawChainEventRow.event_id,
                 )
-            ).all()
-        return {str(protocol) for protocol in protocols}
+                .where(EventDedupRow.processing_status != "PROCESSED")
+            )
+            if first_unresolved is None:
+                return protocols
+            processed_suffix_count = await session.scalar(
+                select(func.count())
+                .select_from(RawChainEventRow)
+                .join(
+                    EventDedupRow,
+                    EventDedupRow.event_id == RawChainEventRow.event_id,
+                )
+                .where(
+                    RawChainEventRow.ingest_sequence > int(first_unresolved),
+                    EventDedupRow.processing_status == "PROCESSED",
+                )
+            )
+            if not processed_suffix_count:
+                return protocols
+            protocols.update(
+                str(protocol)
+                for protocol in (
+                    await session.scalars(
+                        select(RawChainEventRow.protocol)
+                        .where(
+                            RawChainEventRow.ingest_sequence
+                            >= int(first_unresolved)
+                        )
+                        .distinct()
+                    )
+                ).all()
+            )
+        return protocols
 
     async def load_stream_checkpoint(self) -> tuple[int, str | None, datetime | None]:
         async with self.sessions() as session:
             row = await session.scalar(
                 select(RawChainEventRow)
                 .join(EventDedupRow, EventDedupRow.event_id == RawChainEventRow.event_id)
-                .where(EventDedupRow.processing_status == "PROCESSED")
-                .order_by(RawChainEventRow.slot.desc(), RawChainEventRow.observed_at.desc())
+                .where(
+                    EventDedupRow.processing_status == "PROCESSED",
+                    _processed_prefix_condition(),
+                )
+                .order_by(RawChainEventRow.ingest_sequence.desc())
                 .limit(1)
             )
         if row is None:
@@ -582,12 +730,9 @@ class Database:
                     .where(
                         RawChainEventRow.protocol == protocol,
                         EventDedupRow.processing_status == "PROCESSED",
+                        _processed_prefix_condition(),
                     )
-                    .order_by(
-                        RawChainEventRow.slot.desc(),
-                        RawChainEventRow.instruction_index.desc(),
-                        RawChainEventRow.inner_instruction_index.desc(),
-                    )
+                    .order_by(RawChainEventRow.ingest_sequence.desc())
                     .limit(1)
                 )
                 if signature:

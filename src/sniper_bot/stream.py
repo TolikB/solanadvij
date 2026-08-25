@@ -19,7 +19,10 @@ from .solana_rpc import SolanaRpcClient, SolanaRpcError
 
 logger = logging.getLogger(__name__)
 
+TransactionItem = tuple[Protocol, dict[str, Any], EventSource]
 TransactionHandler = Callable[[Protocol, dict[str, Any], EventSource], Awaitable[None]]
+TransactionBatchHandler = Callable[[list[TransactionItem]], Awaitable[None]]
+FatalHandler = Callable[[BaseException], None]
 
 
 class EntryGate:
@@ -87,6 +90,10 @@ class HeliusStreamGateway:
     LOG_FETCH_CONCURRENCY = 20
     SLOT_BLOCK_TIME_CACHE_SIZE = 512
     BLOCK_TIME_RETRY_DELAYS = (0.25, 0.5, 1.0)
+    PROCESSING_BATCH_SIZE = 64
+    PROCESSING_BATCH_WINDOW_SECONDS = 0.05
+    PROCESSING_RETRY_LIMIT = 3
+    PROCESSING_RETRY_DELAYS = (1, 2)
 
     def __init__(
         self,
@@ -96,6 +103,8 @@ class HeliusStreamGateway:
         handler: TransactionHandler,
         entry_gate: EntryGate,
         metrics: BotMetrics,
+        batch_handler: TransactionBatchHandler | None = None,
+        fatal_handler: FatalHandler | None = None,
         queue_size: int = 2000,
         max_processing_lag_seconds: float = 3.0,
         log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
@@ -107,6 +116,8 @@ class HeliusStreamGateway:
         self.websocket_url = websocket_url
         self.rpc = rpc
         self.handler = handler
+        self.batch_handler = batch_handler
+        self.fatal_handler = fatal_handler
         self.entry_gate = entry_gate
         self.metrics = metrics
         self.last_slot = 0
@@ -118,7 +129,7 @@ class HeliusStreamGateway:
         self.last_processing_lag_seconds: float | None = None
         self.max_processing_lag_seconds = max_processing_lag_seconds
         self._baseline_started_at: datetime | None = None
-        self._queue: asyncio.Queue[tuple[Protocol, dict[str, Any], EventSource] | None] = asyncio.Queue(maxsize=queue_size)
+        self._queue: asyncio.Queue[TransactionItem | None] = asyncio.Queue(maxsize=queue_size)
         self._run_task: asyncio.Task[None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
@@ -161,8 +172,30 @@ class HeliusStreamGateway:
             self._run_task = None
         await self._cancel_log_fetch_tasks()
         if self._worker_task is not None:
-            await self._queue.put(None)
-            await self._worker_task
+            worker_task = self._worker_task
+            drain_task: asyncio.Task[None] | None = None
+            if not worker_task.done():
+                drain_task = asyncio.create_task(
+                    self._queue.join(), name="chain-event-queue-drain"
+                )
+                completed, _ = await asyncio.wait(
+                    {worker_task, drain_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if worker_task in completed:
+                    drain_task.cancel()
+                    try:
+                        await drain_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("chain event worker had already failed during shutdown")
             self._worker_task = None
 
     async def _run(self) -> None:
@@ -947,36 +980,76 @@ class HeliusStreamGateway:
             item = await self._queue.get()
             self._sync_queue_depth()
             if item is None:
+                self._queue.task_done()
                 return
-            protocol, transaction, source = item
+            batch = [item]
+            stop_after_batch = False
+            if self.batch_handler is not None:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.PROCESSING_BATCH_WINDOW_SECONDS
+                while len(batch) < self.PROCESSING_BATCH_SIZE:
+                    timeout = deadline - loop.time()
+                    if timeout <= 0:
+                        break
+                    try:
+                        next_item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                    except TimeoutError:
+                        break
+                    if next_item is None:
+                        stop_after_batch = True
+                        break
+                    batch.append(next_item)
+                self._sync_queue_depth()
             attempt = 0
             while True:
                 try:
-                    await self.handler(protocol, transaction, source)
+                    if self.batch_handler is not None:
+                        await self.batch_handler(batch)
+                    else:
+                        protocol, transaction, source = batch[0]
+                        await self.handler(protocol, transaction, source)
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as error:
                     attempt += 1
                     logger.exception(
-                        "chain event processing failed; retrying in order",
-                        extra={"protocol": protocol.value, "attempt": attempt},
+                        "chain event batch processing failed; retrying in order",
+                        extra={"batch_size": len(batch), "attempt": attempt},
                     )
                     self.entry_gate.block("event_processing_error")
-                    await asyncio.sleep(min(30, 2 ** min(attempt - 1, 5)))
+                    if attempt >= self.PROCESSING_RETRY_LIMIT:
+                        if self.fatal_handler is not None:
+                            self.fatal_handler(error)
+                        for _ in batch:
+                            self._queue.task_done()
+                        if stop_after_batch:
+                            self._queue.task_done()
+                        raise
+                    await asyncio.sleep(self.PROCESSING_RETRY_DELAYS[attempt - 1])
                     continue
                 self.entry_gate.unblock("event_processing_error")
-                block_time = _transaction_block_time(transaction)
-                if block_time is not None:
-                    processed_at = datetime.now(tz=timezone.utc)
+                processed_at = datetime.now(tz=timezone.utc)
+                block_times = [
+                    block_time
+                    for _, transaction, _ in batch
+                    if (block_time := _transaction_block_time(transaction)) is not None
+                ]
+                if block_times:
+                    latest_block_time = max(block_times)
                     if (
                         self.last_processed_block_time is None
-                        or block_time > self.last_processed_block_time
+                        or latest_block_time > self.last_processed_block_time
                     ):
-                        self.last_processed_block_time = block_time
+                        self.last_processed_block_time = latest_block_time
                     self.last_processing_lag_seconds = max(
-                        0.0, (processed_at - block_time).total_seconds()
+                        0.0, (processed_at - latest_block_time).total_seconds()
                     )
                 break
+            for _ in batch:
+                self._queue.task_done()
+            if stop_after_batch:
+                self._queue.task_done()
+                return
 
     def refresh_freshness(self, now: datetime | None = None) -> bool:
         now = now or datetime.now(tz=timezone.utc)

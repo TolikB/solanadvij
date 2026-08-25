@@ -95,6 +95,7 @@ class RawChainEventRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     block_date: Mapped[date] = mapped_column(Date, primary_key=True)
     event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    ingest_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
     protocol: Mapped[str] = mapped_column(String(32), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)

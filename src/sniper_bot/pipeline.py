@@ -183,16 +183,30 @@ class ConfirmationPipeline:
         transaction: dict[str, Any],
         source: EventSource = EventSource.HELIUS_WSS,
     ) -> None:
-        decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
-        try:
-            events = decoder.decode_transaction(transaction, source=source)
-        except AnchorDecodeError:
-            self.entry_gate.block_protocol(protocol)
-            await self._record_unknown(protocol, transaction, source)
-            raise
-        for event in events:
-            await self.process_event(event)
+        await self.process_transactions([(protocol, transaction, source)])
 
+    async def process_transactions(
+        self,
+        transactions: list[tuple[Protocol, dict[str, Any], EventSource]],
+    ) -> None:
+        events: list[EventEnvelope] = []
+        for protocol, transaction, source in transactions:
+            decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
+            try:
+                events.extend(decoder.decode_transaction(transaction, source=source))
+            except AnchorDecodeError:
+                self.entry_gate.block_protocol(protocol)
+                await self._record_unknown(protocol, transaction, source)
+                raise
+        if not events:
+            return
+        durable_results = (
+            await self.database.record_events(events, resume_owned=True)
+            if self.database
+            else [True] * len(events)
+        )
+        for event, durable_accepted in zip(events, durable_results, strict=True):
+            await self.process_event(event, durable_claim=durable_accepted)
     def _with_known_pool_mint(self, event: EventEnvelope) -> EventEnvelope:
         if event.mint is not None or not event.pool_address:
             return event
@@ -201,8 +215,16 @@ class ConfirmationPipeline:
             return event
         return event.model_copy(update={"mint": pool.base_mint})
 
-    async def process_event(self, event: EventEnvelope, *, recovering: bool = False) -> bool:
+    async def process_event(
+        self,
+        event: EventEnvelope,
+        *,
+        recovering: bool = False,
+        durable_claim: bool | None = None,
+    ) -> bool:
+        original_mint = event.mint
         event = self._with_known_pool_mint(event)
+        raw_context_changed = event.mint != original_mint
         self.metrics.chain_events_received.inc()
         lag_ms = max(
             Decimal("0"),
@@ -210,7 +232,13 @@ class ConfirmationPipeline:
         )
         self.metrics.chain_event_processing_lag_ms.observe(float(lag_ms))
         durable_accepted = (
-            await self.database.record_event(event, reclaim=recovering) if self.database else True
+            durable_claim
+            if durable_claim is not None
+            else (
+                await self.database.record_event(event, reclaim=recovering)
+                if self.database
+                else True
+            )
         )
         if not durable_accepted:
             self.metrics.chain_events_duplicate.inc()
@@ -235,6 +263,8 @@ class ConfirmationPipeline:
                 try:
                     async with self.database.event_state_transaction():
                         transaction_entered = True
+                        if raw_context_changed:
+                            await self.database.update_raw_event_context(event)
                         await self._apply_event(
                             event,
                             persist=True,

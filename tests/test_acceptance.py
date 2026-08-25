@@ -786,6 +786,7 @@ async def test_statistical_loader_fails_closed_on_config_cutoff_censoring_and_pe
                     id="raw-1",
                     block_date=date(2026, 6, 1),
                     event_id="event-1",
+                    ingest_sequence=1,
                     source="helius",
                     protocol="pumpswap",
                     event_type="pool_created",

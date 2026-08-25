@@ -161,6 +161,8 @@ class SniperRuntime:
             websocket_url=config.resolved_helius_wss_url(),
             rpc=self.rpc,
             handler=self.pipeline.process_transaction,
+            batch_handler=self.pipeline.process_transactions,
+            fatal_handler=self._request_fatal_restart,
             entry_gate=self.entry_gate,
             metrics=self.metrics,
             max_processing_lag_seconds=(
@@ -217,6 +219,9 @@ class SniperRuntime:
                     )
                 profiles, relations = await self.database.load_wallet_analysis()
                 self.wallet_analyzer.restore(profiles, relations)
+                quarantined_protocols = (
+                    await self.database.load_quarantined_event_protocols()
+                )
                 recovery_since = datetime.now(tz=timezone.utc) - timedelta(
                     seconds=max(
                         300,
@@ -248,12 +253,15 @@ class SniperRuntime:
                             runtime_checkpoint.get("momentum_windows") or {}
                         ).items()
                     }
-                for protocol in await self.database.load_quarantined_event_protocols():
+                for protocol in quarantined_protocols:
                     self.entry_gate.block_protocol(Protocol(protocol))
-                for event in await self.database.load_unprocessed_events(
-                    include_owned_processing=True
-                ):
-                    await self.pipeline.process_event(event, recovering=True)
+                if quarantined_protocols:
+                    self.entry_gate.block("event_quarantine")
+                else:
+                    for event in await self.database.load_unprocessed_events(
+                        include_owned_processing=True
+                    ):
+                        await self.pipeline.process_event(event, recovering=True)
                 for protocol, checkpoint in (
                     await self.database.load_protocol_checkpoints()
                 ).items():
@@ -287,7 +295,10 @@ class SniperRuntime:
                     raise
         if self.outbox_worker is not None and self.database_available:
             await self.outbox_worker.start()
-        await self.stream_gateway.start()
+        if "event_quarantine" not in self.entry_gate.reasons:
+            await self.stream_gateway.start()
+        else:
+            logger.critical("chain stream disabled because terminal events require review")
         self.entry_gate.block("warmup")
         self._background_tasks = [
             asyncio.create_task(self._candidate_loop(), name="candidate-loop"),
