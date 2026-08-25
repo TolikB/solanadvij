@@ -107,52 +107,10 @@ class PaperService:
         return sum(1 for decision in decisions if decision.should_exit)
 
     async def _notify_trade_alert(self, message: str) -> None:
-        if self._persistent_outbox_available():
-            return
-        notifier = getattr(self._runtime, "notifier", None)
-        if notifier is None or not hasattr(notifier, "send"):
-            return
-        try:
-            await notifier.send(message)
-        except Exception:
-            return
+        return
 
     async def _notify_risk_alert(self, message: str) -> None:
-        if self._persistent_outbox_available():
-            digest = __import__("hashlib").sha256(message.encode()).hexdigest()
-            await self._runtime.database.enqueue_outbox(  # type: ignore[union-attr]
-                idempotency_key=f"risk:{digest}",
-                event_type="risk_alert",
-                payload={"text": message},
-            )
-            return
-        notifier = getattr(self._runtime, "notifier", None)
-        if notifier is None or not hasattr(notifier, "send"):
-            return
-        try:
-            await notifier.send(message)
-        except Exception:
-            return
+        return
 
     async def _notify_system_alert(self, message: str) -> None:
-        if self._persistent_outbox_available():
-            digest = __import__("hashlib").sha256(message.encode()).hexdigest()
-            await self._runtime.database.enqueue_outbox(  # type: ignore[union-attr]
-                idempotency_key=f"system:{digest}",
-                event_type="system_alert",
-                payload={"text": message},
-            )
-            return
-        notifier = getattr(self._runtime, "notifier", None)
-        if notifier is None or not hasattr(notifier, "send"):
-            return
-        try:
-            await notifier.send(message)
-        except Exception:
-            return
-
-    def _persistent_outbox_available(self) -> bool:
-        return bool(
-            getattr(self._runtime, "database", None) is not None
-            and getattr(self._runtime, "database_available", False)
-        )
+        return

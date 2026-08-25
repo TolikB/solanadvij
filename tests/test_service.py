@@ -84,9 +84,7 @@ async def test_service_forwards_order_id_to_broker_calls() -> None:
         ("close", ("TOKEN", Decimal("5"), "order-2")),
         ("close_half", ("TOKEN", "order-3")),
     ]
-    assert any(msg.startswith("trade alert: open token=TOKEN") for msg in notifier.sent)
-    assert any(msg.startswith("trade alert: close token=TOKEN") for msg in notifier.sent)
-    assert any("close_half token=TOKEN" in msg for msg in notifier.sent)
+    assert notifier.sent == []
 
 
 @pytest.mark.asyncio
@@ -98,7 +96,7 @@ async def test_service_in_record_mode_raises() -> None:
 
 
 @pytest.mark.asyncio
-async def test_service_sends_risk_alert_when_open_is_blocked() -> None:
+async def test_service_suppresses_risk_alert_when_open_is_blocked() -> None:
     notifier = _NotifierSpy()
     broker = _RiskBlockingBroker(ExecutionBlockedError("MAX_POSITION_LIMIT"))
     service = PaperService(_Runtime(broker, notifier))
@@ -106,8 +104,4 @@ async def test_service_sends_risk_alert_when_open_is_blocked() -> None:
     with pytest.raises(ExecutionBlockedError):
         await service.open_position("TOKEN", Decimal("10"))
 
-    assert any(msg.startswith("trade alert blocked: open token=TOKEN") for msg in notifier.sent)
-    assert any(
-        msg.startswith("risk alert: blocked open token=TOKEN")
-        for msg in notifier.sent
-    )
+    assert notifier.sent == []

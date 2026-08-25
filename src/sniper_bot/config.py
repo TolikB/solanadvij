@@ -121,7 +121,7 @@ class ExitConfig(BaseModel):
 class TelegramConfig(BaseModel):
     enabled: bool = True
     daily_report_time: str = "00:05"
-    include_all_time_with_daily: bool = True
+    include_all_time_with_daily: bool = False
 
     @field_validator("daily_report_time")
     @classmethod

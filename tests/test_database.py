@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from sniper_bot.database import Database
+from sniper_bot.database import Database, _telegram_report_text
 from sniper_bot.db_models import (
     DailyReportRow,
     EventDedupRow,
@@ -15,6 +15,48 @@ from sniper_bot.db_models import (
 )
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.registry import WSOL_MINT, PoolRecord, TokenRecord
+
+
+def test_daily_telegram_report_is_human_readable_and_trade_only() -> None:
+    text = _telegram_report_text(
+        {
+            "period": "daily",
+            "date": "2026-08-25",
+            "capital": {
+                "starting_equity_usd": "500",
+                "ending_equity_usd": "512.34",
+                "realized_pnl_usd": "10",
+                "unrealized_pnl_usd": "2.34",
+            },
+            "signals": {"paper_entries": 3},
+            "trades": {
+                "closed": 2,
+                "profitable": 1,
+                "losing": 1,
+                "win_rate": "0.5",
+            },
+            "open_positions": [{}],
+            "strategy_version": "must-not-be-shown",
+            "config_hash": "must-not-be-shown",
+            "report_id": "must-not-be-shown",
+        }
+    )
+
+    assert text == (
+        "Щоденний звіт про тестову торгівлю\n"
+        "Дата: 2026-08-25\n"
+        "Баланс: $500.00 -> $512.34\n"
+        "Результат дня: +$12.34\n"
+        "Закритий PnL: +$10.00\n"
+        "Відкритий PnL: +$2.34\n"
+        "Угоди: відкрито 3, закрито 2\n"
+        "Результати: прибуткових 1, збиткових 1\n"
+        "Частка прибуткових: 50.0%\n"
+        "Відкриті позиції: 1"
+    )
+    assert "strategy" not in text
+    assert "config" not in text
+    assert "report_id" not in text
 
 
 @pytest.mark.asyncio

@@ -91,7 +91,7 @@ exits:
 telegram:
   enabled: true
   daily_report_time: "00:05"
-  include_all_time_with_daily: true
+  include_all_time_with_daily: false
 enrichment:
   enabled: true
   timeout_ms: 2500

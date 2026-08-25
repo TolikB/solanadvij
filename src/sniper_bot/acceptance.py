@@ -108,17 +108,7 @@ RUNTIME_CLAIM_SOURCE_TYPES = {
     "timing_nfrs": "benchmark",
 }
 REQUIRED_TELEGRAM_EVENT_TYPES = frozenset(
-    {
-        "entry",
-        "partial_exit",
-        "full_exit",
-        "risk",
-        "technical_error",
-        "system_start",
-        "system_stop",
-        "daily_report",
-        "all_time_report",
-    }
+    {"system_start", "system_stop", "daily_report"}
 )
 REQUIRED_HARD_FILTER_PROOFS = frozenset(
     {
@@ -398,9 +388,9 @@ class TelegramRuntimeEvidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     delivered_event_types: set[str]
-    fill_alert_p95_seconds: Decimal = Field(ge=0, lt=5)
+    lifecycle_alert_p95_seconds: Decimal = Field(ge=0, lt=5)
     unauthorized_access_blocked: Literal[True]
-    fill_alert_after_database_commit: Literal[True]
+    lifecycle_alert_after_database_commit: Literal[True]
     outbox_redelivery_duplicates: int = Field(ge=0, le=0)
     outage_collection_continued: Literal[True]
     undelivered_messages_retained: Literal[True]
@@ -434,7 +424,7 @@ class PerformanceRuntimeEvidence(BaseModel):
 
     internal_event_p95_ms: Decimal = Field(ge=0, lt=250)
     feature_update_p95_ms: Decimal = Field(ge=0, lt=100)
-    telegram_fill_alert_p95_seconds: Decimal = Field(ge=0, lt=5)
+    telegram_lifecycle_alert_p95_seconds: Decimal = Field(ge=0, lt=5)
     daily_report_max_seconds: Decimal = Field(ge=0, lt=120)
 
 

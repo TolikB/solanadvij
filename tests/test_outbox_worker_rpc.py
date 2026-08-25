@@ -144,6 +144,7 @@ async def test_outbox_worker_classifies_delivery_outcomes(tmp_path) -> None:
         _ClassifyingNotifier(),
         metrics=BotMetrics(),
         poll_seconds=0.01,
+        allowed_event_types=frozenset({"test"}),
     )
     assert await worker.deliver_once() == 1
 
@@ -163,12 +164,47 @@ async def test_outbox_worker_classifies_delivery_outcomes(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_outbox_worker_suppresses_disallowed_event_types(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'outbox-policy.db'}")
+    await database.create_schema_for_tests()
+    assert await database.enqueue_outbox(
+        idempotency_key="blocked-risk",
+        event_type="risk_alert",
+        payload={"text": "risk"},
+    )
+    assert await database.enqueue_outbox(
+        idempotency_key="allowed-daily",
+        event_type="daily_report",
+        payload={"text": "daily"},
+    )
+    notifier = AsyncMock()
+    notifier.send_immediate.return_value = "daily-message"
+    worker = TelegramOutboxWorker(
+        database,
+        notifier,
+        metrics=BotMetrics(),
+        allowed_event_types=frozenset({"daily_report"}),
+    )
+
+    assert await worker.deliver_once() == 1
+    notifier.send_immediate.assert_awaited_once_with("daily", chat_id=None)
+    async with database.sessions() as session:
+        rows = list((await session.scalars(select(OutboxEventRow))).all())
+    states = {row.idempotency_key: row.delivery_state for row in rows}
+    assert states == {
+        "blocked-risk": "DEAD",
+        "allowed-daily": "DELIVERED",
+    }
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_outbox_worker_drain_delivers_before_shutdown(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'outbox-drain.db'}")
     await database.create_schema_for_tests()
     assert await database.enqueue_outbox(
         idempotency_key="shutdown-alert",
-        event_type="system_alert",
+        event_type="system_stop",
         payload={"text": "sniper bot stopped"},
     )
     worker = TelegramOutboxWorker(

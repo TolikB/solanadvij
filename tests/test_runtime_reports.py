@@ -85,6 +85,36 @@ async def test_daily_report_if_not_sent_is_idempotent(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_daily_report_direct_delivery_retries_before_marking_sent(tmp_path) -> None:
+    class FlakyNotifier:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.messages: list[str] = []
+
+        async def send(self, message: str) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("temporary Telegram failure")
+            self.messages.append(message)
+
+    runtime = SniperRuntime(AppConfig(**_base_config("record")), data_dir=tmp_path)
+    notifier = FlakyNotifier()
+    runtime.notifier = notifier
+    runtime._today_key = lambda: "2026-08-18"  # type: ignore[method-assign]
+
+    first = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
+
+    assert first is None
+    assert runtime._report_runs.get("last_daily_report_date") != "2026-08-18"
+
+    second = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
+
+    assert second is not None
+    assert notifier.calls == 2
+    assert notifier.messages[0].startswith("Щоденний звіт про тестову торгівлю\n")
+    assert "report_id" not in notifier.messages[0]
+
+@pytest.mark.asyncio
 async def test_missing_historical_snapshot_notifies_once_and_allows_backfill(tmp_path) -> None:
     class MissingHistoricalSnapshotDatabase:
         def __init__(self) -> None:
@@ -131,8 +161,13 @@ async def test_missing_historical_snapshot_notifies_once_and_allows_backfill(tmp
     }
     assert second is None
     assert len(database.outbox_calls) == 2
-    assert "status=NO_DATA" in str(database.outbox_calls[0]["payload"])
-    assert "values_not_inferred=true" in str(database.outbox_calls[0]["payload"])
+    assert database.outbox_calls[0]["payload"] == {
+        "text": (
+            "Щоденний звіт про тестову торгівлю\n"
+            "Дата: 2026-08-18\n"
+            "Дані за цей день недоступні."
+        )
+    }
     assert database.store_calls == []
 
     database.bounds = {

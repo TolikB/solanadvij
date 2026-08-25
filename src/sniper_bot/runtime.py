@@ -13,12 +13,12 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .broker import PaperBroker
 from .candidates import Candidate, CandidateState
 from .config import AppConfig, AppMode
-from .database import ActiveRuntimeError, Database
+from .database import ActiveRuntimeError, Database, _telegram_report_text
 from .enrichment import DexscreenerClient
 from .events import ChainEventType, EventEnvelope, Protocol
 from .exit_engine import ExitDecision, ExitPolicy, ExitReason, evaluate_exit
@@ -491,20 +491,16 @@ class SniperRuntime:
                 event_type="daily_report_unavailable",
                 payload={
                     "text": (
-                        f"DAILY PAPER REPORT | date={target} | status=NO_DATA | "
-                        "reason=historical_equity_snapshot_unavailable | "
-                        "values_not_inferred=true"
+                        "Щоденний звіт про тестову торгівлю\n"
+                        f"Дата: {target}\n"
+                        "Дані за цей день недоступні."
                     )
                 },
             )
             return report if inserted else None
         report = self.report_builder.daily(target, capital_bounds=capital_bounds)
-        all_time_report = (
-            await self.build_all_time_report_with_history()
-            if self.config.telegram.include_all_time_with_daily
-            else None
-        )
-        if send and self.database is not None:
+        all_time_report = None
+        if send and self.database is not None and self.database_available:
             inserted = await self.database.store_daily_report(
                 report=report,
                 include_all_time=all_time_report,
@@ -512,24 +508,10 @@ class SniperRuntime:
             if not inserted:
                 return None
         elif send:
-            await self._notify_system_alert(f"daily report: {json.dumps(report, sort_keys=True)}")
+            if not await self._notify_daily_report(report):
+                return None
         self._record_daily_report_sent(target, str(report["report_id"]))
         return report
-
-    async def queue_all_time_report(self) -> bool:
-        report = await self.build_all_time_report_with_history()
-        if self.database is None:
-            return False
-        return await self.database.enqueue_outbox(
-            idempotency_key=f"telegram:shutdown-all-time:{report['report_id']}",
-            event_type="all_time_report",
-            payload={
-                "text": (
-                    f"ALL-TIME PAPER REPORT equity={report.get('current_equity_usd')} "
-                    f"pnl={report.get('net_pnl_usd')} report_id={report['report_id']}"
-                )
-            },
-        )
 
     def daily_loss_exceeded(self, limit: float | int | None = None) -> bool:
         limit_value = self.config.risk.daily_loss_limit_usdc if limit is None else limit
@@ -1271,28 +1253,25 @@ class SniperRuntime:
         return decisions
 
     async def _notify_trade_alert(self, message: str) -> None:
-        notifier = getattr(self, "notifier", None)
-        if notifier is None or not hasattr(notifier, "send"):
-            return
-        try:
-            await notifier.send(message)
-        except Exception as exc:
-            logger.warning("trade alert delivery failed error_type=%s", type(exc).__name__)
+        logger.info("proactive Telegram trade alert suppressed")
 
-    async def _notify_system_alert(self, message: str) -> None:
+    async def _notify_lifecycle_alert(
+        self, event_type: str, message: str
+    ) -> None:
+        if event_type not in {"system_start", "system_stop"}:
+            raise ValueError("unsupported Telegram lifecycle event type")
         if self.database is not None and self.database_available:
-            digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:24]
             run_id = self._system_run_id or "unregistered"
             try:
                 await self.database.enqueue_outbox(
-                    idempotency_key=f"telegram:system:{run_id}:{digest}",
-                    event_type="system_alert",
+                    idempotency_key=f"telegram:{event_type}:{run_id}",
+                    event_type=event_type,
                     payload={"text": message},
                 )
                 return
             except Exception as exc:
                 logger.error(
-                    "system alert outbox enqueue failed error_type=%s",
+                    "lifecycle alert outbox enqueue failed error_type=%s",
                     type(exc).__name__,
                 )
         notifier = getattr(self, "notifier", None)
@@ -1301,8 +1280,27 @@ class SniperRuntime:
         try:
             await notifier.send(message)
         except Exception as exc:
-            logger.warning("system alert delivery failed error_type=%s", type(exc).__name__)
+            logger.warning(
+                "lifecycle alert delivery failed error_type=%s",
+                type(exc).__name__,
+            )
 
+    async def _notify_daily_report(self, report: dict[str, Any]) -> bool:
+        notifier = getattr(self, "notifier", None)
+        if notifier is None or not hasattr(notifier, "send"):
+            return False
+        try:
+            await notifier.send(_telegram_report_text(report))
+        except Exception as exc:
+            logger.warning(
+                "daily report delivery failed error_type=%s",
+                type(exc).__name__,
+            )
+            return False
+        return True
+
+    async def _notify_system_alert(self, message: str) -> None:
+        logger.warning("proactive Telegram system alert suppressed")
     def _report_id(self, payload: dict[str, object]) -> str:
         report_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(report_payload.encode("utf-8")).hexdigest()[:24]

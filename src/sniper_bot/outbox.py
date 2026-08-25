@@ -11,6 +11,10 @@ from .metrics import BotMetrics
 
 logger = logging.getLogger(__name__)
 
+PROACTIVE_TELEGRAM_EVENT_TYPES = frozenset(
+    {"system_start", "system_stop", "daily_report", "daily_report_unavailable"}
+)
+
 
 class TelegramOutboxWorker:
     def __init__(
@@ -20,11 +24,13 @@ class TelegramOutboxWorker:
         *,
         metrics: BotMetrics,
         poll_seconds: float = 1.0,
+        allowed_event_types: frozenset[str] = PROACTIVE_TELEGRAM_EVENT_TYPES,
     ) -> None:
         self.database = database
         self.notifier = notifier
         self.metrics = metrics
         self.poll_seconds = poll_seconds
+        self.allowed_event_types = allowed_event_types
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -68,6 +74,12 @@ class TelegramOutboxWorker:
             claim_token = event.claim_token
             if claim_token is None:
                 raise RuntimeError("claimed outbox event has no fencing token")
+            if event.event_type not in self.allowed_event_types:
+                await self.database.mark_outbox_dead(
+                    event.id, claim_token, "TELEGRAM_POLICY_BLOCKED"
+                )
+                self.metrics.telegram_messages.labels(status="suppressed").inc()
+                continue
             payload = event.payload_json
             text = str(payload.get("text") or "").strip()
             chat_id = payload.get("chat_id")

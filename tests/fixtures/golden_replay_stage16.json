@@ -1,11 +1,11 @@
 {
   "name": "golden_replay_v1",
   "description": "Stage 16 baseline paper replay fixture",
-  "strategy_version": "aedc95ea47dda29a",
-  "config_hash": "aedc95ea47dda29a412e1e9b0d99576d86f946260d2d72d82719cc16a3f5f9dc",
+  "strategy_version": "db215b9461bd010f",
+  "config_hash": "db215b9461bd010f88ab530b9e81c24fb8643d1ffeb2a824987f86e2b019b974",
   "strategy_seed": 17,
   "time_zone": "Europe/Kyiv",
-  "input_hash": "2bd54b7ff11310a3a0d8690b6b4e2b6dbd53475708953fa9991b111536e9264b",
+  "input_hash": "b8ca11a4d4fbf01ca5be47f945765e9fe0e026e094ef255ffa66e31e64c84610",
   "output_hash": "8de958fe1a323aa0b5007b7f89fbfd592ed2a7232b1b81f8eaffccf84f88d377",
   "actions": [
     {

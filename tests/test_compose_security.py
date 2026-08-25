@@ -74,5 +74,5 @@ def test_compose_requires_valid_telegram_runtime_config() -> None:
     assert 'TELEGRAM: "${TELEGRAM:?TELEGRAM is required}"' in compose
     assert (
         'TELEGRAM={"enabled":true,"daily_report_time":"00:05",'
-        '"include_all_time_with_daily":true}'
+        '"include_all_time_with_daily":false}'
     ) in env_example

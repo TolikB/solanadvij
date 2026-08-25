@@ -2083,15 +2083,26 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
         capital = report.get("capital") or {}
         signals = report.get("signals") or {}
         trades = report.get("trades") or {}
+        starting = _report_decimal(capital.get("starting_equity_usd"))
+        ending = _report_decimal(capital.get("ending_equity_usd"))
+        day_result = ending - starting
+        open_positions = report.get("open_positions")
+        open_count = len(open_positions) if isinstance(open_positions, list) else 0
         return (
-            f"DAILY PAPER REPORT {report.get('date')} ({report.get('timezone')})\n"
-            f"equity={capital.get('ending_equity_usd')} pnl={capital.get('realized_pnl_usd')} "
-            f"return={capital.get('net_return_pct')}\n"
-            f"pools={signals.get('new_pools')} hard_rejects={signals.get('hard_rejects')} "
-            f"entries={signals.get('paper_entries')}\n"
-            f"closed={trades.get('closed')} win_rate={trades.get('win_rate')} "
-            f"profit_factor={trades.get('profit_factor')}\n"
-            f"report_id={report.get('report_id')}"
+            "Щоденний звіт про тестову торгівлю\n"
+            f"Дата: {report.get('date')}\n"
+            f"Баланс: {_format_usd(starting)} -> {_format_usd(ending)}\n"
+            f"Результат дня: {_format_usd(day_result, signed=True)}\n"
+            "Закритий PnL: "
+            f"{_format_usd(capital.get('realized_pnl_usd'), signed=True)}\n"
+            "Відкритий PnL: "
+            f"{_format_usd(capital.get('unrealized_pnl_usd'), signed=True)}\n"
+            f"Угоди: відкрито {_report_int(signals.get('paper_entries'))}, "
+            f"закрито {_report_int(trades.get('closed'))}\n"
+            f"Результати: прибуткових {_report_int(trades.get('profitable'))}, "
+            f"збиткових {_report_int(trades.get('losing'))}\n"
+            f"Частка прибуткових: {_format_percent(trades.get('win_rate'))}\n"
+            f"Відкриті позиції: {open_count}"
         )
     stats = report.get("trade_statistics") or {}
     return (
@@ -2102,3 +2113,29 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
         f"win_rate={stats.get('win_rate')} profit_factor={stats.get('profit_factor')}\n"
         f"report_id={report.get('report_id')}"
     )
+
+
+def _report_decimal(value: object) -> Decimal:
+    try:
+        return Decimal(str(value if value is not None else "0"))
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _report_int(value: object) -> int:
+    try:
+        if isinstance(value, (str, int, float, Decimal)):
+            return int(value)
+        return 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_usd(value: object, *, signed: bool = False) -> str:
+    amount = _report_decimal(value)
+    sign = "-" if amount < 0 else "+" if signed and amount > 0 else ""
+    return f"{sign}${abs(amount):,.2f}"
+
+
+def _format_percent(value: object) -> str:
+    return f"{_report_decimal(value) * Decimal('100'):.1f}%"

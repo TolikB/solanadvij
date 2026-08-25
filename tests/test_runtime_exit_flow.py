@@ -123,7 +123,7 @@ async def test_runtime_evaluate_and_close_exits_takes_profit(tmp_path: Path) -> 
     snapshot = runtime.ledger.snapshot()
     assert snapshot["positions"][0]["status"] == "open"
     assert snapshot["positions"][0]["tp1_taken"] is True
-    assert any("auto_exit token=TOKEN reason=TP1" in message for message in runtime.notifier.sent)
+    assert runtime.notifier.sent == []
 
 
 @pytest.mark.asyncio
@@ -168,7 +168,7 @@ async def test_runtime_evaluate_and_close_exits_respects_max_positions_limit(tmp
     open_count = sum(1 for row in snapshot["positions"] if row["status"] == "open")
     assert closed_count == 1
     assert open_count == 1
-    assert len([message for message in runtime.notifier.sent if "auto_exit" in message]) == 1
+    assert runtime.notifier.sent == []
 
 
 @pytest.mark.asyncio

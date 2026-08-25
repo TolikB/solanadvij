@@ -303,9 +303,9 @@ def _runtime_artifact(now: datetime, receipt_root=None) -> RuntimeAcceptanceArti
             },
             "telegram": {
                 "delivered_event_types": sorted(REQUIRED_TELEGRAM_EVENT_TYPES),
-                "fill_alert_p95_seconds": "4.9",
+                "lifecycle_alert_p95_seconds": "4.9",
                 "unauthorized_access_blocked": True,
-                "fill_alert_after_database_commit": True,
+                "lifecycle_alert_after_database_commit": True,
                 "outbox_redelivery_duplicates": 0,
                 "outage_collection_continued": True,
                 "undelivered_messages_retained": True,
@@ -326,7 +326,7 @@ def _runtime_artifact(now: datetime, receipt_root=None) -> RuntimeAcceptanceArti
             "performance": {
                 "internal_event_p95_ms": "249.9",
                 "feature_update_p95_ms": "99.9",
-                "telegram_fill_alert_p95_seconds": "4.9",
+                "telegram_lifecycle_alert_p95_seconds": "4.9",
                 "daily_report_max_seconds": "119.9",
             },
         }

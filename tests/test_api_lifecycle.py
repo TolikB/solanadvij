@@ -34,9 +34,12 @@ class _Runtime:
     async def start(self) -> None:
         self.events.append("runtime-start")
 
-    async def _notify_system_alert(self, message: str) -> None:
+    async def _notify_lifecycle_alert(self, event_type: str, message: str) -> None:
         assert "runtime-start" in self.events
-        self.events.append("alert-start" if "started" in message else "alert-stop")
+        assert message in {"Бот запущено.", "Бот зупинено."}
+        self.events.append(
+            "alert-start" if event_type == "system_start" else "alert-stop"
+        )
 
     async def queue_all_time_report(self) -> bool:
         self.events.append("all-time-report")
@@ -55,7 +58,7 @@ class _Runtime:
         return {"period": "all_time", "drawdown_source": "equity_marks"}
 
 
-def test_api_lifespan_starts_notifier_before_runtime_and_queues_durable_alerts() -> None:
+def test_api_lifespan_sends_only_lifecycle_alerts() -> None:
     runtime = _Runtime()
     with TestClient(build_api(runtime)) as client:
         assert runtime.events == [
@@ -73,6 +76,5 @@ def test_api_lifespan_starts_notifier_before_runtime_and_queues_durable_alerts()
         "runtime-start",
         "alert-start",
         "alert-stop",
-        "all-time-report",
         "runtime-shutdown",
     ]

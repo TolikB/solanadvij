@@ -180,15 +180,13 @@ def build_api(runtime: Any) -> FastAPI:
                 logging.getLogger(__name__).exception("Telegram startup failed")
         if hasattr(runtime, "start"):
             await runtime.start()
-        if hasattr(runtime, "_notify_system_alert"):
-            await runtime._notify_system_alert(
-                f"sniper bot started | mode={mode_value()} | strategy={runtime.config.strategy_version}"
+        if hasattr(runtime, "_notify_lifecycle_alert"):
+            await runtime._notify_lifecycle_alert(
+                "system_start", "Бот запущено."
             )
         elif notifier is not None:
             try:
-                await notifier.send(
-                    f"sniper bot started | mode={mode_value()} | strategy={runtime.config.strategy_version}"
-                )
+                await notifier.send("Бот запущено.")
             except Exception:
                 logging.getLogger(__name__).exception("Telegram startup alert failed")
 
@@ -196,19 +194,16 @@ def build_api(runtime: Any) -> FastAPI:
         if getattr(runtime.config, "replay_mode", False):
             return
         notifier = getattr(runtime, "notifier", None)
-        if hasattr(runtime, "_notify_system_alert"):
-            await runtime._notify_system_alert(
-                f"sniper bot stopped | mode={mode_value()} | strategy={runtime.config.strategy_version}"
+        if hasattr(runtime, "_notify_lifecycle_alert"):
+            await runtime._notify_lifecycle_alert(
+                "system_stop", "Бот зупинено."
             )
         elif notifier is not None:
             try:
-                await notifier.send(
-                    f"sniper bot stopped | mode={mode_value()} | strategy={runtime.config.strategy_version}"
-                )
+                await notifier.send("Бот зупинено.")
             except Exception:
                 logging.getLogger(__name__).exception("Telegram shutdown alert failed")
-        if hasattr(runtime, "queue_all_time_report"):
-            await runtime.queue_all_time_report()
+
         if hasattr(runtime, "shutdown"):
             await runtime.shutdown()
         elif notifier is not None:
