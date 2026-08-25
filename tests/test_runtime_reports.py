@@ -80,3 +80,41 @@ async def test_daily_report_if_not_sent_is_idempotent(tmp_path) -> None:
     assert second is None
     assert runtime._report_runs["last_daily_report_date"] == "2026-08-18"
     assert runtime._report_runs["last_daily_report_id"] == str(first["report_id"])
+
+
+@pytest.mark.asyncio
+async def test_missing_historical_snapshot_queues_explicit_no_data_report(tmp_path) -> None:
+    class MissingHistoricalSnapshotDatabase:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def load_daily_equity_bounds(self, **_kwargs: object) -> None:
+            return None
+
+        async def store_daily_report(self, **kwargs: object) -> bool:
+            self.calls.append(kwargs)
+            return True
+
+    runtime = SniperRuntime(AppConfig(**_base_config("paper")), data_dir=tmp_path)
+    database = MissingHistoricalSnapshotDatabase()
+    runtime.database = database  # type: ignore[assignment]
+    runtime.database_available = True
+    runtime.config.telegram.include_all_time_with_daily = False
+    runtime._today_key = lambda: "2026-08-19"  # type: ignore[method-assign]
+
+    first = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
+    second = await runtime.daily_report_if_not_sent(date="2026-08-18", send=True)
+
+    assert first is not None
+    assert first["data_status"] == "unavailable"
+    assert first["equity_usd"] is None
+    assert first["pnl"] is None
+    assert first["reconcile"] == {
+        "is_reconciled": False,
+        "reason": "historical_equity_snapshot_unavailable",
+    }
+    assert second is None
+    assert len(database.calls) == 1
+    assert database.calls[0]["report"] == first
+    assert "status=NO_DATA" in str(database.calls[0]["telegram_text"])
+    assert "values_not_inferred=true" in str(database.calls[0]["telegram_text"])

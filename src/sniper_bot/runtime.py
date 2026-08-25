@@ -425,15 +425,45 @@ class SniperRuntime:
         if self._daily_report_already_sent(target):
             return None
         capital_bounds = None
+        historical_snapshot_unavailable = False
         if self.database is not None and self.database_available:
             capital_bounds = await self.database.load_daily_equity_bounds(
                 account_id="paper-main",
                 report_date=target,
                 timezone_name=self.config.time_zone,
             )
-            if capital_bounds is None and target < self._today_key():
-                raise RuntimeError("historical daily equity snapshot is unavailable")
-        report = self.report_builder.daily(target, capital_bounds=capital_bounds)
+            historical_snapshot_unavailable = capital_bounds is None and target < self._today_key()
+        if historical_snapshot_unavailable:
+            unavailable_reason = "historical_equity_snapshot_unavailable"
+            report: dict[str, object] = {
+                "period": "daily",
+                "date": target,
+                "timezone": self.config.time_zone,
+                "strategy_version": self.config.strategy_version,
+                "data_status": "unavailable",
+                "data_status_reason": unavailable_reason,
+                "candidate_count": None,
+                "closed_trade_count": None,
+                "equity_usd": None,
+                "realized_pnl_usd": None,
+                "unrealized_pnl_usd": None,
+                "net_pnl_usd": None,
+                "pnl": None,
+                "sample_size_warning": True,
+                "reconcile": {
+                    "is_reconciled": False,
+                    "reason": unavailable_reason,
+                },
+                "open_positions": [],
+            }
+            report["report_id"] = self._report_id(report)
+            telegram_text = (
+                f"DAILY PAPER REPORT | date={target} | status=NO_DATA | "
+                "reason=historical_equity_snapshot_unavailable | values_not_inferred=true"
+            )
+        else:
+            report = self.report_builder.daily(target, capital_bounds=capital_bounds)
+            telegram_text = None
         all_time_report = (
             await self.build_all_time_report_with_history()
             if self.config.telegram.include_all_time_with_daily
@@ -443,6 +473,7 @@ class SniperRuntime:
             inserted = await self.database.store_daily_report(
                 report=report,
                 include_all_time=all_time_report,
+                telegram_text=telegram_text,
             )
             if not inserted:
                 return None
