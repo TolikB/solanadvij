@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
+from sniper_bot.events import EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import (
@@ -272,7 +274,162 @@ async def test_run_closes_transaction_socket_and_persists_logs_only_mode(
             "logsSubscribe",
             "logsSubscribe",
         ]
-        assert gateway.entry_gate.enabled is True
+        assert gateway.entry_gate.enabled is False
+        assert "startup" not in gateway.entry_gate.reasons
+        assert "stream_disconnected" not in gateway.entry_gate.reasons
+        assert "stream_stale" in gateway.entry_gate.reasons
+    finally:
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+
+@pytest.mark.asyncio
+async def test_live_baseline_tags_transactions_non_tradable_until_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    gateway._begin_live_baseline()
+    monkeypatch.setattr(
+        "sniper_bot.stream._transaction_protocols",
+        lambda _transaction: [Protocol.PUMP],
+    )
+    transaction = {"slot": 1, "signature": "baseline-signature"}
+
+    await gateway._queue_transaction(transaction, EventSource.SOLANA_WSS)
+    _, _, baseline_source = gateway._queue.get_nowait()
+    assert baseline_source == EventSource.BASELINE_WSS
+
+    gateway._baseline_started_at = (
+        datetime.now(tz=timezone.utc) - gateway.LIVE_BASELINE_WARMUP
+    )
+    transaction = {"slot": 2, "signature": "live-signature"}
+    await gateway._queue_transaction(transaction, EventSource.SOLANA_WSS)
+    _, _, live_source = gateway._queue.get_nowait()
+    assert live_source == EventSource.SOLANA_WSS
+
+
+@pytest.mark.asyncio
+async def test_gap_recovery_timeout_buffers_live_event_without_partial_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "transactionNotification",
+        "params": {},
+    }
+    connection = FakeConnection(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+            notification,
+        ],
+        finish_iteration=False,
+    )
+    events: list[str] = []
+
+    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+        return FakeConnectionContext(connection, events, "timeout")
+
+    gateway = _gateway()
+    gateway.GAP_RECOVERY_TIMEOUT_SECONDS = 0.01
+    gateway.restore_checkpoint(
+        123,
+        "recent-signature",
+        datetime.now(tz=timezone.utc),
+    )
+    gateway.restore_protocol_checkpoint(Protocol.PUMP, "recent-signature")
+    recovery_cancelled = asyncio.Event()
+    live_processed = asyncio.Event()
+    processed: list[dict[str, Any]] = []
+
+    async def slow_recovery() -> list[tuple[Protocol, dict[str, Any], object]]:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            recovery_cancelled.set()
+        return []
+
+    async def handle_message(message: dict[str, Any]) -> None:
+        processed.append(message)
+        live_processed.set()
+
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
+    monkeypatch.setattr(gateway, "_recover_gap", slow_recovery)
+    monkeypatch.setattr(gateway, "handle_message", handle_message)
+    run_task = asyncio.create_task(gateway._run())
+    try:
+        async with asyncio.timeout(1):
+            await live_processed.wait()
+            await recovery_cancelled.wait()
+
+        assert processed == [notification]
+        assert gateway._queue.empty()
+        assert gateway.last_slot == 0
+        assert gateway.last_signature is None
+        assert gateway._last_signatures == {}
+        assert "startup" not in gateway.entry_gate.reasons
+        assert "stream_disconnected" not in gateway.entry_gate.reasons
+        assert "stream_baseline" in gateway.entry_gate.reasons
+        assert "stream_stale" in gateway.entry_gate.reasons
+    finally:
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+
+@pytest.mark.asyncio
+async def test_stale_checkpoint_skips_gap_recovery_and_waits_for_live_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ],
+        finish_iteration=False,
+    )
+    events: list[str] = []
+
+    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+        return FakeConnectionContext(connection, events, "stale")
+
+    gateway = _gateway()
+    gateway.restore_checkpoint(
+        123,
+        "old-signature",
+        datetime.now(tz=timezone.utc) - timedelta(minutes=5),
+    )
+    gateway.restore_protocol_checkpoint(Protocol.PUMP, "old-signature")
+
+    async def unexpected_recovery() -> None:
+        pytest.fail("stale checkpoint must not trigger historical gap recovery")
+
+    checkpoint_discarded = asyncio.Event()
+    discard_checkpoint = gateway._discard_in_memory_checkpoint
+
+    def discard_and_notify() -> None:
+        discard_checkpoint()
+        checkpoint_discarded.set()
+
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
+    monkeypatch.setattr(gateway, "_recover_gap", unexpected_recovery)
+    monkeypatch.setattr(
+        gateway,
+        "_discard_in_memory_checkpoint",
+        discard_and_notify,
+    )
+    run_task = asyncio.create_task(gateway._run())
+    try:
+        async with asyncio.timeout(1):
+            await checkpoint_discarded.wait()
+
+        assert gateway.last_slot == 0
+        assert gateway.last_signature is None
+        assert gateway.last_observed_at is None
+        assert gateway._last_signatures == {}
+        assert "stream_disconnected" not in gateway.entry_gate.reasons
+        assert "stream_stale" in gateway.entry_gate.reasons
     finally:
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import websockets
@@ -71,10 +71,19 @@ class _UseLogsFallback(_SubscriptionHandshakeError):
     pass
 
 
+class _GapRecoveryTimeout(RuntimeError):
+    def __init__(self, message: str, buffered_messages: list[dict[str, Any]]) -> None:
+        super().__init__(message)
+        self.buffered_messages = tuple(buffered_messages)
+
+
 class HeliusStreamGateway:
     BACKOFF_SECONDS = (1, 2, 4, 8, 15)
     SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
     SUBSCRIPTION_MESSAGE_BUFFER_LIMIT = 1024
+    MAX_GAP_RECOVERY_AGE = timedelta(seconds=60)
+    GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
+    LIVE_BASELINE_WARMUP = timedelta(seconds=60)
 
     def __init__(
         self,
@@ -95,6 +104,7 @@ class HeliusStreamGateway:
         self.last_signature: str | None = None
         self._last_signatures: dict[Protocol, str] = {}
         self.last_observed_at: datetime | None = None
+        self._baseline_started_at: datetime | None = None
         self._queue: asyncio.Queue[tuple[Protocol, dict[str, Any], EventSource] | None] = asyncio.Queue(maxsize=queue_size)
         self._run_task: asyncio.Task[None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
@@ -146,6 +156,7 @@ class HeliusStreamGateway:
                     max_queue=1024,
                 ) as websocket:
                     try:
+                        self._begin_live_baseline()
                         buffered = await self._subscribe(websocket, logs_only=logs_only)
                         if (
                             len(pending_handshake_messages) + len(buffered)
@@ -154,14 +165,43 @@ class HeliusStreamGateway:
                             logger.error("subscription handshake message buffer overflow")
                             return
                         pending_handshake_messages.extend(buffered)
+                        recovered: list[tuple[Protocol, dict[str, Any], EventSource]] = []
+                        if self.last_slot:
+                            if self._checkpoint_is_recent():
+                                try:
+                                    recovered, pending_handshake_messages = (
+                                        await self._recover_gap_with_live_buffer(
+                                            websocket,
+                                            pending_handshake_messages,
+                                        )
+                                    )
+                                except _GapRecoveryTimeout as exc:
+                                    logger.warning(str(exc))
+                                    pending_handshake_messages = list(
+                                        exc.buffered_messages
+                                    )
+                                    self._discard_in_memory_checkpoint()
+                            else:
+                                logger.warning(
+                                    "Solana checkpoint is stale; "
+                                    "starting a new non-tradable live baseline"
+                                )
+                                self._discard_in_memory_checkpoint()
+                        if recovered:
+                            if self._commit_recovered_events(recovered):
+                                self.metrics.websocket_gap_recoveries.inc()
+                            else:
+                                logger.warning(
+                                    "Solana recovery batch exceeded queue capacity; "
+                                    "starting a new non-tradable live baseline"
+                                )
+                                self._discard_in_memory_checkpoint()
                         while pending_handshake_messages:
                             await self.handle_message(pending_handshake_messages[0])
                             del pending_handshake_messages[0]
-                        if self.last_slot:
-                            await self._recover_gap()
                         self.entry_gate.unblock("startup")
                         self.entry_gate.unblock("stream_disconnected")
-                        self.entry_gate.unblock("stream_stale")
+                        self.refresh_freshness()
                         attempt = 0
                         async for raw_message in websocket:
                             await self.handle_message(json.loads(raw_message))
@@ -372,14 +412,125 @@ class HeliusStreamGateway:
         self.last_slot = max(self.last_slot, slot)
         self.last_signature = signature or self.last_signature
         self.last_observed_at = datetime.now(tz=timezone.utc)
+        queued_source = source
+        if source in {EventSource.HELIUS_WSS, EventSource.SOLANA_WSS}:
+            if self._baseline_started_at is None:
+                self._baseline_started_at = self.last_observed_at
+            if (
+                self.last_observed_at - self._baseline_started_at
+                < self.LIVE_BASELINE_WARMUP
+            ):
+                queued_source = EventSource.BASELINE_WSS
         protocols = _transaction_protocols(transaction)
         for protocol in protocols:
             if signature:
                 self._last_signatures[protocol] = signature
-            await self._queue.put((protocol, transaction, source))
+            await self._queue.put((protocol, transaction, queued_source))
         self.metrics.event_queue_depth.set(self._queue.qsize())
 
-    async def _recover_gap(self) -> None:
+    def _checkpoint_is_recent(self, now: datetime | None = None) -> bool:
+        if self.last_slot <= 0 or self.last_observed_at is None:
+            return False
+        current = now or datetime.now(tz=timezone.utc)
+        age = current - self.last_observed_at
+        return timedelta(0) <= age <= self.MAX_GAP_RECOVERY_AGE
+
+    def _begin_live_baseline(self) -> None:
+        self._baseline_started_at = None
+        self.entry_gate.block("stream_baseline")
+        self.entry_gate.block("stream_stale")
+
+    def _discard_in_memory_checkpoint(self) -> None:
+        self.last_slot = 0
+        self.last_signature = None
+        self.last_observed_at = None
+        self._last_signatures.clear()
+        self._begin_live_baseline()
+
+    def _commit_recovered_events(
+        self,
+        recovered: list[tuple[Protocol, dict[str, Any], EventSource]],
+    ) -> bool:
+        available = self._queue.maxsize - self._queue.qsize()
+        if len(recovered) > available:
+            return False
+        for protocol, transaction, source in recovered:
+            signature = _transaction_signature(transaction)
+            slot = int(transaction.get("slot", 0))
+            self.last_slot = max(self.last_slot, slot)
+            self.last_signature = signature or self.last_signature
+            if signature:
+                self._last_signatures[protocol] = signature
+            self._queue.put_nowait((protocol, transaction, source))
+        self.metrics.event_queue_depth.set(self._queue.qsize())
+        return True
+
+    async def _recover_gap_with_live_buffer(
+        self,
+        websocket: Any,
+        initial_messages: list[dict[str, Any]],
+    ) -> tuple[
+        list[tuple[Protocol, dict[str, Any], EventSource]],
+        list[dict[str, Any]],
+    ]:
+        buffered = list(initial_messages)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.GAP_RECOVERY_TIMEOUT_SECONDS
+        recovery_task = asyncio.create_task(
+            self._recover_gap(),
+            name="solana-gap-recovery",
+        )
+        receive_task = asyncio.create_task(
+            websocket.recv(),
+            name="solana-gap-live-buffer",
+        )
+        try:
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise _GapRecoveryTimeout(
+                        "Solana gap recovery timed out; "
+                        "starting a new non-tradable live baseline",
+                        buffered,
+                    )
+                done, _ = await asyncio.wait(
+                    {recovery_task, receive_task},
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise _GapRecoveryTimeout(
+                        "Solana gap recovery timed out; "
+                        "starting a new non-tradable live baseline",
+                        buffered,
+                    )
+                if receive_task in done:
+                    buffered.append(json.loads(receive_task.result()))
+                    if len(buffered) > self.SUBSCRIPTION_MESSAGE_BUFFER_LIMIT:
+                        raise _GapRecoveryTimeout(
+                            "Solana live buffer overflow during gap recovery; "
+                            "starting a new non-tradable live baseline",
+                            buffered,
+                        )
+                    receive_task = asyncio.create_task(
+                        websocket.recv(),
+                        name="solana-gap-live-buffer",
+                    )
+                if recovery_task in done:
+                    return recovery_task.result(), buffered
+        finally:
+            for task in (recovery_task, receive_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                recovery_task,
+                receive_task,
+                return_exceptions=True,
+            )
+
+    async def _recover_gap(
+        self,
+    ) -> list[tuple[Protocol, dict[str, Any], EventSource]]:
         recovered: dict[str, tuple[Protocol, dict[str, Any]]] = {}
         for protocol, program_id in (
             (Protocol.PUMP, PUMP_PROGRAM_ID),
@@ -411,12 +562,13 @@ class HeliusStreamGateway:
                 if not next_before or next_before == before:
                     raise RuntimeError("gap recovery pagination did not advance")
                 before = next_before
-        for protocol, transaction in sorted(
-            recovered.values(), key=lambda item: int(item[1].get("slot", 0))
-        ):
-            await self._queue.put((protocol, transaction, EventSource.RPC_RECOVERY))
-        if recovered:
-            self.metrics.websocket_gap_recoveries.inc()
+        return [
+            (protocol, transaction, EventSource.RPC_RECOVERY)
+            for protocol, transaction in sorted(
+                recovered.values(),
+                key=lambda item: int(item[1].get("slot", 0)),
+            )
+        ]
 
     async def _worker(self) -> None:
         while True:
@@ -450,7 +602,16 @@ class HeliusStreamGateway:
             self.entry_gate.block("stream_stale")
         else:
             self.entry_gate.unblock("stream_stale")
-        return not stale
+
+        baseline_ready = (
+            self._baseline_started_at is not None
+            and now - self._baseline_started_at >= self.LIVE_BASELINE_WARMUP
+        )
+        if baseline_ready:
+            self.entry_gate.unblock("stream_baseline")
+        else:
+            self.entry_gate.block("stream_baseline")
+        return not stale and baseline_ready
 
 
 def _transaction_protocols(transaction: dict[str, Any]) -> list[Protocol]:

@@ -36,6 +36,13 @@ from .scoring import DeveloperHistory, ScoreBreakdown, ScoreContext, ScoringEngi
 from .security import RejectReason, SecurityContext, SecurityEngine, SecurityResult
 from .stream import EntryGate
 
+NON_TRADABLE_EVENT_SOURCES = frozenset(
+    {
+        EventSource.BASELINE_WSS,
+        EventSource.RPC_RECOVERY,
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 SecurityProvider = Callable[[Candidate, FeatureSnapshot], Awaitable[SecurityContext]]
@@ -198,7 +205,11 @@ class ConfirmationPipeline:
         try:
             if self.record_raw and not recovering:
                 await self.recorder.record(event)
-            await self._apply_event(event, persist=True, observe=True)
+            if event.source in NON_TRADABLE_EVENT_SOURCES:
+                if self.event_observer is not None:
+                    await self.event_observer(event)
+            else:
+                await self._apply_event(event, persist=True, observe=True)
             if self.database is not None:
                 await self.database.mark_event_processed(
                     event.event_id, processed_at=datetime.now(tz=timezone.utc)

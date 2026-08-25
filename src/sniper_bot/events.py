@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class EventSource(StrEnum):
     HELIUS_WSS = "helius_wss"
     SOLANA_WSS = "solana_wss"
+    BASELINE_WSS = "baseline_wss"
     RPC_RECOVERY = "rpc_recovery"
     REPLAY = "replay"
 
