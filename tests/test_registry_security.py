@@ -60,6 +60,53 @@ def test_pumpswap_effective_quote_reserves_include_virtual_value() -> None:
     assert state.marginal_price_usd == Decimal("500")
 
 
+def test_reversed_wsol_pool_normalizes_reserves_and_market_cap() -> None:
+    now = _now()
+    token_mint = "2r8hyN4p3uTtTjGkkyzhNt4Ygxe3J1JnQPqCoi3pyyvu"
+    tracker = PoolStateTracker()
+    tracker.set_quote_price(
+        QuoteAssetPrice(mint=WSOL_MINT, price_usd=Decimal("200"), observed_at=now)
+    )
+    event = EventEnvelope(
+        source=EventSource.REPLAY,
+        protocol=Protocol.PUMPSWAP,
+        event_type=ChainEventType.POOL_CREATED,
+        slot=1,
+        signature="real-create-layout",
+        instruction_index=1,
+        block_time=now,
+        observed_at=now,
+        mint=token_mint,
+        pool_address="POOL",
+        payload={
+            "base_mint": WSOL_MINT,
+            "quote_mint": token_mint,
+            "base_mint_decimals": 9,
+            "quote_mint_decimals": 6,
+            "pool_base_amount": 84_990_000_000,
+            "pool_quote_amount": 1_000_000_000_000_000,
+        },
+    )
+
+    state = tracker.apply(event)
+    pool = tracker.pool("POOL")
+
+    assert state is not None
+    assert pool is not None
+    assert pool.base_mint == token_mint
+    assert pool.quote_mint == WSOL_MINT
+    assert pool.source_orientation_reversed is True
+    assert state.raw_base_reserves == Decimal("1000000000000000")
+    assert state.raw_quote_reserves == Decimal("84990000000")
+    assert state.quote_reserve_usd == Decimal("16998")
+    assert state.marginal_price_usd == Decimal("0.000016998")
+    updated = tracker.apply_base_supply(
+        "POOL", total_supply_raw=Decimal("1000000000000000")
+    )
+    assert updated is not None
+    assert updated.market_cap_estimate_usd == Decimal("16998")
+
+
 def test_holder_balances_are_aggregated_by_owner_and_system_accounts_excluded() -> None:
     metrics = aggregate_holders(
         [

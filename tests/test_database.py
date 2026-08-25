@@ -61,6 +61,7 @@ async def test_database_event_and_outbox_idempotency(tmp_path) -> None:
     assert await database.record_event(event) is False
     await database.mark_event_processed(event.event_id, processed_at=now)
     assert await database.load_protocol_checkpoints() == {"pumpswap": "sig"}
+    assert await database.load_stream_checkpoint() == (1, "sig", now)
     assert await database.enqueue_outbox(
         idempotency_key="entry:1", event_type="paper_entry", payload={"mint": "TOKEN"}
     ) is True

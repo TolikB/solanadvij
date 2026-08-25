@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import json
 import struct
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -18,6 +20,7 @@ from sniper_bot.events import (
 from sniper_bot.protocols import UnknownDiscriminatorError
 from sniper_bot.protocols.anchor import _base58_encode
 from sniper_bot.protocols.pump import PUMP_PROGRAM_ID, PumpDecoder
+from sniper_bot.protocols.pumpswap import PumpSwapDecoder
 
 
 def _complete_event_transaction(discriminator: bytes | None = None) -> dict:
@@ -66,6 +69,22 @@ def test_pump_decoder_uses_official_event_discriminator() -> None:
     assert event.mint == _base58_encode(bytes([2]) * 32)
     assert event.payload["bonding_curve"] == _base58_encode(bytes([3]) * 32)
     assert event.payload["quote_mint"] == _base58_encode(bytes([4]) * 32)
+
+
+def test_pumpswap_decoder_uses_real_reversed_create_pool_event() -> None:
+    fixture_path = (
+        Path(__file__).parent / "fixtures" / "pumpswap_create_pool_reversed.json"
+    )
+    transaction = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    decoded = PumpSwapDecoder().decode_transaction(transaction)
+
+    assert len(decoded) == 1
+    event = decoded[0]
+    assert event.event_type == ChainEventType.POOL_CREATED
+    assert event.mint == "2r8hyN4p3uTtTjGkkyzhNt4Ygxe3J1JnQPqCoi3pyyvu"
+    assert event.payload["base_mint"] == "So11111111111111111111111111111111111111112"
+    assert event.pool_address == "3NPBqdz22Xz4xhomduRcC8QTCcHnqBGVgLXB8sWWPRpp"
 
 
 def test_unknown_anchor_discriminator_fails_closed() -> None:

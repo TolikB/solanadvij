@@ -84,6 +84,7 @@ class HeliusStreamGateway:
     MAX_GAP_RECOVERY_AGE = timedelta(seconds=60)
     GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
+    LOG_FETCH_CONCURRENCY = 8
 
     def __init__(
         self,
@@ -94,7 +95,13 @@ class HeliusStreamGateway:
         entry_gate: EntryGate,
         metrics: BotMetrics,
         queue_size: int = 2000,
+        max_processing_lag_seconds: float = 3.0,
+        log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
     ) -> None:
+        if max_processing_lag_seconds <= 0:
+            raise ValueError("max_processing_lag_seconds must be greater than zero")
+        if log_fetch_concurrency <= 0:
+            raise ValueError("log_fetch_concurrency must be greater than zero")
         self.websocket_url = websocket_url
         self.rpc = rpc
         self.handler = handler
@@ -104,11 +111,21 @@ class HeliusStreamGateway:
         self.last_signature: str | None = None
         self._last_signatures: dict[Protocol, str] = {}
         self.last_observed_at: datetime | None = None
+        self.last_chain_block_time: datetime | None = None
+        self.last_processed_block_time: datetime | None = None
+        self.last_processing_lag_seconds: float | None = None
+        self.max_processing_lag_seconds = max_processing_lag_seconds
         self._baseline_started_at: datetime | None = None
         self._queue: asyncio.Queue[tuple[Protocol, dict[str, Any], EventSource] | None] = asyncio.Queue(maxsize=queue_size)
         self._run_task: asyncio.Task[None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._stream_generation = 0
+        self._log_fetch_sequence = 0
+        self._log_fetch_semaphore = asyncio.Semaphore(log_fetch_concurrency)
+        self._log_fetch_tasks: set[asyncio.Task[None]] = set()
+        self._log_fetch_tail: asyncio.Task[None] | None = None
+        self._fetch_error_sequences: set[int] = set()
 
     async def start(self) -> None:
         if self._run_task is not None:
@@ -136,6 +153,14 @@ class HeliusStreamGateway:
             except asyncio.CancelledError:
                 pass
             self._run_task = None
+        fetch_tasks = tuple(self._log_fetch_tasks)
+        for task in fetch_tasks:
+            task.cancel()
+        if fetch_tasks:
+            await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        self._log_fetch_tasks.clear()
+        self._log_fetch_tail = None
+        self._fetch_error_sequences.clear()
         if self._worker_task is not None:
             await self._queue.put(None)
             await self._worker_task
@@ -390,35 +415,144 @@ class HeliusStreamGateway:
         method = str(message.get("method") or "")
         if not method.endswith("Notification"):
             return
+        received_at = datetime.now(tz=timezone.utc)
+        if self.last_observed_at is None or received_at > self.last_observed_at:
+            self.last_observed_at = received_at
         result = ((message.get("params") or {}).get("result") or {})
         transaction = result.get("transaction") if isinstance(result, dict) else None
         context = result.get("context") if isinstance(result, dict) else None
         if isinstance(transaction, dict):
             if "slot" not in transaction and isinstance(context, dict):
                 transaction["slot"] = context.get("slot", 0)
-            await self._queue_transaction(transaction, EventSource.HELIUS_WSS)
+            await self._queue_transaction(
+                transaction,
+                EventSource.HELIUS_WSS,
+                received_at=received_at,
+                generation=self._stream_generation,
+            )
             return
         value = result.get("value") if isinstance(result, dict) else None
         if isinstance(value, dict) and value.get("signature"):
-            transaction = await self.rpc.get_transaction(str(value["signature"]))
-            if transaction is not None:
-                if isinstance(context, dict):
-                    transaction["slot"] = context.get("slot", transaction.get("slot", 0))
-                await self._queue_transaction(transaction, EventSource.SOLANA_WSS)
+            await self._spawn_ordered_log_fetch(
+                signature=str(value["signature"]),
+                slot=int(context.get("slot", 0)) if isinstance(context, dict) else 0,
+                received_at=received_at,
+                generation=self._stream_generation,
+            )
 
-    async def _queue_transaction(self, transaction: dict[str, Any], source: EventSource) -> None:
+    async def _spawn_ordered_log_fetch(
+        self,
+        *,
+        signature: str,
+        slot: int,
+        received_at: datetime,
+        generation: int,
+    ) -> None:
+        await self._log_fetch_semaphore.acquire()
+        sequence = self._log_fetch_sequence
+        self._log_fetch_sequence += 1
+        previous = self._log_fetch_tail
+        task = asyncio.create_task(
+            self._fetch_and_dispatch_log_transaction(
+                sequence=sequence,
+                signature=signature,
+                slot=slot,
+                received_at=received_at,
+                generation=generation,
+                previous=previous,
+            ),
+            name=f"solana-log-fetch-{sequence}",
+        )
+        self._log_fetch_tail = task
+        self._log_fetch_tasks.add(task)
+        task.add_done_callback(self._forget_log_fetch_task)
+        self._sync_queue_depth()
+
+    async def _fetch_and_dispatch_log_transaction(
+        self,
+        *,
+        sequence: int,
+        signature: str,
+        slot: int,
+        received_at: datetime,
+        generation: int,
+        previous: asyncio.Task[None] | None,
+    ) -> None:
+        attempt = 0
+        try:
+            while True:
+                try:
+                    transaction = await self.rpc.get_transaction(signature)
+                    if transaction is None:
+                        raise RuntimeError(
+                            "confirmed transaction is temporarily unavailable"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    attempt += 1
+                    self._fetch_error_sequences.add(sequence)
+                    self.entry_gate.block("stream_fetch_error")
+                    logger.warning(
+                        "Solana transaction fetch failed; retrying in receive order",
+                        extra={"attempt": attempt},
+                    )
+                    await asyncio.sleep(min(5, 0.25 * (2 ** min(attempt - 1, 5))))
+                    continue
+                self._fetch_error_sequences.discard(sequence)
+                if not self._fetch_error_sequences:
+                    self.entry_gate.unblock("stream_fetch_error")
+                break
+
+            if previous is not None:
+                await previous
+            transaction.setdefault("slot", slot)
+            await self._queue_transaction(
+                transaction,
+                EventSource.SOLANA_WSS,
+                received_at=received_at,
+                generation=generation,
+            )
+        finally:
+            self._fetch_error_sequences.discard(sequence)
+            if not self._fetch_error_sequences:
+                self.entry_gate.unblock("stream_fetch_error")
+            self._log_fetch_semaphore.release()
+
+    def _forget_log_fetch_task(self, task: asyncio.Task[None]) -> None:
+        self._log_fetch_tasks.discard(task)
+        if self._log_fetch_tail is task:
+            self._log_fetch_tail = None
+        self._sync_queue_depth()
+
+    async def _queue_transaction(
+        self,
+        transaction: dict[str, Any],
+        source: EventSource,
+        *,
+        received_at: datetime | None = None,
+        generation: int | None = None,
+    ) -> None:
+        received = received_at or datetime.now(tz=timezone.utc)
         slot = int(transaction.get("slot", 0))
         signature = _transaction_signature(transaction)
         self.last_slot = max(self.last_slot, slot)
         self.last_signature = signature or self.last_signature
-        self.last_observed_at = datetime.now(tz=timezone.utc)
+        if self.last_observed_at is None or received > self.last_observed_at:
+            self.last_observed_at = received
+        block_time = _transaction_block_time(transaction)
+        if block_time is not None and (
+            self.last_chain_block_time is None
+            or block_time > self.last_chain_block_time
+        ):
+            self.last_chain_block_time = block_time
         queued_source = source
         if source in {EventSource.HELIUS_WSS, EventSource.SOLANA_WSS}:
             if self._baseline_started_at is None:
-                self._baseline_started_at = self.last_observed_at
+                self._baseline_started_at = received
             if (
-                self.last_observed_at - self._baseline_started_at
-                < self.LIVE_BASELINE_WARMUP
+                received - self._baseline_started_at < self.LIVE_BASELINE_WARMUP
+                or (generation is not None and generation != self._stream_generation)
             ):
                 queued_source = EventSource.BASELINE_WSS
         protocols = _transaction_protocols(transaction)
@@ -426,7 +560,7 @@ class HeliusStreamGateway:
             if signature:
                 self._last_signatures[protocol] = signature
             await self._queue.put((protocol, transaction, queued_source))
-        self.metrics.event_queue_depth.set(self._queue.qsize())
+        self._sync_queue_depth()
 
     def _checkpoint_is_recent(self, now: datetime | None = None) -> bool:
         if self.last_slot <= 0 or self.last_observed_at is None:
@@ -436,6 +570,7 @@ class HeliusStreamGateway:
         return timedelta(0) <= age <= self.MAX_GAP_RECOVERY_AGE
 
     def _begin_live_baseline(self) -> None:
+        self._stream_generation += 1
         self._baseline_started_at = None
         self.entry_gate.block("stream_baseline")
         self.entry_gate.block("stream_stale")
@@ -444,6 +579,9 @@ class HeliusStreamGateway:
         self.last_slot = 0
         self.last_signature = None
         self.last_observed_at = None
+        self.last_chain_block_time = None
+        self.last_processed_block_time = None
+        self.last_processing_lag_seconds = None
         self._last_signatures.clear()
         self._begin_live_baseline()
 
@@ -462,7 +600,7 @@ class HeliusStreamGateway:
             if signature:
                 self._last_signatures[protocol] = signature
             self._queue.put_nowait((protocol, transaction, source))
-        self.metrics.event_queue_depth.set(self._queue.qsize())
+        self._sync_queue_depth()
         return True
 
     async def _recover_gap_with_live_buffer(
@@ -573,7 +711,7 @@ class HeliusStreamGateway:
     async def _worker(self) -> None:
         while True:
             item = await self._queue.get()
-            self.metrics.event_queue_depth.set(self._queue.qsize())
+            self._sync_queue_depth()
             if item is None:
                 return
             protocol, transaction, source = item
@@ -593,11 +731,31 @@ class HeliusStreamGateway:
                     await asyncio.sleep(min(30, 2 ** min(attempt - 1, 5)))
                     continue
                 self.entry_gate.unblock("event_processing_error")
+                block_time = _transaction_block_time(transaction)
+                if block_time is not None:
+                    processed_at = datetime.now(tz=timezone.utc)
+                    if (
+                        self.last_processed_block_time is None
+                        or block_time > self.last_processed_block_time
+                    ):
+                        self.last_processed_block_time = block_time
+                    self.last_processing_lag_seconds = max(
+                        0.0, (processed_at - block_time).total_seconds()
+                    )
                 break
 
     def refresh_freshness(self, now: datetime | None = None) -> bool:
         now = now or datetime.now(tz=timezone.utc)
-        stale = self.last_observed_at is None or (now - self.last_observed_at).total_seconds() > 3
+        transport_stale = (
+            self.last_observed_at is None
+            or (now - self.last_observed_at).total_seconds()
+            > self.max_processing_lag_seconds
+        )
+        processing_stale = (
+            self.last_processing_lag_seconds is None
+            or self.last_processing_lag_seconds > self.max_processing_lag_seconds
+        )
+        stale = transport_stale or processing_stale
         if stale:
             self.entry_gate.block("stream_stale")
         else:
@@ -612,6 +770,11 @@ class HeliusStreamGateway:
         else:
             self.entry_gate.block("stream_baseline")
         return not stale and baseline_ready
+
+    def _sync_queue_depth(self) -> None:
+        self.metrics.event_queue_depth.set(
+            self._queue.qsize() + len(self._log_fetch_tasks)
+        )
 
 
 def _transaction_protocols(transaction: dict[str, Any]) -> list[Protocol]:
@@ -631,3 +794,15 @@ def _transaction_signature(transaction: dict[str, Any]) -> str | None:
         return str(transaction["signature"])
     signatures = transaction.get("transaction", {}).get("signatures") or []
     return str(signatures[0]) if signatures else None
+
+
+def _transaction_block_time(transaction: dict[str, Any]) -> datetime | None:
+    raw = transaction.get("blockTime")
+    if raw is None:
+        raw = (transaction.get("transaction") or {}).get("blockTime")
+    if raw is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None

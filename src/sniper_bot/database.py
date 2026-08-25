@@ -502,7 +502,7 @@ class Database:
             )
         if row is None:
             return 0, None, None
-        return row.slot, row.signature, _as_utc(row.observed_at)
+        return row.slot, row.signature, _as_utc(row.block_time)
 
     async def load_protocol_checkpoints(self) -> dict[str, str]:
         checkpoints: dict[str, str] = {}

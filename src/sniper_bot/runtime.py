@@ -162,6 +162,9 @@ class SniperRuntime:
             handler=self.pipeline.process_transaction,
             entry_gate=self.entry_gate,
             metrics=self.metrics,
+            max_processing_lag_seconds=(
+                float(config.chain.max_stream_lag_ms) / 1000.0
+            ),
         )
         self.report_builder = ReportBuilder(self)
         self.retention = RawRetentionManager(
@@ -324,6 +327,19 @@ class SniperRuntime:
                 self.stream_gateway.last_observed_at.isoformat()
                 if self.stream_gateway.last_observed_at
                 else None
+            ),
+            "last_stream_chain_block_time": (
+                self.stream_gateway.last_chain_block_time.isoformat()
+                if self.stream_gateway.last_chain_block_time
+                else None
+            ),
+            "last_stream_processed_block_time": (
+                self.stream_gateway.last_processed_block_time.isoformat()
+                if self.stream_gateway.last_processed_block_time
+                else None
+            ),
+            "stream_processing_lag_seconds": (
+                self.stream_gateway.last_processing_lag_seconds
             ),
             "candidate_count": len(self.pipeline.candidates),
         }
@@ -822,6 +838,11 @@ class SniperRuntime:
         )
         if updated_token is not None and self.database is not None:
             await self.database.upsert_token(updated_token)
+        self.pipeline.update_pool_supply(
+            candidate.pool_address,
+            total_supply_raw=mint_info.total_supply_raw,
+            observed_at=mint_info.observed_at,
+        )
         owner_scope = {holder.owner for holder in holder_accounts if holder.owner}
         dev_cluster = self.wallet_analyzer.cluster_for(dev_wallet, owner_scope)
         related_cluster = self.wallet_analyzer.largest_related_cluster(

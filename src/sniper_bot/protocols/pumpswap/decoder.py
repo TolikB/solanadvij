@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ...events import ChainEventType, EventEnvelope, EventSource, Protocol
+from ...registry import target_mint_for_pool
 from ..anchor import AnchorIdlDecoder
 from ..pump.decoder import _block_time, _signature
 
@@ -60,7 +61,9 @@ class PumpSwapDecoder:
                     inner_instruction_index=-1,
                     block_time=block_time,
                     observed_at=observed,
-                    mint=fields.get("base_mint"),
+                    mint=target_mint_for_pool(
+                        fields.get("base_mint"), fields.get("quote_mint")
+                    ),
                     pool_address=fields.get("pool"),
                     payload=fields,
                 )

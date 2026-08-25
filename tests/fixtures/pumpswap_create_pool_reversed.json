@@ -1,0 +1,16 @@
+{
+  "blockTime": 1787646905,
+  "meta": {
+    "logMessages": [
+      "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA invoke [1]",
+      "Program data: sTEM0qB2p3S5U41qAAAAAAAAHCfQ/ukkcz4rpYbUd0vN2IEZZgcU7lF3EpnZyJjnVwYGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAARtx3Dh296nNOlKJNka3xo8jvKoUebcCNWhpcWEShwRGCQaAe8zJEwAAAACAxqR+jQMAgHvMyRMAAAAAgMakfo0DAGQAAAAAAAAAfKRYd2IIAAAYpFh3YggAAP4jMahZwIIhpnHu+mfb0f6tDKPfvnvkKGge6iDfThYPlVrEdOT0BzLEpZ7KBXv08AgO2oO8OLn6n5gxiyga9Rp9k7KN5LHqGoRXwczC7Zw0qJoSZUZF3qb5UdIoeiIY33+QP0DdLeak/eY3kOszZadc3GGNd+r9MgIDfDcuiyhwgxwn0P7pJHM+K6WG1HdLzdiBGWYHFO5RdxKZ2ciY51cGAA==",
+      "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA success"
+    ]
+  },
+  "slot": 441592070,
+  "transaction": {
+    "signatures": [
+      "NkYsLJyf3Y3RMbEcpbu2azme7r98x5jeC6BYi8RbXWCwJsLF62ftWaoDMsGhetb9Rq4fUV64utcLJS3WN1KVW8U"
+    ]
+  }
+}

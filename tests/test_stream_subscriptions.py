@@ -543,3 +543,77 @@ async def test_failed_buffer_handler_retries_only_unconfirmed_message(
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task
+
+
+@pytest.mark.asyncio
+async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=_handler,
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        log_fetch_concurrency=2,
+    )
+    first_release = asyncio.Event()
+    second_fetched = asyncio.Event()
+    dispatched: list[str] = []
+
+    async def get_transaction(signature: str) -> dict[str, Any]:
+        if signature == "first":
+            await first_release.wait()
+        else:
+            second_fetched.set()
+        return {
+            "slot": 1 if signature == "first" else 2,
+            "blockTime": 1_787_646_900,
+            "signature": signature,
+        }
+
+    async def dispatch(
+        transaction: dict[str, Any],
+        _source: EventSource,
+        **_kwargs: Any,
+    ) -> None:
+        dispatched.append(str(transaction["signature"]))
+
+    monkeypatch.setattr(gateway.rpc, "get_transaction", get_transaction)
+    monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
+    def notification(signature: str, slot: int) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": slot},
+                    "value": {"signature": signature},
+                }
+            },
+        }
+
+    await gateway.handle_message(notification("first", 1))
+    await gateway.handle_message(notification("second", 2))
+    await asyncio.wait_for(second_fetched.wait(), timeout=1)
+    assert dispatched == []
+
+    first_release.set()
+    tasks = tuple(gateway._log_fetch_tasks)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    assert dispatched == ["first", "second"]
+
+
+def test_processing_lag_blocks_freshness_even_with_live_notifications() -> None:
+    gateway = _gateway()
+    now = datetime.now(tz=timezone.utc)
+    gateway.last_observed_at = now
+    gateway._baseline_started_at = now - gateway.LIVE_BASELINE_WARMUP
+    gateway.last_processing_lag_seconds = gateway.max_processing_lag_seconds + 1
+
+    assert gateway.refresh_freshness(now) is False
+    assert "stream_stale" in gateway.entry_gate.reasons
+
+    gateway.last_processing_lag_seconds = gateway.max_processing_lag_seconds - 1
+    assert gateway.refresh_freshness(now) is True
+    assert "stream_stale" not in gateway.entry_gate.reasons

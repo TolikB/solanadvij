@@ -15,6 +15,16 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SUPPORTED_QUOTE_MINTS = frozenset({WSOL_MINT, USDC_MINT})
 
 
+def target_mint_for_pool(base_mint: str | None, quote_mint: str | None) -> str | None:
+    if not base_mint or not quote_mint:
+        return None
+    base_is_quote = base_mint in SUPPORTED_QUOTE_MINTS
+    quote_is_quote = quote_mint in SUPPORTED_QUOTE_MINTS
+    if base_is_quote == quote_is_quote:
+        return None
+    return quote_mint if base_is_quote else base_mint
+
+
 class TokenRecord(BaseModel):
     mint: str
     token_program: str | None = None
@@ -52,6 +62,7 @@ class PoolRecord(BaseModel):
     status: str = "active"
     base_decimals: int
     quote_decimals: int
+    source_orientation_reversed: bool = False
     updated_at: datetime
 
 
@@ -61,7 +72,9 @@ class PoolState(BaseModel):
     quote_mint: str
     raw_base_reserves: Decimal = Decimal("0")
     raw_quote_reserves: Decimal = Decimal("0")
+    virtual_base_reserves: Decimal = Decimal("0")
     virtual_quote_reserves: Decimal = Decimal("0")
+    effective_base_reserves: Decimal = Decimal("0")
     effective_quote_reserves: Decimal = Decimal("0")
     quote_reserve_usd: Decimal = Decimal("0")
     base_reserve_usd: Decimal = Decimal("0")
@@ -72,6 +85,7 @@ class PoolState(BaseModel):
     last_update_time: datetime
     quote_price_updated_at: datetime
     base_supply_raw: Decimal | None = None
+    source_orientation_reversed: bool = False
     data_quality_flags: list[str] = Field(default_factory=list)
 
 
@@ -195,26 +209,79 @@ class PoolStateTracker:
     def pools(self) -> list[PoolRecord]:
         return list(self._pools.values())
 
+    def apply_base_supply(
+        self,
+        pool_address: str,
+        *,
+        total_supply_raw: Decimal,
+    ) -> PoolState | None:
+        state = self._states.get(pool_address)
+        pool = self._pools.get(pool_address)
+        if state is None or pool is None:
+            return None
+        market_cap = (
+            total_supply_raw
+            / (Decimal(10) ** pool.base_decimals)
+            * state.marginal_price_usd
+            if state.marginal_price_usd > 0
+            else None
+        )
+        updated = state.model_copy(
+            update={
+                "base_supply_raw": total_supply_raw,
+                "market_cap_estimate_usd": market_cap,
+            }
+        )
+        self._states[pool_address] = updated
+        return updated
+
     def apply(self, event: EventEnvelope) -> PoolState | None:
         pool_address = event.pool_address
         if not pool_address:
             return None
         payload = event.payload
         if event.event_type == ChainEventType.POOL_CREATED:
-            base_mint = _required_text(payload, "base_mint")
-            quote_mint = _required_text(payload, "quote_mint")
+            source_base_mint = _required_text(payload, "base_mint")
+            source_quote_mint = _required_text(payload, "quote_mint")
+            reversed_orientation = (
+                source_base_mint in SUPPORTED_QUOTE_MINTS
+                and source_quote_mint not in SUPPORTED_QUOTE_MINTS
+            )
+            base_mint = source_quote_mint if reversed_orientation else source_base_mint
+            quote_mint = source_base_mint if reversed_orientation else source_quote_mint
             record = PoolRecord(
                 pool_address=pool_address,
                 base_mint=base_mint,
                 quote_mint=quote_mint,
                 protocol=event.protocol.value,
-                base_vault=_text(payload.get("base_vault")),
-                quote_vault=_text(payload.get("quote_vault")),
+                base_vault=_text(
+                    payload.get("quote_vault")
+                    if reversed_orientation
+                    else payload.get("base_vault")
+                ),
+                quote_vault=_text(
+                    payload.get("base_vault")
+                    if reversed_orientation
+                    else payload.get("quote_vault")
+                ),
                 creation_signature=event.signature,
                 creation_slot=event.slot,
                 creation_time=event.block_time,
-                base_decimals=int(payload["base_mint_decimals"]),
-                quote_decimals=int(payload["quote_mint_decimals"]),
+                base_decimals=int(
+                    payload[
+                        "quote_mint_decimals"
+                        if reversed_orientation
+                        else "base_mint_decimals"
+                    ]
+                ),
+                quote_decimals=int(
+                    payload[
+                        "base_mint_decimals"
+                        if reversed_orientation
+                        else "quote_mint_decimals"
+                    ]
+                ),
+                source_orientation_reversed=reversed_orientation,
                 updated_at=event.observed_at,
             )
             self._pools[pool_address] = record
@@ -222,20 +289,38 @@ class PoolStateTracker:
         if pool_record is None:
             return None
 
-        raw_base, raw_quote = _reserve_fields(event.event_type, payload)
+        raw_base, raw_quote = _reserve_fields(
+            event.event_type,
+            payload,
+            reversed_orientation=pool_record.source_orientation_reversed,
+        )
         previous = self._states.get(pool_address)
         if raw_base is None and previous is not None:
             raw_base = previous.raw_base_reserves
         if raw_quote is None and previous is not None:
             raw_quote = previous.raw_quote_reserves
-        virtual_quote = _decimal_or_none(payload.get("virtual_quote_reserves"))
+        source_virtual_quote = _decimal_or_none(payload.get("virtual_quote_reserves"))
+        virtual_base: Decimal | None
+        virtual_quote: Decimal | None
+        if pool_record.source_orientation_reversed:
+            virtual_base = source_virtual_quote
+            virtual_quote = Decimal("0")
+        else:
+            virtual_base = Decimal("0")
+            virtual_quote = source_virtual_quote
+        if virtual_base is None and previous is not None:
+            virtual_base = previous.virtual_base_reserves
         if virtual_quote is None and previous is not None:
             virtual_quote = previous.virtual_quote_reserves
         raw_base = raw_base or Decimal("0")
         raw_quote = raw_quote or Decimal("0")
+        virtual_base = virtual_base or Decimal("0")
         virtual_quote = virtual_quote or Decimal("0")
+        effective_base = raw_base + virtual_base
         effective_quote = raw_quote + virtual_quote
         flags: list[str] = []
+        if effective_base < 0:
+            flags.append("NEGATIVE_EFFECTIVE_BASE_RESERVES")
         if effective_quote < 0:
             flags.append("NEGATIVE_EFFECTIVE_QUOTE_RESERVES")
         quote_price = self._quote_prices.get(pool_record.quote_mint)
@@ -251,7 +336,9 @@ class PoolStateTracker:
         if pool_record.quote_mint not in SUPPORTED_QUOTE_MINTS:
             flags.append("UNSUPPORTED_QUOTE_MINT")
 
-        normalized_base = raw_base / (Decimal(10) ** pool_record.base_decimals)
+        normalized_base = max(effective_base, Decimal("0")) / (
+            Decimal(10) ** pool_record.base_decimals
+        )
         normalized_quote = max(effective_quote, Decimal("0")) / (
             Decimal(10) ** pool_record.quote_decimals
         )
@@ -262,7 +349,11 @@ class PoolStateTracker:
         )
         quote_reserve_usd = normalized_quote * quote_usd
         base_reserve_usd = normalized_base * marginal_price
-        base_supply = _decimal_or_none(payload.get("base_supply"))
+        base_supply = (
+            None
+            if pool_record.source_orientation_reversed
+            else _decimal_or_none(payload.get("base_supply"))
+        )
         if base_supply is None and previous is not None:
             base_supply = previous.base_supply_raw
         market_cap = None
@@ -279,7 +370,9 @@ class PoolStateTracker:
             quote_mint=pool_record.quote_mint,
             raw_base_reserves=raw_base,
             raw_quote_reserves=raw_quote,
+            virtual_base_reserves=virtual_base,
             virtual_quote_reserves=virtual_quote,
+            effective_base_reserves=effective_base,
             effective_quote_reserves=effective_quote,
             quote_reserve_usd=quote_reserve_usd,
             base_reserve_usd=base_reserve_usd,
@@ -295,6 +388,7 @@ class PoolStateTracker:
             last_update_time=event.block_time,
             quote_price_updated_at=price_time,
             base_supply_raw=base_supply,
+            source_orientation_reversed=pool_record.source_orientation_reversed,
             data_quality_flags=flags,
         )
         self._states[pool_address] = state
@@ -305,16 +399,21 @@ class PoolStateTracker:
 
 
 def _reserve_fields(
-    event_type: ChainEventType, payload: dict[str, Any]
+    event_type: ChainEventType,
+    payload: dict[str, Any],
+    *,
+    reversed_orientation: bool,
 ) -> tuple[Decimal | None, Decimal | None]:
     if event_type == ChainEventType.POOL_CREATED:
-        return (
-            _decimal_or_none(payload.get("pool_base_amount")),
-            _decimal_or_none(payload.get("pool_quote_amount")),
-        )
+        source_base = _decimal_or_none(payload.get("pool_base_amount"))
+        source_quote = _decimal_or_none(payload.get("pool_quote_amount"))
+    else:
+        source_base = _decimal_or_none(payload.get("pool_base_token_reserves"))
+        source_quote = _decimal_or_none(payload.get("pool_quote_token_reserves"))
     return (
-        _decimal_or_none(payload.get("pool_base_token_reserves")),
-        _decimal_or_none(payload.get("pool_quote_token_reserves")),
+        (source_quote, source_base)
+        if reversed_orientation
+        else (source_base, source_quote)
     )
 
 

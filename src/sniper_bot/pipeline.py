@@ -31,7 +31,12 @@ from .metrics import BotMetrics
 from .protocols import AnchorDecodeError
 from .protocols.pump import PumpDecoder
 from .protocols.pumpswap import PumpSwapDecoder
-from .registry import PoolState, PoolStateTracker, TokenRegistry
+from .registry import (
+    SUPPORTED_QUOTE_MINTS,
+    PoolState,
+    PoolStateTracker,
+    TokenRegistry,
+)
 from .scoring import DeveloperHistory, ScoreBreakdown, ScoreContext, ScoringEngine
 from .security import RejectReason, SecurityContext, SecurityEngine, SecurityResult
 from .stream import EntryGate
@@ -185,7 +190,16 @@ class ConfirmationPipeline:
         for event in events:
             await self.process_event(event)
 
+    def _with_known_pool_mint(self, event: EventEnvelope) -> EventEnvelope:
+        if event.mint is not None or not event.pool_address:
+            return event
+        pool = self.pools.pool(event.pool_address)
+        if pool is None:
+            return event
+        return event.model_copy(update={"mint": pool.base_mint})
+
     async def process_event(self, event: EventEnvelope, *, recovering: bool = False) -> bool:
+        event = self._with_known_pool_mint(event)
         self.metrics.chain_events_received.inc()
         lag_ms = max(
             Decimal("0"),
@@ -205,11 +219,12 @@ class ConfirmationPipeline:
         try:
             if self.record_raw and not recovering:
                 await self.recorder.record(event)
-            if event.source in NON_TRADABLE_EVENT_SOURCES:
-                if self.event_observer is not None:
-                    await self.event_observer(event)
-            else:
-                await self._apply_event(event, persist=True, observe=True)
+            await self._apply_event(
+                event,
+                persist=True,
+                observe=True,
+                allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+            )
             if self.database is not None:
                 await self.database.mark_event_processed(
                     event.event_id, processed_at=datetime.now(tz=timezone.utc)
@@ -229,7 +244,12 @@ class ConfirmationPipeline:
 
     async def rehydrate_event(self, event: EventEnvelope) -> None:
         """Rebuild bounded in-memory state from an already processed durable event."""
-        await self._apply_event(event, persist=False, observe=False)
+        await self._apply_event(
+            event,
+            persist=False,
+            observe=False,
+            allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+        )
 
     def restore_candidates(self, candidates: list[Candidate]) -> None:
         for candidate in candidates:
@@ -240,25 +260,55 @@ class ConfirmationPipeline:
         self._persisted_score_totals.update(scores)
 
     async def _apply_event(
-        self, event: EventEnvelope, *, persist: bool, observe: bool
+        self,
+        event: EventEnvelope,
+        *,
+        persist: bool,
+        observe: bool,
+        allow_candidate: bool = True,
     ) -> None:
-        if observe and self.event_observer is not None:
-            await self.event_observer(event)
-        token = self.tokens.apply(event)
         pool_state = self.pools.apply(event)
+        pool_record = self.pools.pool(event.pool_address) if event.pool_address else None
+        effective_event = event
+        if pool_record is not None and event.mint != pool_record.base_mint:
+            effective_event = event.model_copy(update={"mint": pool_record.base_mint})
+        supported_quote_pair = bool(
+            pool_record is not None
+            and pool_record.quote_mint in SUPPORTED_QUOTE_MINTS
+            and pool_record.base_mint not in SUPPORTED_QUOTE_MINTS
+        )
+        if observe and self.event_observer is not None:
+            await self.event_observer(effective_event)
+        token = self.tokens.apply(effective_event)
         if persist and token is not None and self.database is not None:
             await self.database.upsert_token(token)
-        pool_record = self.pools.pool(event.pool_address) if event.pool_address else None
         if persist and pool_record is not None and self.database is not None:
             await self.database.upsert_pool(pool_record)
-        if event.event_type == ChainEventType.POOL_CREATED and event.pool_address and event.mint:
-            self.features.register_pool(event.pool_address, event.block_time)
+        if (
+            effective_event.event_type == ChainEventType.POOL_CREATED
+            and effective_event.pool_address
+            and effective_event.mint
+        ):
+            self.features.register_pool(
+                effective_event.pool_address, effective_event.block_time
+            )
+        if (
+            allow_candidate
+            and supported_quote_pair
+            and effective_event.event_type == ChainEventType.POOL_CREATED
+            and effective_event.pool_address
+            and effective_event.mint
+        ):
             candidate = Candidate(
-                candidate_id=_candidate_id(event.mint, event.pool_address, self.strategy_version),
-                mint=event.mint,
-                pool_address=event.pool_address,
-                detected_at=event.block_time,
-                updated_at=event.observed_at,
+                candidate_id=_candidate_id(
+                    effective_event.mint,
+                    effective_event.pool_address,
+                    self.strategy_version,
+                ),
+                mint=effective_event.mint,
+                pool_address=effective_event.pool_address,
+                detected_at=effective_event.block_time,
+                updated_at=effective_event.observed_at,
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
             )
@@ -267,11 +317,19 @@ class ConfirmationPipeline:
             if persist and self.database is not None:
                 await self.database.upsert_candidate(candidate, self.strategy_version)
         if pool_state is not None:
-            self._ingest_pool_features(event, pool_state)
-        if token is not None and event.mint and event.pool_address:
-            current = self.candidates.get(_candidate_id(event.mint, event.pool_address, self.strategy_version))
+            self._ingest_pool_features(effective_event, pool_state)
+        if token is not None and effective_event.mint and effective_event.pool_address:
+            current = self.candidates.get(
+                _candidate_id(
+                    effective_event.mint,
+                    effective_event.pool_address,
+                    self.strategy_version,
+                )
+            )
             if current is not None:
-                self.candidates[current.candidate_id] = current.model_copy(update={"updated_at": event.observed_at})
+                self.candidates[current.candidate_id] = current.model_copy(
+                    update={"updated_at": effective_event.observed_at}
+                )
 
     async def evaluate_candidates(self, at: datetime | None = None) -> list[Candidate]:
         at = at or datetime.now(tz=timezone.utc)
@@ -406,6 +464,30 @@ class ConfirmationPipeline:
     def list_rejections(self) -> list[Candidate]:
         return [candidate for candidate in self.candidates.values() if candidate.state == CandidateState.REJECTED]
 
+    def update_pool_supply(
+        self,
+        pool_address: str,
+        total_supply_raw: Decimal,
+        observed_at: datetime,
+    ) -> PoolState | None:
+        state = self.pools.apply_base_supply(
+            pool_address,
+            total_supply_raw=total_supply_raw,
+        )
+        if state is not None:
+            self.features.ingest_liquidity(
+                LiquidityObservation(
+                    event_id=(
+                        f"{pool_address}:supply:{total_supply_raw.normalize()}"
+                    ),
+                    pool_address=pool_address,
+                    event_time=observed_at,
+                    quote_liquidity_usd=max(state.quote_reserve_usd, Decimal("0")),
+                    market_cap_usd=state.market_cap_estimate_usd,
+                )
+            )
+        return state
+
     def _ingest_pool_features(self, event: EventEnvelope, state: PoolState) -> None:
         self.features.ingest_liquidity(
             LiquidityObservation(
@@ -418,10 +500,27 @@ class ConfirmationPipeline:
         )
         if event.event_type not in {ChainEventType.SWAP_BUY, ChainEventType.SWAP_SELL}:
             return
-        quote_amount = event.payload.get("quote_amount_in") or event.payload.get("quote_amount_out") or 0
         pool = self.pools.pool(state.pool_address)
         if pool is None or state.marginal_price_usd <= 0:
             return
+        if pool.source_orientation_reversed:
+            if event.event_type == ChainEventType.SWAP_BUY:
+                quote_amount = event.payload.get("base_amount_out") or 0
+                trade_side = TradeSide.SELL
+            else:
+                quote_amount = event.payload.get("base_amount_in") or 0
+                trade_side = TradeSide.BUY
+        else:
+            quote_amount = (
+                event.payload.get("quote_amount_in")
+                or event.payload.get("quote_amount_out")
+                or 0
+            )
+            trade_side = (
+                TradeSide.BUY
+                if event.event_type == ChainEventType.SWAP_BUY
+                else TradeSide.SELL
+            )
         quote_price = self.pools.quote_price(pool.quote_mint)
         quote_usd = quote_price.price_usd if quote_price else Decimal("0")
         volume_usd = Decimal(str(quote_amount)) / (Decimal(10) ** pool.quote_decimals) * quote_usd
@@ -432,7 +531,7 @@ class ConfirmationPipeline:
                 event_id=f"{event.event_id}:trade",
                 pool_address=state.pool_address,
                 event_time=event.block_time,
-                side=TradeSide.BUY if event.event_type == ChainEventType.SWAP_BUY else TradeSide.SELL,
+                side=trade_side,
                 wallet=wallet,
                 volume_usd=max(volume_usd, Decimal("0")),
                 price_usd=state.marginal_price_usd,
