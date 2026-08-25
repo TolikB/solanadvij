@@ -15,7 +15,7 @@ from sniper_bot.stream import EntryGate
     "source",
     [EventSource.BASELINE_WSS, EventSource.RPC_RECOVERY],
 )
-async def test_non_tradable_sources_record_checkpoint_without_candidate(
+async def test_non_tradable_sources_materialize_state_without_candidate(
     tmp_path,
     source: EventSource,
 ) -> None:
@@ -45,7 +45,14 @@ async def test_non_tradable_sources_record_checkpoint_without_candidate(
         observed_at=now,
         mint="TOKEN",
         pool_address="POOL",
-        payload={},
+        payload={
+            "base_mint": "TOKEN",
+            "quote_mint": "So11111111111111111111111111111111111111112",
+            "base_mint_decimals": 6,
+            "quote_mint_decimals": 9,
+            "pool_base_amount": 1_000_000,
+            "pool_quote_amount": 1_000_000_000,
+        },
     )
 
     accepted = await pipeline.process_event(event)
@@ -53,4 +60,4 @@ async def test_non_tradable_sources_record_checkpoint_without_candidate(
     assert accepted is True
     assert observed == [event.event_id]
     assert pipeline.candidates == {}
-    assert pipeline.pools.pool("POOL") is None
+    assert pipeline.pools.pool("POOL") is not None
