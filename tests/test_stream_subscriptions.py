@@ -605,6 +605,40 @@ async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
 
 
 @pytest.mark.asyncio
+async def test_saturated_log_fetch_wait_aborts_for_reconnect() -> None:
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=_handler,
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        log_fetch_concurrency=1,
+    )
+    await gateway._log_fetch_semaphore.acquire()
+    blocked = asyncio.create_task(
+        gateway._spawn_ordered_log_fetch(
+            signature="blocked",
+            slot=1,
+            received_at=datetime.now(tz=timezone.utc),
+            generation=0,
+        )
+    )
+    await asyncio.sleep(0)
+    gateway._reconnect_requested.set()
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="ordered Solana transaction dispatch requested reconnect",
+        ):
+            await asyncio.wait_for(blocked, timeout=1)
+    finally:
+        gateway._log_fetch_semaphore.release()
+
+    assert gateway._log_fetch_tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -687,8 +721,15 @@ def test_dispatch_recovery_gate_clears_only_after_new_baseline() -> None:
     assert "stream_fetch_error" in gateway.entry_gate.reasons
 
     ready_at = now + gateway.LIVE_BASELINE_WARMUP
-    gateway.last_observed_at = ready_at
+    gateway.last_observed_at = ready_at - timedelta(
+        seconds=gateway.max_processing_lag_seconds + 1
+    )
     gateway.last_processed_block_time = ready_at
+    assert gateway.refresh_freshness(ready_at) is False
+    assert gateway._dispatch_recovery_pending is True
+    assert "stream_fetch_error" in gateway.entry_gate.reasons
+
+    gateway.last_observed_at = ready_at
     assert gateway.refresh_freshness(ready_at) is True
     assert gateway._dispatch_recovery_pending is False
     assert "stream_fetch_error" not in gateway.entry_gate.reasons

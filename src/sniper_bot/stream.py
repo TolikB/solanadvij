@@ -218,6 +218,11 @@ class HeliusStreamGateway:
                                 )
                                 self._discard_in_memory_checkpoint()
                         while pending_handshake_messages:
+                            if self._reconnect_requested.is_set():
+                                raise RuntimeError(
+                                    "ordered Solana transaction dispatch "
+                                    "requested reconnect"
+                                )
                             await self.handle_message(pending_handshake_messages[0])
                             del pending_handshake_messages[0]
                         self.entry_gate.unblock("startup")
@@ -460,6 +465,26 @@ class HeliusStreamGateway:
                 generation=self._stream_generation,
             )
 
+    async def _acquire_log_fetch_permit(self) -> None:
+        while True:
+            if self._reconnect_requested.is_set():
+                raise RuntimeError(
+                    "ordered Solana transaction dispatch requested reconnect"
+                )
+            try:
+                await asyncio.wait_for(
+                    self._log_fetch_semaphore.acquire(),
+                    timeout=0.25,
+                )
+            except TimeoutError:
+                continue
+            if self._reconnect_requested.is_set():
+                self._log_fetch_semaphore.release()
+                raise RuntimeError(
+                    "ordered Solana transaction dispatch requested reconnect"
+                )
+            return
+
     async def _spawn_ordered_log_fetch(
         self,
         *,
@@ -468,7 +493,7 @@ class HeliusStreamGateway:
         received_at: datetime,
         generation: int,
     ) -> None:
-        await self._log_fetch_semaphore.acquire()
+        await self._acquire_log_fetch_permit()
         sequence = self._log_fetch_sequence
         self._log_fetch_sequence += 1
         previous = self._log_fetch_tail
@@ -828,6 +853,7 @@ class HeliusStreamGateway:
             self.entry_gate.unblock("stream_baseline")
             if (
                 self._dispatch_recovery_pending
+                and not stale
                 and not self._reconnect_requested.is_set()
                 and not self._fetch_error_sequences
             ):
