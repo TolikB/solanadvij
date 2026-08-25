@@ -15,7 +15,7 @@ from .events import EventSource, Protocol
 from .metrics import BotMetrics
 from .protocols.pump import PUMP_PROGRAM_ID
 from .protocols.pumpswap import PUMPSWAP_PROGRAM_ID
-from .solana_rpc import SolanaRpcClient
+from .solana_rpc import SolanaRpcClient, SolanaRpcError
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,7 @@ class HeliusStreamGateway:
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
     LOG_FETCH_CONCURRENCY = 20
     SLOT_BLOCK_TIME_CACHE_SIZE = 512
+    BLOCK_TIME_RETRY_DELAYS = (0.25, 0.5, 1.0)
 
     def __init__(
         self,
@@ -576,6 +577,19 @@ class HeliusStreamGateway:
                     self.entry_gate.unblock("stream_fetch_error")
             self._log_fetch_semaphore.release()
 
+    async def _fetch_slot_block_time(self, slot: int) -> int | None:
+        for attempt in range(len(self.BLOCK_TIME_RETRY_DELAYS) + 1):
+            try:
+                return await self.rpc.get_block_time(slot)
+            except SolanaRpcError as error:
+                if (
+                    error.code != -32004
+                    or attempt >= len(self.BLOCK_TIME_RETRY_DELAYS)
+                ):
+                    raise
+                await asyncio.sleep(self.BLOCK_TIME_RETRY_DELAYS[attempt])
+        raise RuntimeError("unreachable block-time retry state")
+
     async def _get_slot_block_time(self, slot: int) -> int:
         if slot <= 0:
             raise RuntimeError("Solana logs notification is missing a valid slot")
@@ -585,7 +599,7 @@ class HeliusStreamGateway:
         task = self._slot_block_time_tasks.get(slot)
         if task is None:
             task = asyncio.create_task(
-                self.rpc.get_block_time(slot),
+                self._fetch_slot_block_time(slot),
                 name=f"solana-block-time-{slot}",
             )
             self._slot_block_time_tasks[slot] = task

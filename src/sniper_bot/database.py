@@ -99,6 +99,8 @@ class Database:
         if self._event_write_session.get() is not None:
             raise RuntimeError("event state transactions must not be nested")
         async with self.sessions.begin() as session:
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                await session.execute(text("SET LOCAL synchronous_commit TO OFF"))
             token = self._event_write_session.set(session)
             try:
                 yield

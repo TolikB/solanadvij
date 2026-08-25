@@ -9,7 +9,7 @@ import pytest
 
 from sniper_bot.events import EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
-from sniper_bot.solana_rpc import SolanaRpcClient
+from sniper_bot.solana_rpc import SolanaRpcClient, SolanaRpcError
 from sniper_bot.stream import (
     EntryGate,
     HeliusStreamGateway,
@@ -615,6 +615,30 @@ async def test_logs_notification_uses_cached_block_time_without_transaction_fetc
     assert all(row[1] == EventSource.SOLANA_WSS for row in queued)
     assert list(gateway._slot_block_times) == [2, 3]
     assert gateway._log_fetch_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_logs_notification_retries_transient_unavailable_block_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    gateway.BLOCK_TIME_RETRY_DELAYS = (0.0, 0.0)
+    calls = 0
+
+    async def transient_block_time(_slot: int) -> int:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise SolanaRpcError(
+                "Solana RPC getBlockTime failed with code -32004",
+                code=-32004,
+            )
+        return 1_787_646_900
+
+    monkeypatch.setattr(gateway.rpc, "get_block_time", transient_block_time)
+
+    assert await gateway._get_slot_block_time(123) == 1_787_646_900
+    assert calls == 3
 
 
 @pytest.mark.asyncio

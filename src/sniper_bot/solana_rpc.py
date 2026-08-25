@@ -31,7 +31,11 @@ _READ_METHODS = frozenset(
 
 
 class SolanaRpcError(RuntimeError):
-    pass
+    def __init__(
+        self, message: str, *, code: int | str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class _RpcResponse:
@@ -543,13 +547,18 @@ class SolanaRpcClient:
                 payload = response.json()
                 if payload.get("error"):
                     error = payload["error"]
-                    code = error.get("code") if isinstance(error, dict) else "unknown"
+                    raw_code = error.get("code") if isinstance(error, dict) else None
+                    code = raw_code if isinstance(raw_code, (int, str)) else None
+                    code_text = code if code is not None else "unknown"
                     await self._record_call(
                         method, params_payload, payload, requested_at,
                         int((__import__("time").perf_counter() - started) * 1000),
-                        response.status_code, f"RPC_{code}",
+                        response.status_code, f"RPC_{code_text}",
                     )
-                    raise SolanaRpcError(f"Solana RPC {method} failed with code {code}")
+                    raise SolanaRpcError(
+                        f"Solana RPC {method} failed with code {code_text}",
+                        code=code,
+                    )
                 result = payload.get("result")
                 if self.journal is not None and self.record_responses:
                     self.journal.record(journal_key, result)
