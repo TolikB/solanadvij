@@ -32,6 +32,15 @@ class SolanaRpcError(RuntimeError):
     pass
 
 
+class _RpcResponse:
+    def __init__(self, status_code: int, payload: Any) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> Any:
+        return self._payload
+
+
 class SolanaRpcClient:
     def __init__(
         self,
@@ -43,6 +52,8 @@ class SolanaRpcClient:
         journal: ExternalJournal | None = None,
         record_responses: bool = False,
         recorder: Callable[..., Awaitable[str]] | None = None,
+        transaction_batch_size: int = 20,
+        transaction_batch_window_seconds: float = 0.05,
     ) -> None:
         self.endpoint = endpoint
         self.timeout_seconds = timeout_seconds
@@ -52,6 +63,19 @@ class SolanaRpcClient:
         self.journal = journal
         self.record_responses = record_responses
         self.recorder = recorder
+        if transaction_batch_size <= 0:
+            raise ValueError("transaction_batch_size must be greater than zero")
+        if transaction_batch_window_seconds <= 0:
+            raise ValueError(
+                "transaction_batch_window_seconds must be greater than zero"
+            )
+        self.transaction_batch_size = transaction_batch_size
+        self.transaction_batch_window_seconds = transaction_batch_window_seconds
+        self._transaction_batch_lock = asyncio.Lock()
+        self._transaction_batch_pending: list[
+            tuple[dict[str, Any], asyncio.Future[_RpcResponse]]
+        ] = []
+        self._transaction_batch_flush_task: asyncio.Task[None] | None = None
         self._clock: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
@@ -231,6 +255,193 @@ class SolanaRpcClient:
             raise SolanaRpcError("token-account owner response is incomplete")
         return values
 
+    async def _post_rpc(
+        self,
+        method: str,
+        body: dict[str, Any],
+    ) -> httpx.Response | _RpcResponse:
+        if method == "getTransaction":
+            return await self._enqueue_transaction_batch(body)
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            return await client.post(self.endpoint, json=body)
+
+    async def _enqueue_transaction_batch(
+        self,
+        body: dict[str, Any],
+    ) -> _RpcResponse:
+        future: asyncio.Future[_RpcResponse] = (
+            asyncio.get_running_loop().create_future()
+        )
+        async with self._transaction_batch_lock:
+            self._transaction_batch_pending.append((body, future))
+            if self._transaction_batch_flush_task is None:
+                self._start_transaction_batch_worker()
+        try:
+            return await future
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def _start_transaction_batch_worker(self) -> None:
+        task = asyncio.create_task(
+            self._transaction_batch_worker(),
+            name="solana-transaction-rpc-batcher",
+        )
+        self._transaction_batch_flush_task = task
+        task.add_done_callback(self._transaction_batch_worker_done)
+
+    def _transaction_batch_worker_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+            return
+        loop = task.get_loop()
+        if loop.is_closed():
+            return
+        loop.create_task(
+            self._settle_prestart_cancelled_batch_worker(task),
+            name="solana-transaction-rpc-batcher-cleanup",
+        )
+
+    async def _settle_prestart_cancelled_batch_worker(
+        self,
+        task: asyncio.Task[None],
+    ) -> None:
+        async with self._transaction_batch_lock:
+            if self._transaction_batch_flush_task is not task:
+                return
+            pending = self._transaction_batch_pending
+            self._transaction_batch_pending = []
+            self._transaction_batch_flush_task = None
+        for _body, future in pending:
+            future.cancel()
+
+    async def _transaction_batch_worker(self) -> None:
+        current_task = asyncio.current_task()
+        cancelled = False
+        pending_to_cancel: list[
+            tuple[dict[str, Any], asyncio.Future[_RpcResponse]]
+        ] = []
+        try:
+            await asyncio.sleep(self.transaction_batch_window_seconds)
+            while True:
+                async with self._transaction_batch_lock:
+                    if not self._transaction_batch_pending:
+                        return
+                    candidates = self._transaction_batch_pending[
+                        : self.transaction_batch_size
+                    ]
+                    del self._transaction_batch_pending[
+                        : self.transaction_batch_size
+                    ]
+                batch = [
+                    (body, future)
+                    for body, future in candidates
+                    if not future.done()
+                ]
+                if batch:
+                    await self._send_transaction_batch(batch)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            async with self._transaction_batch_lock:
+                if cancelled:
+                    pending_to_cancel = self._transaction_batch_pending
+                    self._transaction_batch_pending = []
+                if self._transaction_batch_flush_task is current_task:
+                    self._transaction_batch_flush_task = None
+                if (
+                    not cancelled
+                    and self._transaction_batch_pending
+                    and self._transaction_batch_flush_task is None
+                ):
+                    self._start_transaction_batch_worker()
+            for _body, future in pending_to_cancel:
+                future.cancel()
+
+    async def _send_transaction_batch(
+        self,
+        batch: list[tuple[dict[str, Any], asyncio.Future[_RpcResponse]]],
+    ) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                batch = [
+                    (body, future)
+                    for body, future in batch
+                    if not future.done()
+                ]
+                if not batch:
+                    return
+                response = await client.post(
+                    self.endpoint,
+                    json=[body for body, _future in batch],
+                )
+        except asyncio.CancelledError:
+            for _body, future in batch:
+                future.cancel()
+            raise
+        except Exception as exc:
+            for _body, future in batch:
+                if not future.done():
+                    future.set_exception(exc)
+            return
+
+        if response.status_code < 200 or response.status_code >= 300:
+            for _body, future in batch:
+                if not future.done():
+                    future.set_result(_RpcResponse(response.status_code, {}))
+            return
+
+        try:
+            payload = response.json()
+        except Exception as exc:
+            for _body, future in batch:
+                if not future.done():
+                    future.set_exception(exc)
+            return
+
+        expected_ids = {body["id"] for body, _future in batch}
+        rows_by_id: dict[int, dict[str, Any]] = {}
+        invalid_batch = not isinstance(payload, list)
+        if isinstance(payload, list):
+            for row in payload:
+                if not isinstance(row, dict):
+                    invalid_batch = True
+                    continue
+                response_id = row.get("id")
+                if (
+                    type(response_id) is not int
+                    or response_id not in expected_ids
+                    or response_id in rows_by_id
+                ):
+                    invalid_batch = True
+                    continue
+                rows_by_id[response_id] = row
+            if set(rows_by_id) != expected_ids:
+                invalid_batch = True
+
+        shared_error = (
+            payload
+            if isinstance(payload, dict) and isinstance(payload.get("error"), dict)
+            else None
+        )
+        invalid_response = {
+            "error": {
+                "code": "BATCH_INVALID",
+                "message": "Solana RPC batch response IDs are invalid or incomplete",
+            }
+        }
+        for body, future in batch:
+            if future.done():
+                continue
+            if shared_error is not None:
+                row = shared_error
+            elif invalid_batch:
+                row = invalid_response
+            else:
+                row = rows_by_id[body["id"]]
+            future.set_result(_RpcResponse(response.status_code, row))
+
     async def _call(
         self, method: str, params: Iterable[Any] | dict[str, Any]
     ) -> Any:
@@ -256,8 +467,7 @@ class SolanaRpcClient:
             requested_at = datetime.now(tz=timezone.utc)
             started = __import__("time").perf_counter()
             try:
-                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    response = await client.post(self.endpoint, json=body)
+                response = await self._post_rpc(method, body)
                 if response.status_code == 429 or response.status_code >= 500:
                     if attempt < self.max_retries:
                         await asyncio.sleep(0.25 * (2**attempt))

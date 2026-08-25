@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -10,7 +12,102 @@ from sniper_bot.database import Database
 from sniper_bot.db_models import OutboxEventRow
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.outbox import TelegramOutboxWorker
-from sniper_bot.solana_rpc import SolanaRpcClient
+from sniper_bot.solana_rpc import SolanaRpcClient, SolanaRpcError
+
+
+class _BatchResponse:
+    status_code = 200
+
+    def __init__(self, payload: list[dict[str, Any]]) -> None:
+        self._payload = payload
+
+    def json(self) -> list[dict[str, Any]]:
+        return self._payload
+
+
+class _BatchHttpClient:
+    posts: list[list[dict[str, Any]]] = []
+
+    def __init__(self, *, timeout: float) -> None:
+        self.timeout = timeout
+
+    async def __aenter__(self) -> _BatchHttpClient:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def post(
+        self,
+        _endpoint: str,
+        *,
+        json: list[dict[str, Any]],
+    ) -> _BatchResponse:
+        self.posts.append(json)
+        rows = [
+            {
+                "jsonrpc": "2.0",
+                "id": item["id"],
+                "result": {"signature": item["params"][0]},
+            }
+            for item in reversed(json)
+        ]
+        return _BatchResponse(rows)
+
+
+class _NonJsonResponse:
+    status_code = 429
+
+    def json(self) -> object:
+        raise AssertionError("429 response body must not be decoded")
+
+
+class _RetryBatchHttpClient(_BatchHttpClient):
+    calls = 0
+
+    async def post(
+        self,
+        endpoint: str,
+        *,
+        json: list[dict[str, Any]],
+    ) -> _BatchResponse | _NonJsonResponse:
+        type(self).calls += 1
+        if type(self).calls == 1:
+            return _NonJsonResponse()
+        return await super().post(endpoint, json=json)
+
+
+class _ArbitraryBatchResponse:
+    status_code = 200
+
+    def __init__(self, payload: object) -> None:
+        self._payload = payload
+
+    def json(self) -> object:
+        return self._payload
+
+
+class _ArbitraryBatchHttpClient(_BatchHttpClient):
+    payload: object = None
+
+    async def post(
+        self,
+        _endpoint: str,
+        *,
+        json: list[dict[str, Any]],
+    ) -> _ArbitraryBatchResponse:
+        self.posts.append(json)
+        return _ArbitraryBatchResponse(self.payload)
+
+
+class _BlockingEnterBatchHttpClient(_BatchHttpClient):
+    enter_started = asyncio.Event()
+    release_enter = asyncio.Event()
+
+    async def __aenter__(self) -> _BlockingEnterBatchHttpClient:
+        self.enter_started.set()
+        await self.release_enter.wait()
+        return self
 
 
 class _ClassifyingNotifier:
@@ -113,6 +210,184 @@ async def test_outbox_worker_drain_fails_safe_on_database_error(tmp_path) -> Non
     assert await worker.drain(timeout_seconds=1.0) is False
     await worker.stop()
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_batches_concurrent_transaction_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _BatchHttpClient.posts = []
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _BatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        transaction_batch_size=20,
+        transaction_batch_window_seconds=0.001,
+    )
+
+    signatures = [f"SIGNATURE_{index}" for index in range(20)]
+    results = await asyncio.gather(
+        *(client.get_transaction(signature) for signature in signatures)
+    )
+
+    assert len(_BatchHttpClient.posts) == 1
+    assert len(_BatchHttpClient.posts[0]) == 20
+    assert [result["signature"] if result else None for result in results] == signatures
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_retries_non_json_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _BatchHttpClient.posts = []
+    _RetryBatchHttpClient.calls = 0
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _RetryBatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        max_retries=1,
+        transaction_batch_window_seconds=0.001,
+    )
+
+    result = await client.get_transaction("SIGNATURE")
+
+    assert result == {"signature": "SIGNATURE"}
+    assert _RetryBatchHttpClient.calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"signature": "WRONG_SHARED_RESULT"},
+        },
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": {"signature": "A"}},
+            {"jsonrpc": "2.0", "id": 1, "result": {"signature": "B"}},
+        ],
+    ],
+)
+async def test_solana_rpc_rejects_invalid_batch_response_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    payload: object,
+) -> None:
+    _ArbitraryBatchHttpClient.posts = []
+    _ArbitraryBatchHttpClient.payload = payload
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _ArbitraryBatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        transaction_batch_window_seconds=0.001,
+    )
+
+    results = await asyncio.gather(
+        client.get_transaction("A"),
+        client.get_transaction("B"),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, SolanaRpcError) for result in results)
+    assert len(_ArbitraryBatchHttpClient.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_does_not_send_cancelled_batch_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _BatchHttpClient.posts = []
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _BatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        transaction_batch_window_seconds=0.01,
+    )
+    request = asyncio.create_task(client.get_transaction("CANCELLED"))
+    await asyncio.sleep(0)
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    await asyncio.sleep(0.02)
+
+    assert _BatchHttpClient.posts == []
+    assert client._transaction_batch_flush_task is None
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_filters_cancellation_during_http_enter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _BlockingEnterBatchHttpClient.posts = []
+    _BlockingEnterBatchHttpClient.enter_started = asyncio.Event()
+    _BlockingEnterBatchHttpClient.release_enter = asyncio.Event()
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _BlockingEnterBatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        transaction_batch_window_seconds=0.001,
+    )
+    cancelled = asyncio.create_task(client.get_transaction("CANCELLED"))
+    retained = asyncio.create_task(client.get_transaction("RETAINED"))
+    await asyncio.wait_for(
+        _BlockingEnterBatchHttpClient.enter_started.wait(),
+        timeout=1,
+    )
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    _BlockingEnterBatchHttpClient.release_enter.set()
+
+    result = await asyncio.wait_for(retained, timeout=1)
+
+    assert result == {"signature": "RETAINED"}
+    sent = _BlockingEnterBatchHttpClient.posts[0]
+    assert [item["params"][0] for item in sent] == ["RETAINED"]
+
+
+@pytest.mark.asyncio
+async def test_solana_rpc_worker_cancellation_settles_pending_and_allows_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _BatchHttpClient.posts = []
+    monkeypatch.setattr(
+        "sniper_bot.solana_rpc.httpx.AsyncClient",
+        _BatchHttpClient,
+    )
+    client = SolanaRpcClient(
+        "https://rpc.invalid",
+        transaction_batch_window_seconds=60,
+    )
+    pending = asyncio.create_task(client.get_transaction("PENDING"))
+    await asyncio.sleep(0)
+    worker = client._transaction_batch_flush_task
+    assert worker is not None
+    worker.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+    assert client._transaction_batch_flush_task is None
+
+    client.transaction_batch_window_seconds = 0.001
+    result = await asyncio.wait_for(
+        client.get_transaction("AFTER_CANCEL"),
+        timeout=1,
+    )
+    assert result == {"signature": "AFTER_CANCEL"}
 
 
 @pytest.mark.asyncio

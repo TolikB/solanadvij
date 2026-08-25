@@ -84,7 +84,7 @@ class HeliusStreamGateway:
     MAX_GAP_RECOVERY_AGE = timedelta(seconds=60)
     GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
-    LOG_FETCH_CONCURRENCY = 8
+    LOG_FETCH_CONCURRENCY = 20
 
     def __init__(
         self,
