@@ -417,7 +417,7 @@ class HeliusStreamGateway:
 
     async def _receive_or_reconnect(self, websocket: Any) -> Any:
         receive_task = asyncio.create_task(
-            anext(websocket), name="solana-websocket-receive"
+            websocket.recv(), name="solana-websocket-receive"
         )
         reconnect_task = asyncio.create_task(
             self._reconnect_requested.wait(), name="solana-reconnect-request"

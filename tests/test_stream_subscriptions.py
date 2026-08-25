@@ -191,6 +191,13 @@ class FakeConnection(FakeWebSocket):
         super().__init__(responses)
         self.finish_iteration = finish_iteration
         self.ready_event = ready_event
+        self._handshake_responses_remaining = len(responses)
+
+    async def recv(self) -> str:
+        if self._handshake_responses_remaining > 0:
+            self._handshake_responses_remaining -= 1
+            return await super().recv()
+        return await self.__anext__()
 
     async def send(self, value: str) -> None:
         await super().send(value)
