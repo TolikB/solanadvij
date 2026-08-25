@@ -85,6 +85,7 @@ class HeliusStreamGateway:
     GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
     LOG_FETCH_CONCURRENCY = 20
+    SLOT_BLOCK_TIME_CACHE_SIZE = 512
 
     def __init__(
         self,
@@ -128,6 +129,8 @@ class HeliusStreamGateway:
         self._fetch_error_sequences: set[int] = set()
         self._reconnect_requested = asyncio.Event()
         self._dispatch_recovery_pending = False
+        self._slot_block_times: dict[int, int] = {}
+        self._slot_block_time_tasks: dict[int, asyncio.Task[int | None]] = {}
 
     async def start(self) -> None:
         if self._run_task is not None:
@@ -456,14 +459,148 @@ class HeliusStreamGateway:
                 generation=self._stream_generation,
             )
             return
+        if method != "logsNotification":
+            return
         value = result.get("value") if isinstance(result, dict) else None
-        if isinstance(value, dict) and value.get("signature"):
-            await self._spawn_ordered_log_fetch(
-                signature=str(value["signature"]),
-                slot=int(context.get("slot", 0)) if isinstance(context, dict) else 0,
+        if not isinstance(value, dict):
+            raise RuntimeError("Solana logs notification is missing a valid value")
+        signature = value.get("signature")
+        if (
+            not isinstance(signature, str)
+            or not signature
+            or signature != signature.strip()
+        ):
+            raise RuntimeError("Solana logs notification is missing a valid signature")
+        if "err" not in value:
+            raise RuntimeError("Solana logs notification is missing the required err field")
+        if value["err"] is not None:
+            return
+        raw_logs = value.get("logs")
+        if not isinstance(raw_logs, list) or not all(
+            isinstance(line, str) for line in raw_logs
+        ):
+            raise RuntimeError("Solana logs notification is missing a valid logs array")
+        slot = context.get("slot") if isinstance(context, dict) else None
+        if type(slot) is not int or slot <= 0:
+            raise RuntimeError("Solana logs notification is missing a valid slot")
+        await self._spawn_ordered_log_dispatch(
+            signature=signature,
+            slot=slot,
+            logs=raw_logs,
+            received_at=received_at,
+            generation=self._stream_generation,
+        )
+
+    async def _spawn_ordered_log_dispatch(
+        self,
+        *,
+        signature: str,
+        slot: int,
+        logs: list[str],
+        received_at: datetime,
+        generation: int,
+    ) -> None:
+        await self._acquire_log_fetch_permit()
+        sequence = self._log_fetch_sequence
+        self._log_fetch_sequence += 1
+        previous = self._log_fetch_tail
+        task = asyncio.create_task(
+            self._fetch_block_time_and_dispatch_logs(
+                sequence=sequence,
+                signature=signature,
+                slot=slot,
+                logs=logs,
                 received_at=received_at,
-                generation=self._stream_generation,
+                generation=generation,
+                previous=previous,
+            ),
+            name=f"solana-log-dispatch-{sequence}",
+        )
+        self._log_fetch_tail = task
+        self._log_fetch_tasks.add(task)
+        task.add_done_callback(self._forget_log_fetch_task)
+        self._sync_queue_depth()
+
+    async def _fetch_block_time_and_dispatch_logs(
+        self,
+        *,
+        sequence: int,
+        signature: str,
+        slot: int,
+        logs: list[str],
+        received_at: datetime,
+        generation: int,
+        previous: asyncio.Task[None] | None,
+    ) -> None:
+        dispatched = False
+        try:
+            block_time = await self._get_slot_block_time(slot)
+            if previous is not None:
+                await previous
+            if any(failed < sequence for failed in self._fetch_error_sequences):
+                raise RuntimeError("an earlier ordered transaction dispatch failed")
+            await self._queue_transaction(
+                {
+                    "slot": slot,
+                    "blockTime": block_time,
+                    "signature": signature,
+                    "meta": {
+                        "err": None,
+                        "logMessages": logs,
+                    },
+                },
+                EventSource.SOLANA_WSS,
+                received_at=received_at,
+                generation=generation,
             )
+            dispatched = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._fetch_error_sequences.add(sequence)
+            self._dispatch_recovery_pending = True
+            self.entry_gate.block("stream_fetch_error")
+            self._reconnect_requested.set()
+            logger.exception(
+                "Solana ordered logs dispatch failed; reconnect requested",
+                extra={"sequence": sequence},
+            )
+            raise
+        finally:
+            if dispatched:
+                self._fetch_error_sequences.discard(sequence)
+                if (
+                    not self._fetch_error_sequences
+                    and not self._dispatch_recovery_pending
+                ):
+                    self.entry_gate.unblock("stream_fetch_error")
+            self._log_fetch_semaphore.release()
+
+    async def _get_slot_block_time(self, slot: int) -> int:
+        if slot <= 0:
+            raise RuntimeError("Solana logs notification is missing a valid slot")
+        cached = self._slot_block_times.get(slot)
+        if cached is not None:
+            return cached
+        task = self._slot_block_time_tasks.get(slot)
+        if task is None:
+            task = asyncio.create_task(
+                self.rpc.get_block_time(slot),
+                name=f"solana-block-time-{slot}",
+            )
+            self._slot_block_time_tasks[slot] = task
+        try:
+            block_time = await task
+        finally:
+            if self._slot_block_time_tasks.get(slot) is task:
+                del self._slot_block_time_tasks[slot]
+        if block_time is None:
+            raise RuntimeError("confirmed Solana slot block time is unavailable")
+        self._slot_block_times[slot] = block_time
+        while len(self._slot_block_times) > self.SLOT_BLOCK_TIME_CACHE_SIZE:
+            oldest_slot = next(iter(self._slot_block_times))
+            del self._slot_block_times[oldest_slot]
+        return block_time
 
     async def _acquire_log_fetch_permit(self) -> None:
         while True:
@@ -598,6 +735,12 @@ class HeliusStreamGateway:
         if fetch_tasks:
             await asyncio.gather(*fetch_tasks, return_exceptions=True)
         self._log_fetch_tasks.clear()
+        block_time_tasks = tuple(set(self._slot_block_time_tasks.values()))
+        for block_time_task in block_time_tasks:
+            block_time_task.cancel()
+        if block_time_tasks:
+            await asyncio.gather(*block_time_tasks, return_exceptions=True)
+        self._slot_block_time_tasks.clear()
         self._log_fetch_tail = None
         self._fetch_error_sequences.clear()
         self._sync_queue_depth()

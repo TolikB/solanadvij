@@ -371,6 +371,32 @@ async def test_solana_rpc_retries_non_json_rate_limit(
 
 
 @pytest.mark.asyncio
+async def test_solana_rpc_get_block_time_validates_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = SolanaRpcClient("https://rpc.invalid")
+    calls: list[tuple[str, list[object]]] = []
+
+    async def call(method: str, params: list[object]) -> object:
+        calls.append((method, params))
+        return 1_787_646_900
+
+    monkeypatch.setattr(client, "_call", call)
+
+    assert await client.get_block_time(123) == 1_787_646_900
+    assert calls == [("getBlockTime", [123])]
+    with pytest.raises(ValueError, match="slot must not be negative"):
+        await client.get_block_time(-1)
+
+    async def invalid_call(_method: str, _params: list[object]) -> object:
+        return "invalid"
+
+    monkeypatch.setattr(client, "_call", invalid_call)
+    with pytest.raises(SolanaRpcError, match="invalid result"):
+        await client.get_block_time(123)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "payload",
     [

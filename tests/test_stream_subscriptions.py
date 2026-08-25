@@ -553,7 +553,218 @@ async def test_failed_buffer_handler_retries_only_unconfirmed_message(
 
 
 @pytest.mark.asyncio
-async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
+async def test_logs_notification_uses_cached_block_time_without_transaction_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+    gateway.SLOT_BLOCK_TIME_CACHE_SIZE = 2
+    block_time_calls: list[int] = []
+    queued: list[tuple[dict[str, Any], EventSource, dict[str, Any]]] = []
+
+    async def get_block_time(slot: int) -> int:
+        block_time_calls.append(slot)
+        return 1_787_646_900 + slot
+
+    async def unexpected_get_transaction(_signature: str) -> dict[str, Any]:
+        pytest.fail("logsNotification must not fetch the full transaction")
+
+    async def queue_transaction(
+        transaction: dict[str, Any],
+        source: EventSource,
+        **kwargs: Any,
+    ) -> None:
+        queued.append((transaction, source, kwargs))
+
+    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
+    monkeypatch.setattr(gateway.rpc, "get_transaction", unexpected_get_transaction)
+    monkeypatch.setattr(gateway, "_queue_transaction", queue_transaction)
+
+    def notification(signature: str, slot: int) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": slot},
+                    "value": {
+                        "signature": signature,
+                        "err": None,
+                        "logs": ["Program data: example"],
+                    },
+                }
+            },
+        }
+
+    await gateway.handle_message(notification("first", 1))
+    await gateway.handle_message(notification("second", 1))
+    await gateway.handle_message(notification("third", 2))
+    await gateway.handle_message(notification("fourth", 3))
+    tasks = tuple(gateway._log_fetch_tasks)
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+    await asyncio.sleep(0)
+
+    assert block_time_calls == [1, 2, 3]
+    assert [row[0]["signature"] for row in queued] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+    ]
+    assert queued[0][0]["blockTime"] == 1_787_646_901
+    assert queued[0][0]["meta"]["logMessages"] == ["Program data: example"]
+    assert all(row[1] == EventSource.SOLANA_WSS for row in queued)
+    assert list(gateway._slot_block_times) == [2, 3]
+    assert gateway._log_fetch_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_logs_notification_block_time_failure_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = _gateway()
+
+    async def missing_block_time(_slot: int) -> None:
+        return None
+
+    async def queue_transaction(
+        _transaction: dict[str, Any],
+        _source: EventSource,
+        **_kwargs: Any,
+    ) -> None:
+        pytest.fail("unavailable block time must not dispatch a transaction")
+
+    monkeypatch.setattr(gateway.rpc, "get_block_time", missing_block_time)
+    monkeypatch.setattr(gateway, "_queue_transaction", queue_transaction)
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "logsNotification",
+        "params": {
+            "result": {
+                "context": {"slot": 123},
+                "value": {
+                    "signature": "missing-time",
+                    "err": None,
+                    "logs": ["Program data: example"],
+                },
+            }
+        },
+    }
+
+    await gateway.handle_message(notification)
+    tasks = tuple(gateway._log_fetch_tasks)
+    results = await asyncio.wait_for(
+        asyncio.gather(*tasks, return_exceptions=True),
+        timeout=1,
+    )
+
+    assert len(results) == 1
+    assert isinstance(results[0], RuntimeError)
+    assert "block time is unavailable" in str(results[0])
+    assert gateway._reconnect_requested.is_set()
+    assert gateway._dispatch_recovery_pending is True
+    assert "stream_fetch_error" in gateway.entry_gate.reasons
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value, slot, message",
+    [
+        (
+            {
+                "signature": "missing-err",
+                "logs": ["Program data: example"],
+            },
+            123,
+            "required err field",
+        ),
+        (
+            {
+                "signature": "missing-logs",
+                "err": None,
+            },
+            123,
+            "valid logs array",
+        ),
+        (
+            {
+                "signature": "invalid-logs",
+                "err": None,
+                "logs": "not-a-list",
+            },
+            123,
+            "valid logs array",
+        ),
+        (
+            {
+                "err": None,
+                "logs": ["Program data: example"],
+            },
+            123,
+            "valid signature",
+        ),
+        (
+            {
+                "signature": True,
+                "err": None,
+                "logs": ["Program data: example"],
+            },
+            123,
+            "valid signature",
+        ),
+        (
+            {
+                "signature": " padded ",
+                "err": None,
+                "logs": ["Program data: example"],
+            },
+            123,
+            "valid signature",
+        ),
+        (
+            {
+                "signature": "invalid-slot",
+                "err": None,
+                "logs": ["Program data: example"],
+            },
+            True,
+            "valid slot",
+        ),
+        (
+            {
+                "signature": "invalid-slot",
+                "err": None,
+                "logs": ["Program data: example"],
+            },
+            123.5,
+            "valid slot",
+        ),
+    ],
+)
+async def test_malformed_logs_notification_is_rejected_before_dispatch(
+    value: dict[str, Any],
+    slot: object,
+    message: str,
+) -> None:
+    gateway = _gateway()
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "logsNotification",
+        "params": {
+            "result": {
+                "context": {"slot": slot},
+                "value": value,
+            }
+        },
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        await gateway.handle_message(notification)
+
+    assert gateway._log_fetch_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_log_block_times_are_concurrent_but_dispatched_in_receive_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = HeliusStreamGateway(
@@ -568,16 +779,12 @@ async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
     second_fetched = asyncio.Event()
     dispatched: list[str] = []
 
-    async def get_transaction(signature: str) -> dict[str, Any]:
-        if signature == "first":
+    async def get_block_time(slot: int) -> int:
+        if slot == 1:
             await first_release.wait()
         else:
             second_fetched.set()
-        return {
-            "slot": 1 if signature == "first" else 2,
-            "blockTime": 1_787_646_900,
-            "signature": signature,
-        }
+        return 1_787_646_900 + slot
 
     async def dispatch(
         transaction: dict[str, Any],
@@ -586,7 +793,7 @@ async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
     ) -> None:
         dispatched.append(str(transaction["signature"]))
 
-    monkeypatch.setattr(gateway.rpc, "get_transaction", get_transaction)
+    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
     monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
     def notification(signature: str, slot: int) -> dict[str, Any]:
         return {
@@ -595,7 +802,11 @@ async def test_log_fetches_are_concurrent_but_dispatched_in_receive_order(
             "params": {
                 "result": {
                     "context": {"slot": slot},
-                    "value": {"signature": signature},
+                    "value": {
+                        "signature": signature,
+                        "err": None,
+                        "logs": [f"Program data: {signature}"],
+                    },
                 }
             },
         }
@@ -623,9 +834,10 @@ async def test_saturated_log_fetch_wait_aborts_for_reconnect() -> None:
     )
     await gateway._log_fetch_semaphore.acquire()
     blocked = asyncio.create_task(
-        gateway._spawn_ordered_log_fetch(
+        gateway._spawn_ordered_log_dispatch(
             signature="blocked",
             slot=1,
+            logs=["Program data: blocked"],
             received_at=datetime.now(tz=timezone.utc),
             generation=0,
         )
@@ -661,12 +873,8 @@ async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
     release_first_dispatch = asyncio.Event()
     dispatched: list[str] = []
 
-    async def get_transaction(signature: str) -> dict[str, Any]:
-        return {
-            "slot": 1 if signature == "first" else 2,
-            "blockTime": 1_787_646_900,
-            "signature": signature,
-        }
+    async def get_block_time(slot: int) -> int:
+        return 1_787_646_900 + slot
 
     async def dispatch(
         transaction: dict[str, Any],
@@ -687,12 +895,16 @@ async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
             "params": {
                 "result": {
                     "context": {"slot": slot},
-                    "value": {"signature": signature},
+                    "value": {
+                        "signature": signature,
+                        "err": None,
+                        "logs": [f"Program data: {signature}"],
+                    },
                 }
             },
         }
 
-    monkeypatch.setattr(gateway.rpc, "get_transaction", get_transaction)
+    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
     monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
 
     await gateway.handle_message(notification("first", 1))

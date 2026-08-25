@@ -91,6 +91,16 @@ class SolanaRpcClient:
     def set_clock(self, clock: Callable[[], datetime]) -> None:
         self._clock = clock
 
+    async def get_block_time(self, slot: int) -> int | None:
+        if slot < 0:
+            raise ValueError("slot must not be negative")
+        result = await self._call("getBlockTime", [slot])
+        if result is None:
+            return None
+        if type(result) is not int:
+            raise SolanaRpcError("getBlockTime returned an invalid result")
+        return result
+
     async def get_transaction(self, signature: str) -> dict[str, Any] | None:
         result = await self._call(
             "getTransaction",
