@@ -52,7 +52,7 @@ def test_backup_command_is_one_complete_shell_script_argument() -> None:
     assert isinstance(command, list)
     assert len(command) == 1
     assert "while true; do" in command[0]
-    assert "/scripts/backup.sh" in command[0]
+    assert "/bin/sh /scripts/backup.sh" in command[0]
     assert "sleep 86400" in command[0]
     assert command[0].strip().endswith("done")
 

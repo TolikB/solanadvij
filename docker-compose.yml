@@ -89,7 +89,7 @@ services:
     command:
       - |
         while true; do
-          /scripts/backup.sh
+          /bin/sh /scripts/backup.sh
           sleep 86400
         done
     volumes:
