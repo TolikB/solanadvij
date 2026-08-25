@@ -56,6 +56,7 @@ EntryHandler = Callable[
     Awaitable[RejectReason | None],
 ]
 EventObserver = Callable[[EventEnvelope], Awaitable[None]]
+FatalHandler = Callable[[BaseException], None]
 
 
 class ConfirmationPipeline:
@@ -71,6 +72,7 @@ class ConfirmationPipeline:
         security_provider: SecurityProvider | None = None,
         entry_handler: EntryHandler | None = None,
         event_observer: EventObserver | None = None,
+        fatal_handler: FatalHandler | None = None,
         record_raw: bool = True,
         config: AppConfig | None = None,
     ) -> None:
@@ -167,6 +169,7 @@ class ConfirmationPipeline:
         self.security_provider = security_provider
         self.entry_handler = entry_handler
         self.event_observer = event_observer
+        self.fatal_handler = fatal_handler
         self.record_raw = record_raw
         self._pump = PumpDecoder()
         self._pumpswap = PumpSwapDecoder()
@@ -216,30 +219,52 @@ class ConfirmationPipeline:
         if not local_accepted:
             self.metrics.chain_events_duplicate.inc()
             return False
+        requires_state_rebuild = False
         try:
             if self.record_raw and not recovering:
                 await self.recorder.record(event)
-            await self._apply_event(
-                event,
-                persist=True,
-                observe=True,
-                allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
-            )
-            if self.database is not None:
-                await self.database.mark_event_processed(
-                    event.event_id, processed_at=datetime.now(tz=timezone.utc)
+            if self.database is None:
+                await self._apply_event(
+                    event,
+                    persist=True,
+                    observe=True,
+                    allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
                 )
+            else:
+                transaction_entered = False
+                try:
+                    async with self.database.event_state_transaction():
+                        transaction_entered = True
+                        await self._apply_event(
+                            event,
+                            persist=True,
+                            observe=True,
+                            allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+                        )
+                        await self.database.mark_event_processed(
+                            event.event_id, processed_at=datetime.now(tz=timezone.utc)
+                        )
+                except BaseException:
+                    requires_state_rebuild = transaction_entered
+                    raise
+                self.database.release_event_claim(event.event_id)
             return True
         except BaseException as error:
-            await self.deduplicator.forget(event.event_id)
-            if self.database is not None:
-                try:
-                    await self.database.mark_event_failed(event.event_id, error)
-                except Exception:
-                    logger.exception(
-                        "failed to persist event processing failure",
-                        extra={"event_id": event.event_id},
-                    )
+            try:
+                await self.deduplicator.forget(event.event_id)
+                if self.database is not None:
+                    try:
+                        await self.database.mark_event_failed(event.event_id, error)
+                    except Exception:
+                        logger.exception(
+                            "failed to persist event processing failure",
+                            extra={"event_id": event.event_id},
+                        )
+            finally:
+                if self.database is not None:
+                    self.database.release_event_claim(event.event_id)
+                if requires_state_rebuild and self.fatal_handler is not None:
+                    self.fatal_handler(error)
             raise
 
     async def rehydrate_event(self, event: EventEnvelope) -> None:

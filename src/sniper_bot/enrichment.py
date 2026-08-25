@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -98,25 +99,71 @@ class DexscreenerClient:
                 )
         if not isinstance(payload, dict):
             raise RuntimeError("Dexscreener enrichment returned invalid payload")
-        pairs = [item for item in payload.get("pairs", []) if item.get("chainId") == "solana"]
+        raw_pairs = payload.get("pairs")
+        if raw_pairs is None:
+            raw_pairs = []
+        if not isinstance(raw_pairs, list):
+            raise RuntimeError("Dexscreener enrichment returned invalid pairs")
+        pairs = [
+            item
+            for item in raw_pairs
+            if isinstance(item, dict) and item.get("chainId") == "solana"
+        ]
         pair: dict[str, Any] = max(
             pairs,
-            key=lambda item: float((item.get("liquidity") or {}).get("usd") or 0),
+            key=_pair_liquidity_usd,
             default={},
         )
-        info = pair.get("info") or {}
-        websites = info.get("websites") or []
+        raw_info = pair.get("info")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        raw_websites = info.get("websites")
+        websites = (
+            [item for item in raw_websites if isinstance(item, dict)]
+            if isinstance(raw_websites, list)
+            else []
+        )
+        raw_socials = info.get("socials")
+        socials = (
+            [item for item in raw_socials if isinstance(item, dict)]
+            if isinstance(raw_socials, list)
+            else []
+        )
+        raw_base_token = pair.get("baseToken")
+        base_token = raw_base_token if isinstance(raw_base_token, dict) else {}
+        raw_boosts = pair.get("boosts")
+        boosts = raw_boosts if isinstance(raw_boosts, dict) else {}
         enrichment = TokenEnrichment(
             mint=mint,
-            name=(pair.get("baseToken") or {}).get("name"),
-            symbol=(pair.get("baseToken") or {}).get("symbol"),
+            name=base_token.get("name"),
+            symbol=base_token.get("symbol"),
             image_url=info.get("imageUrl") or info.get("header"),
             website_url=websites[0].get("url") if websites else None,
-            socials=list(info.get("socials") or []),
+            socials=socials,
             pair_url=pair.get("url"), pair_address=pair.get("pairAddress"),
             dex_id=pair.get("dexId"), price_usd=pair.get("priceUsd"),
-            boosts_active=int((pair.get("boosts") or {}).get("active") or 0),
+            boosts_active=_non_negative_int(boosts.get("active")),
             observed_at=observed_at,
         )
         self._cache[mint] = enrichment
         return enrichment
+
+
+def _pair_liquidity_usd(pair: dict[str, Any]) -> float:
+    raw_liquidity = pair.get("liquidity")
+    if not isinstance(raw_liquidity, dict):
+        return 0.0
+    try:
+        liquidity = float(raw_liquidity.get("usd") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, liquidity) if math.isfinite(liquidity) else 0.0
+
+
+def _non_negative_int(value: object) -> int:
+    if not isinstance(value, (str, bytes, bytearray, int, float)):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, parsed)

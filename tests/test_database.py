@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -12,9 +14,13 @@ from sniper_bot.db_models import (
     EventDedupRow,
     OutboxEventRow,
     RawChainEventRow,
+    TokenRow,
 )
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
+from sniper_bot.metrics import BotMetrics
+from sniper_bot.pipeline import ConfirmationPipeline
 from sniper_bot.registry import WSOL_MINT, PoolRecord, TokenRecord
+from sniper_bot.stream import EntryGate
 
 
 def test_daily_telegram_report_is_human_readable_and_trade_only() -> None:
@@ -286,4 +292,200 @@ async def test_daily_equity_bounds_preserve_historical_unrealized_pnl(tmp_path) 
     assert bounds["ending_equity_usd"] == Decimal("480")
     assert bounds["ending_unrealized_pnl_usd"] == Decimal("-20")
     assert bounds["equity_path_usd"] == [Decimal("500"), Decimal("480")]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_event_state_transaction_rolls_back_and_preserves_claim(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'event-state.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    token = TokenRecord(mint="TOKEN", creation_time=now, updated_at=now)
+    pool = PoolRecord(
+        pool_address="POOL",
+        base_mint="TOKEN",
+        quote_mint=WSOL_MINT,
+        creation_signature="atomic-sig",
+        creation_slot=3,
+        creation_time=now,
+        base_decimals=6,
+        quote_decimals=9,
+        updated_at=now,
+    )
+    event = EventEnvelope(
+        source=EventSource.REPLAY,
+        protocol=Protocol.PUMPSWAP,
+        event_type=ChainEventType.POOL_CREATED,
+        slot=3,
+        signature="atomic-sig",
+        instruction_index=0,
+        block_time=now,
+        observed_at=now,
+        mint="TOKEN",
+        pool_address="POOL",
+        payload={"quote_mint": WSOL_MINT},
+    )
+
+    assert await database.record_event(event) is True
+    with pytest.raises(RuntimeError, match="force rollback"):
+        async with database.event_state_transaction():
+            await database.upsert_token(token)
+            await database.upsert_pool(pool)
+            await database.mark_event_processed(event.event_id, processed_at=now)
+            raise RuntimeError("force rollback")
+
+    async with database.sessions() as session:
+        assert await session.get(TokenRow, "TOKEN") is None
+        claim = await session.get(EventDedupRow, event.event_id)
+        assert claim is not None
+        assert claim.processing_status == "PROCESSING"
+
+    await database.mark_event_failed(event.event_id, RuntimeError("rolled back"))
+    assert await database.record_event(event, reclaim=True) is True
+    async with database.event_state_transaction():
+        await database.upsert_token(token)
+        await database.upsert_pool(pool)
+        await database.mark_event_processed(event.event_id, processed_at=now)
+    database.release_event_claim(event.event_id)
+
+    async with database.sessions() as session:
+        claim = await session.get(EventDedupRow, event.event_id)
+        assert claim is not None
+        assert claim.processing_status == "PROCESSED"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_requests_rebuild_when_failure_marker_is_cancelled(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'commit-failure.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    event = EventEnvelope(
+        source=EventSource.REPLAY,
+        protocol=Protocol.PUMPSWAP,
+        event_type=ChainEventType.SWAP_BUY,
+        slot=4,
+        signature="commit-failure",
+        instruction_index=0,
+        block_time=now,
+        observed_at=now,
+        mint="TOKEN",
+        pool_address="POOL",
+        payload={"base_amount_out": "1", "quote_amount_in": "1"},
+    )
+    original_transaction = database.event_state_transaction
+    fatal_errors: list[BaseException] = []
+
+    @asynccontextmanager
+    async def fail_after_transaction_body():
+        async with original_transaction():
+            yield
+        raise RuntimeError("simulated commit failure")
+
+    async def fail_to_mark_event(_event_id: str, _error: BaseException) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(database, "event_state_transaction", fail_after_transaction_body)
+    monkeypatch.setattr(database, "mark_event_failed", fail_to_mark_event)
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=False,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await pipeline.process_event(event)
+
+    assert len(fatal_errors) == 1
+    assert event.event_id not in database._event_claim_tokens
+    async with database.sessions() as session:
+        claim = await session.get(EventDedupRow, event.event_id)
+        assert claim is not None
+        assert claim.processing_status == "PROCESSED"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_reclaims_owned_processing_and_quarantines_poison_events(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'quarantine.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    event = EventEnvelope(
+        source=EventSource.REPLAY,
+        protocol=Protocol.PUMPSWAP,
+        event_type=ChainEventType.SWAP_SELL,
+        slot=5,
+        signature="poison-event",
+        instruction_index=0,
+        block_time=now,
+        observed_at=now,
+        mint="TOKEN",
+        pool_address="POOL",
+        payload={"base_amount_in": "1", "quote_amount_out": "1"},
+    )
+
+    assert await database.record_event(event) is True
+    assert await database.load_unprocessed_events() == []
+    immediate = await database.load_unprocessed_events(include_owned_processing=True)
+    assert [row.event_id for row in immediate] == [event.event_id]
+
+    await database.mark_event_failed(event.event_id, RuntimeError("attempt 1"))
+    assert await database.record_event(event, reclaim=True) is True
+    await database.mark_event_failed(event.event_id, RuntimeError("attempt 2"))
+    assert await database.record_event(event, reclaim=True) is True
+    await database.mark_event_failed(event.event_id, RuntimeError("attempt 3"))
+
+    assert (
+        await database.load_unprocessed_events(include_owned_processing=True)
+        == []
+    )
+    assert await database.load_quarantined_event_protocols() == {"pumpswap"}
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reclaims_fresh_owned_processing_event(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'owned-processing.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    event = EventEnvelope(
+        source=EventSource.REPLAY,
+        protocol=Protocol.PUMPSWAP,
+        event_type=ChainEventType.SWAP_BUY,
+        slot=6,
+        signature="owned-processing",
+        instruction_index=0,
+        block_time=now,
+        observed_at=now,
+        mint="TOKEN",
+        pool_address="POOL",
+        payload={"base_amount_out": "1", "quote_amount_in": "1"},
+    )
+    assert await database.record_event(event) is True
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        record_raw=False,
+    )
+
+    assert await pipeline.process_event(event, recovering=True) is True
+
+    async with database.sessions() as session:
+        claim = await session.get(EventDedupRow, event.event_id)
+        assert claim is not None
+        assert claim.processing_status == "PROCESSED"
+        assert claim.processing_attempts == 2
     await database.close()

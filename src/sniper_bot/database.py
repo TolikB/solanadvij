@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
@@ -68,6 +71,7 @@ class ActiveRuntimeError(RuntimeError):
 RUNTIME_ADVISORY_LOCK_KEY = 0x534E49504552
 RUNTIME_ADVISORY_LOCK_CLASS_ID = 21326
 RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
+MAX_EVENT_PROCESSING_ATTEMPTS = 3
 
 
 class Database:
@@ -84,6 +88,35 @@ class Database:
         self._system_run_lock = asyncio.Lock()
         self._runtime_lease_connection: AsyncConnection | None = None
         self._owned_system_run_id: str | None = None
+        self._event_write_session: ContextVar[AsyncSession | None] = ContextVar(
+            f"event_write_session_{id(self)}",
+            default=None,
+        )
+
+    @asynccontextmanager
+    async def event_state_transaction(self) -> AsyncIterator[None]:
+        """Commit all secondary state changes for one decoded event atomically."""
+        if self._event_write_session.get() is not None:
+            raise RuntimeError("event state transactions must not be nested")
+        async with self.sessions.begin() as session:
+            token = self._event_write_session.set(session)
+            try:
+                yield
+            finally:
+                self._event_write_session.reset(token)
+
+    @asynccontextmanager
+    async def _write_session(self) -> AsyncIterator[AsyncSession]:
+        active = self._event_write_session.get()
+        if active is not None:
+            yield active
+            return
+        async with self.sessions.begin() as session:
+            yield session
+
+    def release_event_claim(self, event_id: str) -> None:
+        """Forget an in-memory claim only after its outer transaction committed."""
+        self._event_claim_tokens.pop(event_id, None)
 
     async def create_schema_for_tests(self) -> None:
         async with self.engine.begin() as connection:
@@ -362,7 +395,9 @@ class Database:
                     or now - _as_utc(existing.last_attempt_at) >= timedelta(minutes=2)
                 )
                 if existing.processing_status == "PROCESSED" or (
-                    existing.processing_status == "PROCESSING" and not stale_claim
+                    existing.processing_status == "PROCESSING"
+                    and not stale_claim
+                    and not reclaim
                 ):
                     return False
                 existing.processing_status = "PROCESSING"
@@ -400,7 +435,8 @@ class Database:
         claim_token = self._event_claim_tokens.get(event_id)
         if claim_token is None:
             raise RuntimeError("event claim token is missing")
-        async with self.sessions.begin() as session:
+        shared_transaction = self._event_write_session.get() is not None
+        async with self._write_session() as session:
             result = await session.execute(
                 update(EventDedupRow)
                 .where(
@@ -418,7 +454,8 @@ class Database:
             )
             if getattr(result, "rowcount", None) != 1:
                 raise RuntimeError("event processing claim was superseded")
-        self._event_claim_tokens.pop(event_id, None)
+        if not shared_transaction:
+            self.release_event_claim(event_id)
 
     async def mark_event_failed(self, event_id: str, error: BaseException) -> None:
         claim_token = self._event_claim_tokens.get(event_id)
@@ -464,22 +501,26 @@ class Database:
             ).all()
         return [_event_from_row(row) for row in rows]
 
-    async def load_unprocessed_events(self) -> list[EventEnvelope]:
+    async def load_unprocessed_events(
+        self, *, include_owned_processing: bool = False
+    ) -> list[EventEnvelope]:
         stale_before = datetime.now(tz=timezone.utc) - timedelta(minutes=2)
+        processing_filter: Any = EventDedupRow.processing_status == "PROCESSING"
+        if not include_owned_processing:
+            processing_filter = processing_filter & (
+                (EventDedupRow.last_attempt_at.is_(None))
+                | (EventDedupRow.last_attempt_at <= stale_before)
+            )
         async with self.sessions() as session:
             rows = (
                 await session.scalars(
                     select(RawChainEventRow)
                     .join(EventDedupRow, EventDedupRow.event_id == RawChainEventRow.event_id)
                     .where(
+                        EventDedupRow.processing_attempts
+                        < MAX_EVENT_PROCESSING_ATTEMPTS,
                         (EventDedupRow.processing_status == "FAILED")
-                        | (
-                            (EventDedupRow.processing_status == "PROCESSING")
-                            & (
-                                (EventDedupRow.last_attempt_at.is_(None))
-                                | (EventDedupRow.last_attempt_at <= stale_before)
-                            )
-                        )
+                        | processing_filter,
                     )
                     .order_by(
                         RawChainEventRow.slot,
@@ -490,6 +531,25 @@ class Database:
                 )
             ).all()
         return [_event_from_row(row) for row in rows]
+
+    async def load_quarantined_event_protocols(self) -> set[str]:
+        async with self.sessions() as session:
+            protocols = (
+                await session.scalars(
+                    select(RawChainEventRow.protocol)
+                    .join(
+                        EventDedupRow,
+                        EventDedupRow.event_id == RawChainEventRow.event_id,
+                    )
+                    .where(
+                        EventDedupRow.processing_status.in_(("FAILED", "PROCESSING")),
+                        EventDedupRow.processing_attempts
+                        >= MAX_EVENT_PROCESSING_ATTEMPTS,
+                    )
+                    .distinct()
+                )
+            ).all()
+        return {str(protocol) for protocol in protocols}
 
     async def load_stream_checkpoint(self) -> tuple[int, str | None, datetime | None]:
         async with self.sessions() as session:
@@ -1970,7 +2030,7 @@ class Database:
             }
 
     async def _upsert(self, model: Any, values: dict[str, Any], keys: list[str]) -> None:
-        async with self.sessions.begin() as session:
+        async with self._write_session() as session:
             dialect = session.bind.dialect.name if session.bind is not None else ""
             update_values = {key: value for key, value in values.items() if key not in keys}
             if dialect == "postgresql":

@@ -149,6 +149,7 @@ class SniperRuntime:
             security_provider=self._build_security_context,
             entry_handler=self._open_candidate,
             event_observer=self._observe_event,
+            fatal_handler=self._request_fatal_restart,
             record_raw=not config.replay_mode,
             config=config,
         )
@@ -247,7 +248,11 @@ class SniperRuntime:
                             runtime_checkpoint.get("momentum_windows") or {}
                         ).items()
                     }
-                for event in await self.database.load_unprocessed_events():
+                for protocol in await self.database.load_quarantined_event_protocols():
+                    self.entry_gate.block_protocol(Protocol(protocol))
+                for event in await self.database.load_unprocessed_events(
+                    include_owned_processing=True
+                ):
                     await self.pipeline.process_event(event, recovering=True)
                 for protocol, checkpoint in (
                     await self.database.load_protocol_checkpoints()
@@ -537,6 +542,14 @@ class SniperRuntime:
 
     def is_record(self) -> bool:
         return self.config.app_mode == AppMode.RECORD
+
+    def _request_fatal_restart(self, error: BaseException) -> None:
+        self.entry_gate.block("database_unavailable")
+        logger.critical(
+            "event state became ambiguous; requesting supervised process restart",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def halt(self, reason: str) -> None:
         self.risk_manager.set_halt(reason)
