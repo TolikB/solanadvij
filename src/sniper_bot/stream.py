@@ -235,10 +235,10 @@ class HeliusStreamGateway:
                                     )
                                 except _GapRecoveryTimeout as exc:
                                     logger.warning(str(exc))
-                                    pending_handshake_messages = list(
-                                        exc.buffered_messages
-                                    )
+                                    pending_handshake_messages.clear()
                                     self._discard_in_memory_checkpoint()
+                                    self.metrics.websocket_reconnects.inc()
+                                    continue
                             else:
                                 logger.warning(
                                     "Solana checkpoint is stale; "

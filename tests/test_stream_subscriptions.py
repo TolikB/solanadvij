@@ -317,26 +317,42 @@ async def test_live_baseline_tags_transactions_non_tradable_until_warmup(
 
 
 @pytest.mark.asyncio
-async def test_gap_recovery_timeout_buffers_live_event_without_partial_publish(
+async def test_gap_recovery_timeout_reconnects_without_partial_publish(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    notification = {
+    abandoned_notification = {
         "jsonrpc": "2.0",
         "method": "transactionNotification",
-        "params": {},
+        "params": {"generation": "abandoned"},
     }
-    connection = FakeConnection(
+    fresh_notification = {
+        "jsonrpc": "2.0",
+        "method": "transactionNotification",
+        "params": {"generation": "fresh"},
+    }
+    recovery_connection = FakeConnection(
         [
             {"jsonrpc": "2.0", "id": 1, "result": 11},
             {"jsonrpc": "2.0", "id": 2, "result": 12},
-            notification,
+            abandoned_notification,
         ],
         finish_iteration=False,
     )
+    fresh_connection = FakeConnection(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 21},
+            {"jsonrpc": "2.0", "id": 2, "result": 22},
+            fresh_notification,
+        ],
+        finish_iteration=False,
+    )
+    connections = [recovery_connection, fresh_connection]
     events: list[str] = []
 
     def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
-        return FakeConnectionContext(connection, events, "timeout")
+        connection = connections.pop(0)
+        name = "recovery" if connection is recovery_connection else "fresh"
+        return FakeConnectionContext(connection, events, name)
 
     gateway = _gateway()
     gateway.GAP_RECOVERY_TIMEOUT_SECONDS = 0.01
@@ -359,7 +375,8 @@ async def test_gap_recovery_timeout_buffers_live_event_without_partial_publish(
 
     async def handle_message(message: dict[str, Any]) -> None:
         processed.append(message)
-        live_processed.set()
+        if message == fresh_notification:
+            live_processed.set()
 
     monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
     monkeypatch.setattr(gateway, "_recover_gap", slow_recovery)
@@ -370,7 +387,8 @@ async def test_gap_recovery_timeout_buffers_live_event_without_partial_publish(
             await live_processed.wait()
             await recovery_cancelled.wait()
 
-        assert processed == [notification]
+        assert processed == [fresh_notification]
+        assert events[:3] == ["open:recovery", "close:recovery", "open:fresh"]
         assert gateway._queue.empty()
         assert gateway.last_slot == 0
         assert gateway.last_signature is None
