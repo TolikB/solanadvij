@@ -95,6 +95,7 @@ async def _must_reject(
 
 POSTGRES_EVENT_BATCH_SIZE = 64
 POSTGRES_EVENT_BATCH_MAX_SECONDS = 1.0
+POSTGRES_EVENT_FAILURE_BATCH_MAX_SECONDS = 1.0
 
 
 def _event_batch(prefix: str, now: datetime, *, count: int) -> list[EventEnvelope]:
@@ -286,6 +287,219 @@ async def _probe_event_batch(
             )
 
 
+async def _probe_event_failure_batch(
+    database: Database,
+    competitor: Database,
+    now: datetime,
+) -> None:
+    failure_batch = _event_batch(
+        f"ci-failure-batch-{uuid4().hex}",
+        now,
+        count=POSTGRES_EVENT_BATCH_SIZE,
+    )
+    overlap = _event_batch(
+        f"ci-failure-overlap-{uuid4().hex}",
+        now,
+        count=2,
+    )
+    tracked_events = [*failure_batch, *overlap]
+    tracked_event_ids = [event.event_id for event in tracked_events]
+    statements: list[tuple[str, bool]] = []
+    lock_orders: list[tuple[str, ...]] = []
+    listeners: list[tuple[Any, Any]] = []
+
+    def capture_failure_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        statements.append((normalized, executemany))
+
+    def capture_lock_order(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if (
+            normalized.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in normalized
+            and "for update" in normalized
+        ):
+            lock_orders.append(tuple(str(value) for value in parameters))
+
+    try:
+        accepted = await database.record_events(failure_batch)
+        if accepted != [True] * len(failure_batch):
+            raise RuntimeError(
+                "PostgreSQL failure-batch probe rejected a new event"
+            )
+
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_failure_sql,
+        )
+        listeners.append((database.engine.sync_engine, capture_failure_sql))
+        started = time.perf_counter()
+        await database.mark_events_failed(
+            [event.event_id for event in reversed(failure_batch)],
+            RuntimeError("ci failure batch"),
+        )
+        elapsed = time.perf_counter() - started
+        sqlalchemy_event.remove(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_failure_sql,
+        )
+        listeners.clear()
+
+        lock_selects = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in statement
+            and "for update" in statement
+        ]
+        failure_updates = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("update event_dedup set")
+        ]
+        if (
+            len(statements) != 2
+            or len(lock_selects) != 1
+            or len(failure_updates) != 1
+        ):
+            raise RuntimeError(
+                "PostgreSQL event failure batch did not use the required "
+                "two-statement shape"
+            )
+        if any(executemany for _, executemany in statements):
+            raise RuntimeError(
+                "PostgreSQL event failure batch unexpectedly used executemany"
+            )
+        if elapsed > POSTGRES_EVENT_FAILURE_BATCH_MAX_SECONDS:
+            raise RuntimeError(
+                "PostgreSQL event failure batch exceeded the one-second "
+                "performance budget"
+            )
+
+        accepted = await database.record_events(overlap)
+        if accepted != [True] * len(overlap):
+            raise RuntimeError(
+                "PostgreSQL failure-overlap probe rejected a new event"
+            )
+        overlap_ids = [event.event_id for event in overlap]
+        competitor._event_claim_tokens.update(
+            {
+                event_id: database._event_claim_tokens[event_id]
+                for event_id in overlap_ids
+            }
+        )
+        for engine in (
+            database.engine.sync_engine,
+            competitor.engine.sync_engine,
+        ):
+            sqlalchemy_event.listen(
+                engine,
+                "before_cursor_execute",
+                capture_lock_order,
+            )
+            listeners.append((engine, capture_lock_order))
+
+        race_results = await asyncio.wait_for(
+            asyncio.gather(
+                database.mark_events_failed(
+                    overlap_ids,
+                    RuntimeError("ci overlap failure"),
+                ),
+                competitor.mark_events_failed(
+                    list(reversed(overlap_ids)),
+                    RuntimeError("ci overlap failure"),
+                ),
+                return_exceptions=True,
+            ),
+            timeout=5,
+        )
+        canonical_order = tuple(sorted(overlap_ids))
+        if (
+            sum(result is None for result in race_results) != 1
+            or sum(
+                isinstance(result, RuntimeError)
+                and "superseded" in str(result)
+                for result in race_results
+            )
+            != 1
+        ):
+            raise RuntimeError(
+                "PostgreSQL failure-overlap race did not resolve exactly once"
+            )
+        if len(lock_orders) != 2 or any(
+            order != canonical_order for order in lock_orders
+        ):
+            raise RuntimeError(
+                "PostgreSQL failure-overlap locks were not canonical"
+            )
+
+        async with database.sessions() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(
+                            EventDedupRow.processing_status,
+                            EventDedupRow.processing_token,
+                        ).where(EventDedupRow.event_id.in_(tracked_event_ids))
+                    )
+                ).all()
+            )
+        if len(rows) != len(tracked_events):
+            raise RuntimeError(
+                "PostgreSQL event failure probe lost durable claims"
+            )
+        if any(
+            row.processing_status != "FAILED"
+            or row.processing_token is not None
+            for row in rows
+        ):
+            raise RuntimeError(
+                "PostgreSQL event failure probe left unresolved claims"
+            )
+        print(
+            "POSTGRES_EVENT_FAILURE_BATCH_OK "
+            f"rows={len(failure_batch)} statements={len(statements)} "
+            f"elapsed_ms={elapsed * 1000:.3f} lock_race=resolved"
+        )
+    finally:
+        for engine, listener in listeners:
+            sqlalchemy_event.remove(
+                engine,
+                "before_cursor_execute",
+                listener,
+            )
+        for event_id in tracked_event_ids:
+            database.release_event_claim(event_id)
+            competitor.release_event_claim(event_id)
+        async with database.sessions.begin() as session:
+            await session.execute(
+                delete(RawChainEventRow).where(
+                    RawChainEventRow.event_id.in_(tracked_event_ids)
+                )
+            )
+            await session.execute(
+                delete(EventDedupRow).where(
+                    EventDedupRow.event_id.in_(tracked_event_ids)
+                )
+            )
+
+
 async def main() -> None:
     dsn = os.environ.get("MIGRATION_POSTGRES_DSN", "").strip()
     _validate_probe_target(
@@ -421,6 +635,7 @@ async def main() -> None:
         await database.stop_system_run(validated_race_run, reason="ci", now=now)
         active_run_id = None
         await _probe_event_batch(database, competitor, now)
+        await _probe_event_failure_batch(database, competitor, now)
         async with database.engine.connect() as connection:
             transaction = await connection.begin()
             try:

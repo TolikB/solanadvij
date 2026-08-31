@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable
@@ -176,6 +178,15 @@ class ConfirmationPipeline:
         self._security_results: dict[str, tuple[SecurityContext, SecurityResult]] = {}
         self._scores: dict[str, ScoreBreakdown] = {}
         self._persisted_score_totals: dict[str, Decimal] = {}
+        self._state_poisoned = False
+
+    def _require_consistent_state(self) -> None:
+        if self._state_poisoned:
+            raise RuntimeError("pipeline state is inconsistent; restart required")
+
+    def _poison_state(self) -> None:
+        self._state_poisoned = True
+        self.entry_gate.block("event_processing_error")
 
     async def process_transaction(
         self,
@@ -189,6 +200,7 @@ class ConfirmationPipeline:
         self,
         transactions: list[tuple[Protocol, dict[str, Any], EventSource]],
     ) -> None:
+        self._require_consistent_state()
         events: list[EventEnvelope] = []
         for protocol, transaction, source in transactions:
             decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
@@ -205,8 +217,60 @@ class ConfirmationPipeline:
             if self.database
             else [True] * len(events)
         )
-        for event, durable_accepted in zip(events, durable_results, strict=True):
-            await self.process_event(event, durable_claim=durable_accepted)
+        claimed_count = sum(1 for accepted in durable_results if accepted)
+        if self.database is None or claimed_count < 2:
+            for event, durable_accepted in zip(events, durable_results, strict=True):
+                await self.process_event(event, durable_claim=durable_accepted)
+            return
+        await self._process_claimed_event_batch(events, durable_results)
+
+    async def _process_claimed_event_batch(
+        self,
+        events: list[EventEnvelope],
+        durable_results: list[bool],
+    ) -> None:
+        database = self.database
+        if database is None:
+            raise RuntimeError("durable event batch requires a database")
+        claimed_events = [
+            event
+            for event, durable_accepted in zip(events, durable_results, strict=True)
+            if durable_accepted
+        ]
+        try:
+            async with database.event_state_transaction():
+                for event, durable_accepted in zip(
+                    events, durable_results, strict=True
+                ):
+                    processed = await self.process_event(
+                        event,
+                        durable_claim=durable_accepted,
+                        _batch_state_transaction=True,
+                        _defer_failure_cleanup=True,
+                    )
+                    if durable_accepted and not processed:
+                        raise RuntimeError(
+                            "durably claimed batch event was rejected by local deduplication"
+                        )
+        except BaseException as error:
+            self._poison_state()
+            try:
+                async with asyncio.timeout(5):
+                    await database.mark_events_failed(
+                        [event.event_id for event in claimed_events],
+                        error,
+                    )
+            except BaseException:
+                logger.exception(
+                    "failed to persist bounded batch event cleanup; "
+                    "durable claim tokens retained"
+                )
+            if self.fatal_handler is not None:
+                self.fatal_handler(error)
+            raise
+        for event in claimed_events:
+            database.release_event_claim(event.event_id)
+
     def _with_known_pool_mint(self, event: EventEnvelope) -> EventEnvelope:
         if event.mint is not None or not event.pool_address:
             return event
@@ -221,7 +285,10 @@ class ConfirmationPipeline:
         *,
         recovering: bool = False,
         durable_claim: bool | None = None,
+        _batch_state_transaction: bool = False,
+        _defer_failure_cleanup: bool = False,
     ) -> bool:
+        self._require_consistent_state()
         original_mint = event.mint
         event = self._with_known_pool_mint(event)
         raw_context_changed = event.mint != original_mint
@@ -261,25 +328,28 @@ class ConfirmationPipeline:
             else:
                 transaction_entered = False
                 try:
-                    async with self.database.event_state_transaction():
+                    if _batch_state_transaction:
                         transaction_entered = True
-                        if raw_context_changed:
-                            await self.database.update_raw_event_context(event)
-                        await self._apply_event(
+                        await self._persist_claimed_event_state(
                             event,
-                            persist=True,
-                            observe=True,
-                            allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+                            raw_context_changed=raw_context_changed,
                         )
-                        await self.database.mark_event_processed(
-                            event.event_id, processed_at=datetime.now(tz=timezone.utc)
-                        )
+                    else:
+                        async with self.database.event_state_transaction():
+                            transaction_entered = True
+                            await self._persist_claimed_event_state(
+                                event,
+                                raw_context_changed=raw_context_changed,
+                            )
                 except BaseException:
                     requires_state_rebuild = transaction_entered
                     raise
-                self.database.release_event_claim(event.event_id)
+                if not _batch_state_transaction:
+                    self.database.release_event_claim(event.event_id)
             return True
         except BaseException as error:
+            if _defer_failure_cleanup:
+                raise
             try:
                 await self.deduplicator.forget(event.event_id)
                 if self.database is not None:
@@ -293,9 +363,31 @@ class ConfirmationPipeline:
             finally:
                 if self.database is not None:
                     self.database.release_event_claim(event.event_id)
-                if requires_state_rebuild and self.fatal_handler is not None:
-                    self.fatal_handler(error)
+                if requires_state_rebuild:
+                    self._poison_state()
+                    if self.fatal_handler is not None:
+                        self.fatal_handler(error)
             raise
+
+    async def _persist_claimed_event_state(
+        self,
+        event: EventEnvelope,
+        *,
+        raw_context_changed: bool,
+    ) -> None:
+        if self.database is None:
+            raise RuntimeError("durable event state requires a database")
+        if raw_context_changed:
+            await self.database.update_raw_event_context(event)
+        await self._apply_event(
+            event,
+            persist=True,
+            observe=True,
+            allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+        )
+        await self.database.mark_event_processed(
+            event.event_id, processed_at=datetime.now(tz=timezone.utc)
+        )
 
     async def rehydrate_event(self, event: EventEnvelope) -> None:
         """Rebuild bounded in-memory state from an already processed durable event."""

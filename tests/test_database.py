@@ -6,9 +6,13 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event as sqlalchemy_event, select
 
-from sniper_bot.database import Database, _telegram_report_text
+from sniper_bot.database import (
+    SQLITE_SAFE_BOUND_PARAMETER_BUDGET,
+    Database,
+    _telegram_report_text,
+)
 from sniper_bot.db_models import (
     DailyReportRow,
     EventDedupRow,
@@ -412,6 +416,271 @@ async def test_pipeline_requests_rebuild_when_failure_marker_is_cancelled(
     await database.close()
 
 
+def _pipeline_batch_events(prefix: str, now: datetime) -> list[EventEnvelope]:
+    return [
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=Protocol.PUMPSWAP,
+            event_type=ChainEventType.SWAP_BUY,
+            slot=10 + index,
+            signature=f"{prefix}-{index}",
+            instruction_index=0,
+            block_time=now + timedelta(milliseconds=index),
+            observed_at=now + timedelta(milliseconds=index),
+            mint="TOKEN",
+            pool_address="POOL",
+            payload={"base_amount_out": "1", "quote_amount_in": "1"},
+        )
+        for index in range(2)
+    ]
+
+
+def _install_pipeline_batch_decoder(monkeypatch, pipeline, events) -> None:
+    monkeypatch.setattr(
+        pipeline._pumpswap,
+        "decode_transaction",
+        lambda _transaction, source: events,
+    )
+
+
+async def _run_pipeline_batch(pipeline: ConfirmationPipeline) -> None:
+    await pipeline.process_transactions(
+        [(Protocol.PUMPSWAP, {"signature": "batch"}, EventSource.REPLAY)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_commits_claimed_batch_in_one_state_transaction(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-batch.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-batch", datetime(2026, 8, 25, tzinfo=timezone.utc)
+    )
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    transaction_count = 0
+    original_transaction = database.event_state_transaction
+
+    @asynccontextmanager
+    async def counted_transaction():
+        nonlocal transaction_count
+        transaction_count += 1
+        async with original_transaction():
+            yield
+
+    monkeypatch.setattr(database, "event_state_transaction", counted_transaction)
+
+    await _run_pipeline_batch(pipeline)
+
+    assert transaction_count == 1
+    assert database._event_claim_tokens == {}
+    async with database.sessions() as session:
+        claims = list(
+            (
+                await session.scalars(
+                    select(EventDedupRow).order_by(EventDedupRow.event_id)
+                )
+            ).all()
+        )
+        raw_events = list(
+            (
+                await session.scalars(
+                    select(RawChainEventRow).order_by(
+                        RawChainEventRow.ingest_sequence
+                    )
+                )
+            ).all()
+        )
+    assert [claim.processing_status for claim in claims] == ["PROCESSED", "PROCESSED"]
+    assert [event.signature for event in raw_events] == [
+        "pipeline-batch-0",
+        "pipeline-batch-1",
+    ]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_failure_rolls_back_state_and_poison_pipeline(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-batch-failure.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    events = _pipeline_batch_events("pipeline-failure", now)
+    fatal_errors: list[BaseException] = []
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    applied = 0
+
+    async def write_then_fail(
+        _event,
+        *,
+        persist,
+        observe,
+        allow_candidate=True,
+    ):
+        nonlocal applied
+        applied += 1
+        if applied == 1:
+            await database.upsert_token(
+                TokenRecord(mint="BATCH-ROLLBACK", creation_time=now, updated_at=now)
+            )
+            return
+        raise RuntimeError("batch state failure")
+
+    monkeypatch.setattr(pipeline, "_apply_event", write_then_fail)
+
+    with pytest.raises(RuntimeError, match="batch state failure"):
+        await _run_pipeline_batch(pipeline)
+
+    assert len(fatal_errors) == 1
+    assert database._event_claim_tokens == {}
+    assert "event_processing_error" in pipeline.entry_gate.reasons
+    with pytest.raises(RuntimeError, match="restart required"):
+        await _run_pipeline_batch(pipeline)
+    async with database.sessions() as session:
+        assert await session.get(TokenRow, "BATCH-ROLLBACK") is None
+        claims = list(
+            (
+                await session.scalars(
+                    select(EventDedupRow).order_by(EventDedupRow.event_id)
+                )
+            ).all()
+        )
+    assert [claim.processing_status for claim in claims] == ["FAILED", "FAILED"]
+    assert [event.signature for event in await database.load_unprocessed_events()] == [
+        "pipeline-failure-0",
+        "pipeline-failure-1",
+    ]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_uncertain_commit_retains_tokens_and_poison_pipeline(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-batch-commit.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-commit", datetime(2026, 8, 25, tzinfo=timezone.utc)
+    )
+    fatal_errors: list[BaseException] = []
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    original_transaction = database.event_state_transaction
+
+    @asynccontextmanager
+    async def fail_after_commit():
+        async with original_transaction():
+            yield
+        raise RuntimeError("batch commit acknowledgement failure")
+
+    monkeypatch.setattr(database, "event_state_transaction", fail_after_commit)
+
+    with pytest.raises(RuntimeError, match="batch commit acknowledgement failure"):
+        await _run_pipeline_batch(pipeline)
+
+    assert len(fatal_errors) == 1
+    assert set(database._event_claim_tokens) == {event.event_id for event in events}
+    assert "event_processing_error" in pipeline.entry_gate.reasons
+    async with database.sessions() as session:
+        claims = list(
+            (
+                await session.scalars(
+                    select(EventDedupRow).order_by(EventDedupRow.event_id)
+                )
+            ).all()
+        )
+    assert [claim.processing_status for claim in claims] == ["PROCESSED", "PROCESSED"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_cancellation_rolls_back_and_fails_claims(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-batch-cancel.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    events = _pipeline_batch_events("pipeline-cancel", now)
+    fatal_errors: list[BaseException] = []
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    applied = 0
+
+    async def cancel_second_event(
+        _event,
+        *,
+        persist,
+        observe,
+        allow_candidate=True,
+    ):
+        nonlocal applied
+        applied += 1
+        if applied == 1:
+            await database.upsert_token(
+                TokenRecord(mint="BATCH-CANCEL", creation_time=now, updated_at=now)
+            )
+            return
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(pipeline, "_apply_event", cancel_second_event)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run_pipeline_batch(pipeline)
+
+    assert len(fatal_errors) == 1
+    assert database._event_claim_tokens == {}
+    assert "event_processing_error" in pipeline.entry_gate.reasons
+    async with database.sessions() as session:
+        assert await session.get(TokenRow, "BATCH-CANCEL") is None
+        claims = list(
+            (
+                await session.scalars(
+                    select(EventDedupRow).order_by(EventDedupRow.event_id)
+                )
+            ).all()
+        )
+    assert [claim.processing_status for claim in claims] == ["FAILED", "FAILED"]
+    await database.close()
+
 @pytest.mark.asyncio
 async def test_startup_reclaims_owned_processing_and_quarantines_poison_events(
     tmp_path,
@@ -489,3 +758,298 @@ async def test_pipeline_reclaims_fresh_owned_processing_event(tmp_path) -> None:
         assert claim.processing_status == "PROCESSED"
         assert claim.processing_attempts == 2
     await database.close()
+
+
+def _database_batch_events(
+    prefix: str,
+    now: datetime,
+    count: int,
+) -> list[EventEnvelope]:
+    return [
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=Protocol.PUMPSWAP,
+            event_type=ChainEventType.SWAP_BUY,
+            signature=f"{prefix}-{index}",
+            slot=100_000 + index,
+            instruction_index=0,
+            block_time=now,
+            mint="mint-batch",
+            pool_address="pool-batch",
+            payload={"index": index},
+        )
+        for index in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mark_events_failed_chunks_sqlite_bound_parameters(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'failure-chunks.db'}")
+    await database.create_schema_for_tests()
+
+    events = _database_batch_events(
+        "failure-chunks",
+        datetime.now(tz=timezone.utc),
+        600,
+    )
+    update_parameter_counts: list[int] = []
+
+    def capture_updates(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if normalized.startswith("update event_dedup set"):
+            update_parameter_counts.append(len(parameters))
+
+    try:
+        assert await database.record_events(events) == [True] * len(events)
+
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_updates,
+        )
+        try:
+            await database.mark_events_failed(
+                [event.event_id for event in events],
+                RuntimeError("batch failed"),
+            )
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_updates,
+            )
+
+        assert len(update_parameter_counts) > 1
+        assert max(update_parameter_counts) <= SQLITE_SAFE_BOUND_PARAMETER_BUDGET
+        assert database._event_claim_tokens == {}
+
+        async with database.sessions() as session:
+            rows = list((await session.scalars(select(EventDedupRow))).all())
+
+        assert len(rows) == len(events)
+        assert all(row.processing_status == "FAILED" for row in rows)
+        assert all(row.processing_token is None for row in rows)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_events_failed_mixed_reclaimed_claim_is_atomic(tmp_path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'mixed-claims.db'}"
+    owner = Database(url)
+    competitor = Database(url)
+    await owner.create_schema_for_tests()
+
+    active, stale = _database_batch_events(
+        "mixed-claims",
+        datetime.now(tz=timezone.utc),
+        2,
+    )
+
+    try:
+        assert await owner.record_events([active, stale]) == [True, True]
+        original_tokens = dict(owner._event_claim_tokens)
+
+        async with owner.sessions.begin() as session:
+            stale_row = await session.get(EventDedupRow, stale.event_id)
+            assert stale_row is not None
+            stale_row.last_attempt_at = (
+                datetime.now(tz=timezone.utc) - timedelta(minutes=3)
+            )
+
+        assert await competitor.record_event(stale) is True
+        competitor_token = competitor._event_claim_tokens[stale.event_id]
+        assert competitor_token != original_tokens[stale.event_id]
+
+        with pytest.raises(RuntimeError, match="claim"):
+            await owner.mark_events_failed(
+                [active.event_id, stale.event_id],
+                RuntimeError("batch failed"),
+            )
+
+        assert owner._event_claim_tokens == original_tokens
+
+        async with owner.sessions() as session:
+            active_row = await session.get(EventDedupRow, active.event_id)
+            stale_row = await session.get(EventDedupRow, stale.event_id)
+
+        assert active_row is not None
+        assert active_row.processing_status == "PROCESSING"
+        assert active_row.processing_token == original_tokens[active.event_id]
+
+        assert stale_row is not None
+        assert stale_row.processing_status == "PROCESSING"
+        assert stale_row.processing_token == competitor_token
+    finally:
+        await competitor.close()
+        await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_events_failed_reversed_overlap_uses_canonical_order(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'failure-locking.db'}")
+    await database.create_schema_for_tests()
+
+    first, second = _database_batch_events(
+        "reversed-overlap",
+        datetime.now(tz=timezone.utc),
+        2,
+    )
+    event_ids = [first.event_id, second.event_id]
+    lock_orders: list[tuple[str, ...]] = []
+
+    def capture_lock_select(
+        _connection,
+        _cursor,
+        statement,
+        parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if (
+            normalized.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in normalized
+        ):
+            lock_orders.append(tuple(str(value) for value in parameters))
+
+    start = asyncio.Event()
+
+    async def fail_in_order(order: list[str]) -> None:
+        await start.wait()
+        await database.mark_events_failed(order, RuntimeError("batch failed"))
+
+    try:
+        assert await database.record_events([first, second]) == [True, True]
+
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_lock_select,
+        )
+        try:
+            tasks = [
+                asyncio.create_task(fail_in_order(event_ids)),
+                asyncio.create_task(fail_in_order(list(reversed(event_ids)))),
+            ]
+            start.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=2,
+            )
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_lock_select,
+            )
+
+        assert sum(result is None for result in results) == 1
+        assert sum(isinstance(result, RuntimeError) for result in results) == 1
+        assert lock_orders == [tuple(sorted(event_ids))]
+        assert database._event_claim_tokens == {}
+
+        async with database.sessions() as session:
+            rows = list((await session.scalars(select(EventDedupRow))).all())
+
+        assert len(rows) == 2
+        assert all(row.processing_status == "FAILED" for row in rows)
+        assert all(row.processing_token is None for row in rows)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_task_cancellation_rolls_back_and_poison_restarts(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'cancel-batch.db'}")
+    await database.create_schema_for_tests()
+    now = datetime.now(tz=timezone.utc)
+    events = _pipeline_batch_events("task-cancel", now)
+    fatal_errors: list[BaseException] = []
+    metrics = BotMetrics()
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(metrics),
+        metrics=metrics,
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+
+    second_started = asyncio.Event()
+    never_complete = asyncio.Event()
+    applied = 0
+
+    async def blocking_apply(
+        _event,
+        *,
+        persist,
+        observe,
+        allow_candidate=True,
+    ) -> None:
+        nonlocal applied
+        applied += 1
+        if applied == 1:
+            await database.upsert_token(
+                TokenRecord(
+                    mint="cancelled-batch-token",
+                    creation_time=now,
+                    updated_at=now,
+                )
+            )
+            return
+
+        second_started.set()
+        await never_complete.wait()
+
+    monkeypatch.setattr(pipeline, "_apply_event", blocking_apply)
+    task = asyncio.create_task(_run_pipeline_batch(pipeline))
+
+    try:
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+        assert len(fatal_errors) == 1
+        assert isinstance(fatal_errors[0], asyncio.CancelledError)
+        assert database._event_claim_tokens == {}
+        assert "event_processing_error" in pipeline.entry_gate.reasons
+
+        async with database.sessions() as session:
+            token = await session.get(TokenRow, "cancelled-batch-token")
+            claims = {
+                row.event_id: row
+                for row in (
+                    await session.scalars(select(EventDedupRow))
+                ).all()
+            }
+
+        assert token is None
+        assert set(claims) == {event.event_id for event in events}
+        assert all(row.processing_status == "FAILED" for row in claims.values())
+        assert all(row.processing_token is None for row in claims.values())
+
+        with pytest.raises(RuntimeError, match="restart required"):
+            await _run_pipeline_batch(pipeline)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await database.close()

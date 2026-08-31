@@ -15,7 +15,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import (
@@ -101,10 +101,21 @@ def _bulk_insert_chunks(
     ]
 
 
-def _event_id_chunks(event_ids: list[str], *, dialect: str) -> list[list[str]]:
+def _event_id_chunks(
+    event_ids: list[str],
+    *,
+    dialect: str,
+    parameters_per_id: int = 1,
+    reserved_parameters: int = 0,
+) -> list[list[str]]:
     if not event_ids:
         return []
-    chunk_size = _parameter_budget(dialect)
+    if parameters_per_id <= 0 or reserved_parameters < 0:
+        raise ValueError("event-id parameter widths must be positive")
+    available_parameters = _parameter_budget(dialect) - reserved_parameters
+    if available_parameters < parameters_per_id:
+        raise ValueError("database parameter budget is too small for one event id")
+    chunk_size = available_parameters // parameters_per_id
     return [
         event_ids[offset : offset + chunk_size]
         for offset in range(0, len(event_ids), chunk_size)
@@ -757,31 +768,89 @@ class Database:
         if not shared_transaction:
             self.release_event_claim(event_id)
 
-    async def mark_event_failed(self, event_id: str, error: BaseException) -> None:
+    async def mark_events_failed(
+        self,
+        event_ids: list[str],
+        error: BaseException,
+    ) -> None:
+        unique_event_ids = sorted(set(event_ids))
+        if not unique_event_ids:
+            return
         async with self._event_batch_lock:
-            claim_token = self._event_claim_tokens.get(event_id)
-            if claim_token is None:
-                raise RuntimeError("event claim token is missing")
+            claim_tokens: dict[str, str] = {}
+            for event_id in unique_event_ids:
+                claim_token = self._event_claim_tokens.get(event_id)
+                if claim_token is None:
+                    raise RuntimeError("event claim token is missing")
+                claim_tokens[event_id] = claim_token
             failed_at = datetime.now(tz=timezone.utc)
             async with self.sessions() as session, session.begin():
-                result = await session.execute(
-                    update(EventDedupRow)
-                    .where(
-                        EventDedupRow.event_id == event_id,
-                        EventDedupRow.processing_status == "PROCESSING",
-                        EventDedupRow.processing_token == claim_token,
+                dialect = session.bind.dialect.name if session.bind is not None else ""
+                if dialect not in {"postgresql", "sqlite"}:
+                    raise RuntimeError(
+                        f"unsupported event-failure database dialect: {dialect or 'unknown'}"
                     )
-                    .values(
-                        processing_status="FAILED",
-                        last_attempt_at=failed_at,
-                        last_error=type(error).__name__[:128],
-                        processing_token=None,
+                for event_id_chunk in _event_id_chunks(
+                    unique_event_ids,
+                    dialect=dialect,
+                    parameters_per_id=3,
+                    reserved_parameters=4,
+                ):
+                    rows = (
+                        await session.execute(
+                            select(
+                                EventDedupRow.event_id,
+                                EventDedupRow.processing_status,
+                                EventDedupRow.processing_token,
+                            )
+                            .where(EventDedupRow.event_id.in_(event_id_chunk))
+                            .order_by(EventDedupRow.event_id)
+                            .with_for_update()
+                        )
+                    ).all()
+                    durable_claims = {
+                        str(event_id): (
+                            str(processing_status),
+                            (
+                                str(processing_token)
+                                if processing_token is not None
+                                else None
+                            ),
+                        )
+                        for event_id, processing_status, processing_token in rows
+                    }
+                    if set(durable_claims) != set(event_id_chunk) or any(
+                        durable_claims[event_id]
+                        != ("PROCESSING", claim_tokens[event_id])
+                        for event_id in event_id_chunk
+                    ):
+                        raise RuntimeError("event processing claim was superseded")
+                    predicates = [
+                        and_(
+                            EventDedupRow.event_id == event_id,
+                            EventDedupRow.processing_status == "PROCESSING",
+                            EventDedupRow.processing_token == claim_tokens[event_id],
+                        )
+                        for event_id in event_id_chunk
+                    ]
+                    result = await session.execute(
+                        update(EventDedupRow)
+                        .where(or_(*predicates))
+                        .values(
+                            processing_status="FAILED",
+                            last_attempt_at=failed_at,
+                            last_error=type(error).__name__[:128],
+                            processing_token=None,
+                        )
                     )
-                )
-                if getattr(result, "rowcount", None) != 1:
-                    raise RuntimeError("event processing claim was superseded")
-            if self._event_claim_tokens.get(event_id) == claim_token:
-                self._event_claim_tokens.pop(event_id, None)
+                    if getattr(result, "rowcount", None) != len(event_id_chunk):
+                        raise RuntimeError("event processing claim was superseded")
+            for event_id, claim_token in claim_tokens.items():
+                if self._event_claim_tokens.get(event_id) == claim_token:
+                    self._event_claim_tokens.pop(event_id, None)
+
+    async def mark_event_failed(self, event_id: str, error: BaseException) -> None:
+        await self.mark_events_failed([event_id], error)
 
     async def update_raw_event_context(self, event: EventEnvelope) -> None:
         """Persist decoder-enriched context within the active event transaction."""
