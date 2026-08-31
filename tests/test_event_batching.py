@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from sniper_bot.records import TokenRecord
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select, update
 
@@ -16,7 +17,6 @@ from sniper_bot.database import (
 from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
-from sniper_bot.records import TokenRecord
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import EntryGate, HeliusStreamGateway, TransactionItem
 

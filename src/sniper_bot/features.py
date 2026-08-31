@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
-from typing import Any
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 

@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 import sniper_bot.events as events_module
-
 from sniper_bot.events import (
     ChainEventType,
     EventDeduplicator,

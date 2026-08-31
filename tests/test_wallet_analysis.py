@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import sniper_bot.wallet_analysis as wallet_analysis_module
-
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.wallet_analysis import WalletAnalyzer
 

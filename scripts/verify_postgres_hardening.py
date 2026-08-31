@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 from uuid import uuid4
 
+from sniper_bot.records import TokenRecord
 from sqlalchemy import delete, func, select, text
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.engine import make_url
@@ -19,7 +20,6 @@ from sniper_bot.database import ActiveRuntimeError, Database
 from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource
 from sniper_bot.events import Protocol as EventProtocol
-from sniper_bot.records import TokenRecord
 
 
 class _AsyncClosable(Protocol):
