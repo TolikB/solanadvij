@@ -91,7 +91,7 @@ jobs:
           uv run python scripts/smoke_previous_migration.py
           printf '%s sqlite_previous_migration\n' "$GITHUB_SHA" > ci-gates/sqlite_previous_migration.ok
 
-      - name: PostgreSQL trigger and concurrency hardening
+      - name: PostgreSQL trigger, concurrency, and event-batch hardening
         run: |
           uv run python scripts/verify_postgres_hardening.py
           printf '%s postgres_hardening\n' "$GITHUB_SHA" > ci-gates/postgres_hardening.ok

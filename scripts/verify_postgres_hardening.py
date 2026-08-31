@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
-from sqlalchemy import text
+from sqlalchemy import delete, func, select, text
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sniper_bot.database import ActiveRuntimeError, Database
+from sniper_bot.db_models import EventDedupRow, RawChainEventRow
+from sniper_bot.events import ChainEventType, EventEnvelope, EventSource
+from sniper_bot.events import Protocol as EventProtocol
 
 
 class _AsyncClosable(Protocol):
@@ -86,6 +91,197 @@ async def _must_reject(
     else:
         await savepoint.rollback()
         raise RuntimeError("PostgreSQL append-only trigger accepted a mutation")
+
+
+POSTGRES_EVENT_BATCH_SIZE = 64
+POSTGRES_EVENT_BATCH_MAX_SECONDS = 1.0
+
+
+def _event_batch(prefix: str, now: datetime, *, count: int) -> list[EventEnvelope]:
+    return [
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=EventProtocol.PUMPSWAP,
+            event_type=ChainEventType.SWAP_BUY,
+            slot=10_000 + index,
+            signature=f"{prefix}-{index:04d}",
+            instruction_index=0,
+            block_time=now,
+            observed_at=now,
+            mint="CI_TOKEN",
+            pool_address="CI_POOL",
+            payload={"base_amount_out": "1", "quote_amount_in": "1"},
+        )
+        for index in range(count)
+    ]
+
+
+async def _probe_event_batch(
+    database: Database,
+    competitor: Database,
+    now: datetime,
+) -> None:
+    batch = _event_batch(
+        f"ci-batch-{uuid4().hex}",
+        now,
+        count=POSTGRES_EVENT_BATCH_SIZE,
+    )
+    overlap_forward = _event_batch(
+        f"ci-overlap-{uuid4().hex}",
+        now,
+        count=2,
+    )
+    overlap_reverse = list(reversed(overlap_forward))
+    tracked_events = [*batch, *overlap_forward]
+    tracked_event_ids = [event.event_id for event in tracked_events]
+    statements: list[tuple[str, bool]] = []
+    listener_attached = False
+
+    def capture_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        executemany: bool,
+    ) -> None:
+        statements.append((" ".join(statement.lower().split()), executemany))
+
+    try:
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_sql,
+        )
+        listener_attached = True
+        started = time.perf_counter()
+        try:
+            accepted = await database.record_events(batch)
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_sql,
+            )
+            listener_attached = False
+        elapsed = time.perf_counter() - started
+
+        dedup_inserts = [
+            item
+            for item in statements
+            if item[0].startswith("insert into event_dedup")
+        ]
+        raw_inserts = [
+            item
+            for item in statements
+            if item[0].startswith("insert into raw_chain_events")
+        ]
+        sequence_allocations = [
+            item
+            for item in statements
+            if "raw_chain_events_ingest_sequence_seq" in item[0]
+        ]
+        if accepted != [True] * len(batch):
+            raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
+        if (
+            len(statements) != 3
+            or len(dedup_inserts) != 1
+            or len(raw_inserts) != 1
+            or len(sequence_allocations) != 1
+        ):
+            raise RuntimeError(
+                "PostgreSQL event batch did not use the required three-statement shape"
+            )
+        if any(executemany for _, executemany in statements):
+            raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
+        if (
+            " on conflict " not in dedup_inserts[0][0]
+            or " returning event_id" not in dedup_inserts[0][0]
+        ):
+            raise RuntimeError(
+                "PostgreSQL event claim is missing ON CONFLICT RETURNING"
+            )
+        if elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS:
+            raise RuntimeError(
+                "PostgreSQL event batch exceeded the one-second performance budget"
+            )
+
+        async with database.sessions() as session:
+            persisted = list(
+                (
+                    await session.execute(
+                        select(
+                            RawChainEventRow.signature,
+                            RawChainEventRow.ingest_sequence,
+                        )
+                        .where(RawChainEventRow.event_id.in_(tracked_event_ids))
+                        .order_by(RawChainEventRow.ingest_sequence)
+                    )
+                ).all()
+            )
+        if [row.signature for row in persisted] != [
+            event.signature for event in batch
+        ]:
+            raise RuntimeError("PostgreSQL event batch changed durable ingest order")
+        if len({row.ingest_sequence for row in persisted}) != len(batch):
+            raise RuntimeError("PostgreSQL event batch reused an ingest sequence")
+
+        race_results = await asyncio.wait_for(
+            asyncio.gather(
+                database.record_events(overlap_forward),
+                competitor.record_events(overlap_reverse),
+            ),
+            timeout=5,
+        )
+        if sorted(race_results) != [[False, False], [True, True]]:
+            raise RuntimeError(
+                "PostgreSQL reversed-overlap event race was not exactly-once"
+            )
+        async with database.sessions() as session:
+            overlap_count = int(
+                (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(RawChainEventRow)
+                        .where(
+                            RawChainEventRow.event_id.in_(
+                                [event.event_id for event in overlap_forward]
+                            )
+                        )
+                    )
+                )
+                or 0
+            )
+        if overlap_count != len(overlap_forward):
+            raise RuntimeError(
+                "PostgreSQL reversed-overlap event race persisted duplicates"
+            )
+        print(
+            "POSTGRES_EVENT_BATCH_OK "
+            f"rows={len(batch)} statements={len(statements)} "
+            f"elapsed_ms={elapsed * 1000:.3f}"
+        )
+    finally:
+        if listener_attached:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_sql,
+            )
+        for event in tracked_events:
+            database.release_event_claim(event.event_id)
+            competitor.release_event_claim(event.event_id)
+        async with database.sessions.begin() as session:
+            await session.execute(
+                delete(RawChainEventRow).where(
+                    RawChainEventRow.event_id.in_(tracked_event_ids)
+                )
+            )
+            await session.execute(
+                delete(EventDedupRow).where(
+                    EventDedupRow.event_id.in_(tracked_event_ids)
+                )
+            )
 
 
 async def main() -> None:
@@ -222,6 +418,7 @@ async def main() -> None:
         validated_race_run = _validate_race_results(race_run, race_cost)
         await database.stop_system_run(validated_race_run, reason="ci", now=now)
         active_run_id = None
+        await _probe_event_batch(database, competitor, now)
         async with database.engine.connect() as connection:
             transaction = await connection.begin()
             try:

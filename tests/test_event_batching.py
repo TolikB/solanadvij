@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
+from sqlalchemy import func, select, update
 
-from sniper_bot.database import Database
+from sniper_bot.database import MAX_EVENT_BATCH_SIZE, Database
+from sniper_bot.db_models import EventDedupRow, RawChainEventRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.solana_rpc import SolanaRpcClient
@@ -245,4 +248,386 @@ async def test_checkpoints_stop_before_processing_order_hole(tmp_path) -> None:
         Protocol.PUMPSWAP.value: "processed-second"
     }
     assert await database.load_quarantined_event_protocols() == set()
+    await database.close()
+
+@pytest.mark.asyncio
+async def test_record_events_uses_bounded_multirow_sql_and_preserves_order(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'bulk-shape.db'}")
+    await database.create_schema_for_tests()
+    statements: list[tuple[str, bool]] = []
+
+    def capture_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        executemany: bool,
+    ) -> None:
+        statements.append((" ".join(statement.lower().split()), executemany))
+
+    sqlalchemy_event.listen(
+        database.engine.sync_engine, "before_cursor_execute", capture_sql
+    )
+    events = [
+        _event(f"bulk-{index:02d}", 0, slot=1_000 + index)
+        for index in range(64)
+    ]
+    try:
+        assert await database.record_events(events) == [True] * len(events)
+    finally:
+        sqlalchemy_event.remove(
+            database.engine.sync_engine, "before_cursor_execute", capture_sql
+        )
+
+    dedup_inserts = [
+        item for item in statements if item[0].startswith("insert into event_dedup")
+    ]
+    raw_inserts = [
+        item
+        for item in statements
+        if item[0].startswith("insert into raw_chain_events")
+    ]
+    sequence_reads = [
+        item
+        for item in statements
+        if "max(raw_chain_events.ingest_sequence)" in item[0]
+    ]
+    assert len(dedup_inserts) == 1
+    assert " on conflict " in dedup_inserts[0][0]
+    assert " returning event_id" in dedup_inserts[0][0]
+    assert dedup_inserts[0][1] is False
+    assert 1 <= len(raw_inserts) <= 2
+    assert all(executemany is False for _, executemany in raw_inserts)
+    assert len(sequence_reads) == 1
+    assert len(statements) == (
+        len(dedup_inserts) + len(raw_inserts) + len(sequence_reads)
+    )
+
+    async with database.sessions() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(RawChainEventRow).order_by(
+                        RawChainEventRow.ingest_sequence
+                    )
+                )
+            ).all()
+        )
+    assert [row.ingest_sequence for row in rows] == list(range(1, 65))
+    assert [row.signature for row in rows] == [
+        event.signature for event in events
+    ]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_record_events_recovers_from_real_post_commit_fault(tmp_path) -> None:
+    database = Database(
+        f"sqlite+aiosqlite:///{tmp_path / 'post-commit-fault.db'}"
+    )
+    await database.create_schema_for_tests()
+    event = _event("post-commit-fault", 0)
+    injected = False
+
+    def fail_after_commit(_session: Any) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise RuntimeError("injected post-commit acknowledgement loss")
+
+    sync_session_class = database.sessions.class_.sync_session_class
+    sqlalchemy_event.listen(
+        sync_session_class, "after_commit", fail_after_commit
+    )
+    try:
+        with pytest.raises(RuntimeError, match="acknowledgement loss"):
+            await database.record_events([event])
+    finally:
+        sqlalchemy_event.remove(
+            sync_session_class, "after_commit", fail_after_commit
+        )
+
+    assert injected is True
+    stable_token = database._event_claim_tokens[event.event_id]
+    assert await database.record_events([event], resume_owned=True) == [True]
+    assert database._event_claim_tokens[event.event_id] == stable_token
+    async with database.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(RawChainEventRow)
+            )
+            == 1
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_record_events_canonical_locking_handles_reversed_overlap(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'canonical-lock.db'}")
+    await database.create_schema_for_tests()
+    forward = [_event("overlap-a", 0), _event("overlap-b", 0)]
+    reverse = list(reversed(forward))
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            database.record_events(forward),
+            database.record_events(reverse),
+        ),
+        timeout=1,
+    )
+
+    assert sorted(results) == [[False, False], [True, True]]
+    winner = forward if results[0] == [True, True] else reverse
+    async with database.sessions() as session:
+        rows = list(
+            (
+                await session.scalars(
+                    select(RawChainEventRow).order_by(
+                        RawChainEventRow.ingest_sequence
+                    )
+                )
+            ).all()
+        )
+    assert [row.signature for row in rows] == [
+        event.signature for event in winner
+    ]
+    assert [row.ingest_sequence for row in rows] == [1, 2]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_record_events_bulk_conflicts_cover_mixed_claim_states(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'mixed-claims.db'}")
+    await database.create_schema_for_tests()
+    processed = _event("processed", 0)
+    active = _event("active", 0)
+    stale = _event("stale", 0)
+    assert await database.record_events([processed, active, stale]) == [
+        True,
+        True,
+        True,
+    ]
+    async with database.event_state_transaction():
+        await database.mark_event_processed(
+            processed.event_id, processed_at=processed.block_time
+        )
+    database.release_event_claim(processed.event_id)
+    async with database.sessions.begin() as session:
+        await session.execute(
+            update(EventDedupRow)
+            .where(EventDedupRow.event_id == stale.event_id)
+            .values(
+                last_attempt_at=(
+                    datetime.now(tz=timezone.utc) - timedelta(minutes=3)
+                )
+            )
+        )
+
+    new = _event("new", 0)
+    assert await database.record_events(
+        [new, stale, active, processed]
+    ) == [True, True, False, False]
+    async with database.sessions() as session:
+        rows = {
+            row.event_id: row
+            for row in (
+                await session.scalars(
+                    select(EventDedupRow).where(
+                        EventDedupRow.event_id.in_(
+                            [
+                                processed.event_id,
+                                active.event_id,
+                                stale.event_id,
+                                new.event_id,
+                            ]
+                        )
+                    )
+                )
+            ).all()
+        }
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(RawChainEventRow)
+            )
+            == 4
+        )
+    assert rows[processed.event_id].processing_status == "PROCESSED"
+    assert rows[active.event_id].processing_attempts == 1
+    assert rows[stale.event_id].processing_attempts == 2
+    assert rows[new.event_id].processing_attempts == 1
+    await database.close()
+
+@pytest.mark.asyncio
+async def test_record_events_cleans_token_after_precommit_failure(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'rollback-token.db'}")
+    await database.create_schema_for_tests()
+    event = _event("precommit-fault", 0)
+    injected = False
+
+    def fail_before_insert(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        nonlocal injected
+        if not injected and statement.lower().startswith("insert into event_dedup"):
+            injected = True
+            raise RuntimeError("injected pre-commit failure")
+
+    sqlalchemy_event.listen(
+        database.engine.sync_engine,
+        "before_cursor_execute",
+        fail_before_insert,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="pre-commit failure"):
+            await database.record_events([event])
+    finally:
+        sqlalchemy_event.remove(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            fail_before_insert,
+        )
+
+    assert injected is True
+    assert event.event_id not in database._event_claim_tokens
+    assert await database.record_events([event]) == [True]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_event_failed_serializes_with_batch_claims(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'failed-race.db'}")
+    await database.create_schema_for_tests()
+    event = _event("failed-race", 0)
+    assert await database.record_event(event) is True
+
+    await database._event_batch_lock.acquire()
+    task = asyncio.create_task(
+        database.mark_event_failed(event.event_id, RuntimeError("processing failed"))
+    )
+    try:
+        await asyncio.sleep(0)
+        assert task.done() is False
+    finally:
+        database._event_batch_lock.release()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert event.event_id not in database._event_claim_tokens
+    assert await database.record_events([event]) == [True]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_conflict_locking_chunks_large_batches(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'conflict-chunks.db'}")
+    await database.create_schema_for_tests()
+    events = [
+        _event(f"conflict-{index:04d}", 0, slot=20_000 + index)
+        for index in range(901)
+    ]
+    assert await database.record_events(events) == [True] * len(events)
+    conflict_select_parameter_counts: list[int] = []
+
+    def capture_conflict_select(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if (
+            normalized.startswith("select event_dedup.")
+            and " from event_dedup " in normalized
+        ):
+            conflict_select_parameter_counts.append(len(parameters))
+
+    sqlalchemy_event.listen(
+        database.engine.sync_engine,
+        "before_cursor_execute",
+        capture_conflict_select,
+    )
+    try:
+        assert await database.record_events(events) == [False] * len(events)
+    finally:
+        sqlalchemy_event.remove(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_conflict_select,
+        )
+
+    assert conflict_select_parameter_counts == [900, 1]
+    assert all(
+        event.event_id in database._event_claim_tokens
+        for event in events
+    )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_record_events_rejects_oversized_atomic_batch(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'oversized.db'}")
+    await database.create_schema_for_tests()
+    event = _event("oversized", 0)
+
+    with pytest.raises(ValueError, match="at most"):
+        await database.record_events([event] * (MAX_EVENT_BATCH_SIZE + 1))
+
+    assert database._event_claim_tokens == {}
+    await database.close()
+
+@pytest.mark.asyncio
+async def test_record_events_preserves_token_for_unknown_commit_phase(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'unknown-commit.db'}")
+    await database.create_schema_for_tests()
+    event = _event("unknown-commit", 0)
+    injected = False
+
+    def fail_before_commit(_session: Any) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise RuntimeError("injected commit-phase acknowledgement loss")
+
+    sync_session_class = database.sessions.class_.sync_session_class
+    sqlalchemy_event.listen(
+        sync_session_class,
+        "before_commit",
+        fail_before_commit,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="acknowledgement loss"):
+            await database.record_events([event])
+    finally:
+        sqlalchemy_event.remove(
+            sync_session_class,
+            "before_commit",
+            fail_before_commit,
+        )
+
+    assert injected is True
+    stable_token = database._event_claim_tokens[event.event_id]
+    assert await database.record_events([event]) == [True]
+    assert database._event_claim_tokens[event.event_id] == stable_token
+    async with database.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(RawChainEventRow)
+            )
+            == 1
+        )
     await database.close()
