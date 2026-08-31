@@ -168,12 +168,12 @@ class RawEventRecorder:
         for event in events:
             target = self.path_for(event)
             paths.append(target)
-            payload = event.model_dump_json(exclude_none=True) + "\n"
-            compressed = self._compressor.compress(payload.encode("utf-8"))
+            serialized = event.model_dump_json(exclude_none=True) + "\n"
+            compressed = self._compressor.compress(serialized.encode("utf-8"))
             payloads.setdefault(target, bytearray()).extend(compressed)
-        for target, payload in payloads.items():
+        for target, archive_payload in payloads.items():
             target.parent.mkdir(parents=True, exist_ok=True)
-            _append_bytes(target, bytes(payload))
+            _append_bytes(target, bytes(archive_payload))
         return paths
 
 class RawEventReader:
