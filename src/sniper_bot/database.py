@@ -100,6 +100,26 @@ POSTGRES_EVENT_STAGE_COLUMNS = (
     "pool_address",
     "payload_json",
 )
+POSTGRES_RAW_EVENT_COLUMNS = (
+    "id",
+    "ingest_sequence",
+    "block_date",
+    "event_id",
+    "source",
+    "protocol",
+    "event_type",
+    "slot",
+    "signature",
+    "instruction_index",
+    "inner_instruction_index",
+    "block_time",
+    "observed_at",
+    "commitment",
+    "mint",
+    "pool_address",
+    "payload_json",
+    "created_at",
+)
 POSTGRES_EVENT_STAGE_DDL = """
 CREATE TEMP TABLE IF NOT EXISTS sniper_event_ingest_stage (
     batch_order integer NOT NULL,
@@ -167,6 +187,45 @@ def _postgresql_event_stage_records(
             _postgresql_json_rows(row["payload_json"]),
         )
         for row in rows
+    ]
+
+
+def _postgresql_raw_event_records(
+    rows: list[dict[str, Any]],
+    ingest_sequences: list[int],
+    *,
+    created_at: datetime,
+) -> list[tuple[Any, ...]]:
+    if len(rows) != len(ingest_sequences):
+        raise RuntimeError(
+            "raw event rows and ingest sequences have different lengths"
+        )
+    return [
+        (
+            row["raw_id"],
+            ingest_sequence,
+            row["block_date"],
+            row["event_id"],
+            row["source"],
+            row["protocol"],
+            row["event_type"],
+            row["slot"],
+            row["signature"],
+            row["instruction_index"],
+            row["inner_instruction_index"],
+            row["block_time"],
+            row["observed_at"],
+            row["commitment"],
+            row["mint"],
+            row["pool_address"],
+            _postgresql_json_rows(row["payload_json"]),
+            created_at,
+        )
+        for row, ingest_sequence in zip(
+            rows,
+            ingest_sequences,
+            strict=True,
+        )
     ]
 
 
@@ -1050,120 +1109,117 @@ class Database:
                         raise RuntimeError(
                             "PostgreSQL driver does not support COPY staging"
                         )
-                    await copy_records_to_table(
+                    stage_copy_status = await copy_records_to_table(
                         POSTGRES_EVENT_STAGE_TABLE,
                         records=_postgresql_event_stage_records(payload_rows),
                         columns=POSTGRES_EVENT_STAGE_COLUMNS,
                     )
+                    if stage_copy_status != f"COPY {len(payload_rows)}":
+                        raise RuntimeError(
+                            "PostgreSQL event staging copied an unexpected "
+                            "number of rows"
+                        )
                     insert_statement = text(
-                        """WITH inserted_claims AS (
-                            INSERT INTO event_dedup (
-                                event_id,
-                                block_date,
-                                first_seen_at,
-                                processing_status,
-                                processing_attempts,
-                                last_attempt_at,
-                                processed_at,
-                                last_error,
-                                processing_token
-                            )
-                            SELECT
-                                payload.event_id,
-                                payload.block_date,
-                                payload.first_seen_at,
-                                'PROCESSING',
-                                1,
-                                CAST(:claimed_at AS timestamptz),
-                                NULL,
-                                NULL,
-                                payload.processing_token
-                            FROM pg_temp.sniper_event_ingest_stage AS payload
-                            ORDER BY payload.event_id
-                            ON CONFLICT (event_id) DO NOTHING
-                            RETURNING event_id
-                        ),
-                        inserted_raw AS (
-                            INSERT INTO raw_chain_events (
-                                id,
-                                ingest_sequence,
-                                block_date,
-                                event_id,
-                                source,
-                                protocol,
-                                event_type,
-                                slot,
-                                signature,
-                                instruction_index,
-                                inner_instruction_index,
-                                block_time,
-                                observed_at,
-                                commitment,
-                                mint,
-                                pool_address,
-                                payload_json,
-                                created_at
-                            )
-                            SELECT
-                                payload.raw_id,
-                                nextval(
-                                    'raw_chain_events_ingest_sequence_seq'
-                                ),
-                                payload.block_date,
-                                payload.event_id,
-                                payload.source,
-                                payload.protocol,
-                                payload.event_type,
-                                payload.slot,
-                                payload.signature,
-                                payload.instruction_index,
-                                payload.inner_instruction_index,
-                                payload.block_time,
-                                payload.observed_at,
-                                payload.commitment,
-                                payload.mint,
-                                payload.pool_address,
-                                CAST(payload.payload_json AS json),
-                                CAST(:claimed_at AS timestamptz)
-                            FROM pg_temp.sniper_event_ingest_stage AS payload
-                            JOIN inserted_claims
-                              ON inserted_claims.event_id = payload.event_id
-                            ORDER BY payload.batch_order
-                            RETURNING event_id
+                        """INSERT INTO event_dedup (
+                            event_id,
+                            block_date,
+                            first_seen_at,
+                            processing_status,
+                            processing_attempts,
+                            last_attempt_at,
+                            processed_at,
+                            last_error,
+                            processing_token
                         )
                         SELECT
-                            inserted_claims.event_id AS claimed_event_id,
-                            inserted_raw.event_id AS raw_event_id
-                        FROM inserted_claims
-                        LEFT JOIN inserted_raw
-                          ON inserted_raw.event_id = inserted_claims.event_id
-                        ORDER BY inserted_claims.event_id"""
+                            payload.event_id,
+                            payload.block_date,
+                            payload.first_seen_at,
+                            'PROCESSING',
+                            1,
+                            CAST(:claimed_at AS timestamptz),
+                            NULL,
+                            NULL,
+                            payload.processing_token
+                        FROM pg_temp.sniper_event_ingest_stage AS payload
+                        ORDER BY payload.event_id
+                        ON CONFLICT (event_id) DO NOTHING
+                        RETURNING event_id"""
                     )
-                    inserted_rows = (
-                        await session.execute(
-                            insert_statement,
-                            {
-
-                                "claimed_at": now,
-                            },
-                        )
-                    ).all()
-                    if any(
-                        raw_event_id is None
-                        for _, raw_event_id in inserted_rows
-                    ):
-                        raise RuntimeError(
-                            "event claim insert did not persist matching raw "
-                            "events"
-                        )
+                    inserted_event_id_rows = list(
+                        (
+                            await session.scalars(
+                                insert_statement,
+                                {"claimed_at": now},
+                            )
+                        ).all()
+                    )
                     inserted_event_ids = {
                         str(event_id)
-                        for event_id, _ in inserted_rows
+                        for event_id in inserted_event_id_rows
                     }
-                    if len(inserted_rows) != len(inserted_event_ids):
+                    if len(inserted_event_id_rows) != len(
+                        inserted_event_ids
+                    ):
                         raise RuntimeError(
                             "event claim insert returned duplicate event ids"
                         )
+                    inserted_payload_rows = [
+                        row
+                        for row in payload_rows
+                        if str(row["event_id"]) in inserted_event_ids
+                    ]
+                    if len(inserted_payload_rows) != len(
+                        inserted_event_ids
+                    ):
+                        raise RuntimeError(
+                            "event claim insert returned an unexpected "
+                            "event-id set"
+                        )
+                    if inserted_payload_rows:
+                        ingest_sequences = [
+                            int(sequence)
+                            for sequence in (
+                                await session.scalars(
+                                    text(
+                                        """
+                                        SELECT nextval(
+                                            'raw_chain_events_ingest_sequence_seq'
+                                        )
+                                        FROM generate_series(
+                                            1,
+                                            CAST(
+                                                :sequence_count AS integer
+                                            )
+                                        ) AS ordered(batch_order)
+                                        ORDER BY ordered.batch_order
+                                        """
+                                    ),
+                                    {
+                                        "sequence_count": len(
+                                            inserted_payload_rows
+                                        )
+                                    },
+                                )
+                            ).all()
+                        ]
+                        raw_copy_status = await copy_records_to_table(
+                            "raw_chain_events",
+                            records=_postgresql_raw_event_records(
+                                inserted_payload_rows,
+                                ingest_sequences,
+                                created_at=now,
+                            ),
+                            columns=POSTGRES_RAW_EVENT_COLUMNS,
+                            schema_name="public",
+                        )
+                        if raw_copy_status != (
+                            f"COPY {len(inserted_payload_rows)}"
+                        ):
+                            raise RuntimeError(
+                                "PostgreSQL raw event COPY persisted an "
+                                "unexpected number of rows"
+                            )
                 else:
                     dedup_rows = [
                         {

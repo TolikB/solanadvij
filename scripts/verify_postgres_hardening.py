@@ -177,12 +177,16 @@ async def _probe_event_batch(
             listener_attached = False
         elapsed = time.perf_counter() - started
 
-        combined_inserts = [
+        claim_inserts = [
             item
             for item in statements
-            if item[0].startswith("with inserted_claims as")
-            and "insert into event_dedup" in item[0]
-            and "insert into raw_chain_events" in item[0]
+            if item[0].startswith("insert into event_dedup")
+            and "from pg_temp.sniper_event_ingest_stage as payload" in item[0]
+        ]
+        raw_sql_inserts = [
+            item
+            for item in statements
+            if "insert into raw_chain_events" in item[0]
         ]
         staging_creates = [
             item
@@ -213,38 +217,49 @@ async def _probe_event_batch(
         if accepted != [True] * len(batch):
             raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
         if (
-            len(statements) != 4
+            len(statements) != 5
             or len(partition_ensures) != 1
             or len(staging_creates) != 1
             or len(staging_truncates) != 1
-            or len(combined_inserts) != 1
+            or len(claim_inserts) != 1
+            or len(raw_sql_inserts) != 0
             or len(sequence_allocations) != 1
         ):
             raise RuntimeError(
-                "PostgreSQL event batch did not use the required "
-                "transaction-local COPY staging shape"
+                "PostgreSQL event batch did not use transaction-local "
+                "claim staging with direct raw COPY"
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
-        combined_sql = combined_inserts[0][0]
-        required_combined_fragments = (
+        claim_sql = claim_inserts[0][0]
+        required_claim_fragments = (
             "from pg_temp.sniper_event_ingest_stage as payload",
             "insert into event_dedup",
             "order by payload.event_id",
             "on conflict (event_id) do nothing",
             "returning event_id",
-            "insert into raw_chain_events",
-            "nextval( 'raw_chain_events_ingest_sequence_seq' )",
-            "order by payload.batch_order",
-            "left join inserted_raw",
         )
         if any(
-            fragment not in combined_sql
-            for fragment in required_combined_fragments
-        ) or "jsonb_to_recordset" in combined_sql:
+            fragment not in claim_sql
+            for fragment in required_claim_fragments
+        ) or "jsonb_to_recordset" in claim_sql:
             raise RuntimeError(
-                "PostgreSQL event claim/raw insert lost COPY staging, "
-                "canonical ordering, or ingest sequencing"
+                "PostgreSQL event claim insert lost COPY staging or "
+                "canonical ordering"
+            )
+        sequence_sql = sequence_allocations[0][0]
+        required_sequence_fragments = (
+            "select nextval(",
+            "raw_chain_events_ingest_sequence_seq",
+            "from generate_series(",
+            "order by ordered.batch_order",
+        )
+        if any(
+            fragment not in sequence_sql
+            for fragment in required_sequence_fragments
+        ):
+            raise RuntimeError(
+                "PostgreSQL raw COPY lost ordered ingest sequencing"
             )
         if "on commit delete rows" not in staging_creates[0][0]:
             raise RuntimeError(
