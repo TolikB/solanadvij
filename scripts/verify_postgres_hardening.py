@@ -94,7 +94,7 @@ async def _must_reject(
         raise RuntimeError("PostgreSQL append-only trigger accepted a mutation")
 
 
-POSTGRES_EVENT_BATCH_SIZE = 64
+POSTGRES_EVENT_BATCH_SIZE = 512
 POSTGRES_EVENT_BATCH_MAX_SECONDS = 1.0
 POSTGRES_EVENT_FAILURE_BATCH_MAX_SECONDS = 1.0
 POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS = 1.0
@@ -179,6 +179,13 @@ async def _probe_event_batch(
             for item in statements
             if item[0].startswith("insert into raw_chain_events")
         ]
+        partition_ensures = [
+            item
+            for item in statements
+            if item[0].startswith(
+                "select public.ensure_raw_chain_events_partition"
+            )
+        ]
         sequence_allocations = [
             item
             for item in statements
@@ -187,13 +194,14 @@ async def _probe_event_batch(
         if accepted != [True] * len(batch):
             raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
         if (
-            len(statements) != 3
+            len(statements) != 4
+            or len(partition_ensures) != 1
             or len(dedup_inserts) != 1
             or len(raw_inserts) != 1
             or len(sequence_allocations) != 1
         ):
             raise RuntimeError(
-                "PostgreSQL event batch did not use the required three-statement shape"
+                "PostgreSQL event batch did not use the required four-statement shape"
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
@@ -224,12 +232,42 @@ async def _probe_event_batch(
                     )
                 ).all()
             )
+            partition_names = {
+                str(name)
+                for name in (
+                    await session.scalars(
+                        text(
+                            "SELECT DISTINCT tableoid::regclass::text "
+                            "FROM public.raw_chain_events "
+                            "WHERE event_id::text = "
+                            "ANY(CAST(:event_ids AS text[]))"
+                        ),
+                        {"event_ids": tracked_event_ids},
+                    )
+                ).all()
+            }
+            default_rows = int(
+                (
+                    await session.scalar(
+                        text(
+                            "SELECT count(*) FROM ONLY "
+                            "public.raw_chain_events_default"
+                        )
+                    )
+                )
+                or 0
+            )
         if [row.signature for row in persisted] != [
             event.signature for event in batch
         ]:
             raise RuntimeError("PostgreSQL event batch changed durable ingest order")
         if len({row.ingest_sequence for row in persisted}) != len(batch):
             raise RuntimeError("PostgreSQL event batch reused an ingest sequence")
+        expected_partition = f"raw_chain_events_{now:%Y%m%d}"
+        if partition_names != {expected_partition} or default_rows != 0:
+            raise RuntimeError(
+                "PostgreSQL event batch did not route into its daily partition"
+            )
 
         race_results = await asyncio.wait_for(
             asyncio.gather(
@@ -264,7 +302,7 @@ async def _probe_event_batch(
         print(
             "POSTGRES_EVENT_BATCH_OK "
             f"rows={len(batch)} statements={len(statements)} "
-            f"elapsed_ms={elapsed * 1000:.3f}"
+            f"elapsed_ms={elapsed * 1000:.3f} partition={expected_partition}"
         )
     finally:
         if listener_attached:

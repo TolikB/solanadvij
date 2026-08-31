@@ -81,7 +81,8 @@ jobs:
       - name: PostgreSQL previous-revision migration
         run: |
           uv run alembic upgrade 20260824_0005
-          uv run alembic upgrade head
+          uv run alembic upgrade 20260824_0007
+          uv run python scripts/verify_postgres_partition_migration.py
           uv run alembic downgrade 20260824_0005
           uv run alembic upgrade head
           printf '%s postgres_previous_migration\n' "$GITHUB_SHA" > ci-gates/postgres_previous_migration.ok

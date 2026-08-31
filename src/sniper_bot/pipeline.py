@@ -12,7 +12,7 @@ from typing import Any
 
 from .candidates import Candidate, CandidateState, CandidateStateMachine
 from .config import AppConfig
-from .database import Database
+from .database import MAX_EVENT_BATCH_SIZE, Database
 from .events import (
     ChainEventType,
     EventDeduplicator,
@@ -211,6 +211,15 @@ class ConfirmationPipeline:
                 raise
         if not events:
             return
+        for offset in range(0, len(events), MAX_EVENT_BATCH_SIZE):
+            await self._process_decoded_event_batch(
+                events[offset : offset + MAX_EVENT_BATCH_SIZE]
+            )
+
+    async def _process_decoded_event_batch(
+        self,
+        events: list[EventEnvelope],
+    ) -> None:
         durable_results = (
             await self.database.record_events(events, resume_owned=True)
             if self.database

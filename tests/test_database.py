@@ -417,7 +417,12 @@ async def test_pipeline_requests_rebuild_when_failure_marker_is_cancelled(
     await database.close()
 
 
-def _pipeline_batch_events(prefix: str, now: datetime) -> list[EventEnvelope]:
+def _pipeline_batch_events(
+    prefix: str,
+    now: datetime,
+    *,
+    count: int = 2,
+) -> list[EventEnvelope]:
     return [
         EventEnvelope(
             source=EventSource.REPLAY,
@@ -432,7 +437,7 @@ def _pipeline_batch_events(prefix: str, now: datetime) -> list[EventEnvelope]:
             pool_address="POOL",
             payload={"base_amount_out": "1", "quote_amount_in": "1"},
         )
-        for index in range(2)
+        for index in range(count)
     ]
 
 
@@ -449,6 +454,57 @@ async def _run_pipeline_batch(pipeline: ConfirmationPipeline) -> None:
     await pipeline.process_transactions(
         [(Protocol.PUMPSWAP, {"signature": "batch"}, EventSource.REPLAY)]
     )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_splits_decoded_events_into_bounded_ordered_chunks(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-chunks.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-chunks",
+        datetime(2026, 8, 25, tzinfo=timezone.utc),
+        count=5,
+    )
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        record_raw=False,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    monkeypatch.setattr("sniper_bot.pipeline.MAX_EVENT_BATCH_SIZE", 2)
+    original_record_events = database.record_events
+    durable_batches: list[list[str]] = []
+
+    async def tracked_record_events(
+        batch: list[EventEnvelope],
+        *,
+        reclaim: bool = False,
+        resume_owned: bool = False,
+    ) -> list[bool]:
+        durable_batches.append([event.signature for event in batch])
+        return await original_record_events(
+            batch,
+            reclaim=reclaim,
+            resume_owned=resume_owned,
+        )
+
+    monkeypatch.setattr(database, "record_events", tracked_record_events)
+
+    await _run_pipeline_batch(pipeline)
+
+    assert durable_batches == [
+        ["pipeline-chunks-0", "pipeline-chunks-1"],
+        ["pipeline-chunks-2", "pipeline-chunks-3"],
+        ["pipeline-chunks-4"],
+    ]
+    assert database._event_claim_tokens == {}
+    await database.close()
 
 
 @pytest.mark.asyncio

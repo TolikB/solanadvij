@@ -31,6 +31,13 @@ async def main() -> None:
         await connection.execute(
             text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {quoted}")
         )
+        await connection.execute(
+            text(
+                "GRANT EXECUTE ON FUNCTION "
+                "public.ensure_raw_chain_events_partition(date) "
+                f"TO {quoted}"
+            )
+        )
     await database.close()
 
 

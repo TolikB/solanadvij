@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -121,6 +121,18 @@ def _event_id_chunks(
         event_ids[offset : offset + chunk_size]
         for offset in range(0, len(event_ids), chunk_size)
     ]
+
+
+async def _ensure_raw_event_partitions(
+    session: AsyncSession,
+    block_dates: set[date],
+) -> None:
+    """Use the migration-owned narrow DDL capability before durable inserts."""
+    for block_date in sorted(block_dates):
+        await session.execute(
+            text("SELECT public.ensure_raw_chain_events_partition(:block_date)"),
+            {"block_date": block_date},
+        )
 
 
 def _processed_prefix_condition() -> Any:
@@ -746,6 +758,11 @@ class Database:
                 if dialect not in {"postgresql", "sqlite"}:
                     raise RuntimeError(
                         f"unsupported event-claim database dialect: {dialect or 'unknown'}"
+                    )
+                if dialect == "postgresql":
+                    await _ensure_raw_event_partitions(
+                        session,
+                        {event.block_time.date() for event in unique_events},
                     )
 
                 dedup_rows = [
