@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import event as sqlalchemy_event
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from sniper_bot.database import (
     SQLITE_SAFE_BOUND_PARAMETER_BUDGET,
