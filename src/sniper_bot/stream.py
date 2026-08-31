@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -23,6 +24,25 @@ TransactionItem = tuple[Protocol, dict[str, Any], EventSource]
 TransactionHandler = Callable[[Protocol, dict[str, Any], EventSource], Awaitable[None]]
 TransactionBatchHandler = Callable[[list[TransactionItem]], Awaitable[None]]
 FatalHandler = Callable[[BaseException], None]
+
+
+@dataclass(slots=True)
+class _TransactionNotification:
+    transaction: dict[str, Any]
+    received_at: datetime
+    generation: int
+
+
+@dataclass(slots=True)
+class _LogNotification:
+    signature: str
+    slot: int
+    logs: list[str]
+    received_at: datetime
+    generation: int
+
+
+NotificationDispatch = _TransactionNotification | _LogNotification
 
 
 class EntryGate:
@@ -83,7 +103,8 @@ class _GapRecoveryTimeout(RuntimeError):
 class HeliusStreamGateway:
     BACKOFF_SECONDS = (1, 2, 4, 8, 15)
     SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
-    SUBSCRIPTION_MESSAGE_BUFFER_LIMIT = 1024
+    NOTIFICATION_QUEUE_SIZE = 16_384
+    SUBSCRIPTION_MESSAGE_BUFFER_LIMIT = NOTIFICATION_QUEUE_SIZE
     MAX_GAP_RECOVERY_AGE = timedelta(seconds=60)
     GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
@@ -108,11 +129,14 @@ class HeliusStreamGateway:
         queue_size: int = 2000,
         max_processing_lag_seconds: float = 3.0,
         log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
+        notification_queue_size: int = NOTIFICATION_QUEUE_SIZE,
     ) -> None:
         if max_processing_lag_seconds <= 0:
             raise ValueError("max_processing_lag_seconds must be greater than zero")
         if log_fetch_concurrency <= 0:
             raise ValueError("log_fetch_concurrency must be greater than zero")
+        if notification_queue_size <= 0:
+            raise ValueError("notification_queue_size must be greater than zero")
         self.websocket_url = websocket_url
         self.rpc = rpc
         self.handler = handler
@@ -130,6 +154,10 @@ class HeliusStreamGateway:
         self.max_processing_lag_seconds = max_processing_lag_seconds
         self._baseline_started_at: datetime | None = None
         self._queue: asyncio.Queue[TransactionItem | None] = asyncio.Queue(maxsize=queue_size)
+        self._notification_queue: asyncio.Queue[NotificationDispatch] = asyncio.Queue(
+            maxsize=notification_queue_size
+        )
+        self._notification_dispatch_task: asyncio.Task[None] | None = None
         self._run_task: asyncio.Task[None] | None = None
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
@@ -254,14 +282,19 @@ class HeliusStreamGateway:
                                     "starting a new non-tradable live baseline"
                                 )
                                 self._discard_in_memory_checkpoint()
-                        while pending_handshake_messages:
-                            if self._reconnect_requested.is_set():
-                                raise RuntimeError(
-                                    "ordered Solana transaction dispatch "
-                                    "requested reconnect"
-                                )
-                            await self.handle_message(pending_handshake_messages[0])
-                            del pending_handshake_messages[0]
+                        dispatched_messages = 0
+                        try:
+                            for message in pending_handshake_messages:
+                                if self._reconnect_requested.is_set():
+                                    raise RuntimeError(
+                                        "ordered Solana transaction dispatch "
+                                        "requested reconnect"
+                                    )
+                                await self.handle_message(message)
+                                dispatched_messages += 1
+                        finally:
+                            if dispatched_messages:
+                                del pending_handshake_messages[:dispatched_messages]
                         self.entry_gate.unblock("startup")
                         self.entry_gate.unblock("stream_disconnected")
                         self.refresh_freshness()
@@ -486,11 +519,12 @@ class HeliusStreamGateway:
         if isinstance(transaction, dict):
             if "slot" not in transaction and isinstance(context, dict):
                 transaction["slot"] = context.get("slot", 0)
-            await self._queue_transaction(
-                transaction,
-                EventSource.HELIUS_WSS,
-                received_at=received_at,
-                generation=self._stream_generation,
+            self._enqueue_notification_dispatch(
+                _TransactionNotification(
+                    transaction=transaction,
+                    received_at=received_at,
+                    generation=self._stream_generation,
+                )
             )
             return
         if method != "logsNotification":
@@ -517,13 +551,81 @@ class HeliusStreamGateway:
         slot = context.get("slot") if isinstance(context, dict) else None
         if type(slot) is not int or slot <= 0:
             raise RuntimeError("Solana logs notification is missing a valid slot")
-        await self._spawn_ordered_log_dispatch(
-            signature=signature,
-            slot=slot,
-            logs=raw_logs,
-            received_at=received_at,
-            generation=self._stream_generation,
+        self._enqueue_notification_dispatch(
+            _LogNotification(
+                signature=signature,
+                slot=slot,
+                logs=raw_logs,
+                received_at=received_at,
+                generation=self._stream_generation,
+            )
         )
+
+    def _enqueue_notification_dispatch(
+        self,
+        item: NotificationDispatch,
+    ) -> None:
+        if self._reconnect_requested.is_set():
+            raise RuntimeError(
+                "ordered Solana transaction dispatch requested reconnect"
+            )
+        dispatch_task = self._notification_dispatch_task
+        if dispatch_task is None or dispatch_task.done():
+            if dispatch_task is not None:
+                try:
+                    dispatch_task.exception()
+                except asyncio.CancelledError:
+                    pass
+            self._notification_dispatch_task = asyncio.create_task(
+                self._dispatch_notifications(),
+                name="solana-notification-dispatch",
+            )
+        try:
+            self._notification_queue.put_nowait(item)
+        except asyncio.QueueFull as exc:
+            error = RuntimeError(
+                "Solana notification ingress queue overflow"
+            )
+            self._dispatch_recovery_pending = True
+            self.entry_gate.block("stream_fetch_error")
+            self._reconnect_requested.set()
+            if self.fatal_handler is not None:
+                self.fatal_handler(error)
+            raise error from exc
+        self._sync_queue_depth()
+
+    async def _dispatch_notifications(self) -> None:
+        while True:
+            item = await self._notification_queue.get()
+            try:
+                if isinstance(item, _TransactionNotification):
+                    await self._queue_transaction(
+                        item.transaction,
+                        EventSource.HELIUS_WSS,
+                        received_at=item.received_at,
+                        generation=item.generation,
+                    )
+                else:
+                    await self._spawn_ordered_log_dispatch(
+                        signature=item.signature,
+                        slot=item.slot,
+                        logs=item.logs,
+                        received_at=item.received_at,
+                        generation=item.generation,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._dispatch_recovery_pending = True
+                self.entry_gate.block("stream_fetch_error")
+                self._reconnect_requested.set()
+                logger.exception(
+                    "Solana notification dispatch failed; reconnect requested"
+                )
+                raise
+            finally:
+                self._notification_queue.task_done()
+                self._sync_queue_depth()
 
     async def _spawn_ordered_log_dispatch(
         self,
@@ -775,7 +877,22 @@ class HeliusStreamGateway:
             self._log_fetch_tail = None
         self._sync_queue_depth()
 
+    async def _cancel_notification_dispatcher(self) -> None:
+        dispatch_task = self._notification_dispatch_task
+        if dispatch_task is not None:
+            dispatch_task.cancel()
+            await asyncio.gather(dispatch_task, return_exceptions=True)
+            self._notification_dispatch_task = None
+        while True:
+            try:
+                self._notification_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._notification_queue.task_done()
+
     async def _cancel_log_fetch_tasks(self) -> None:
+        await self._cancel_notification_dispatcher()
         fetch_tasks = tuple(self._log_fetch_tasks)
         for task in fetch_tasks:
             task.cancel()
@@ -1095,7 +1212,9 @@ class HeliusStreamGateway:
 
     def _sync_queue_depth(self) -> None:
         self.metrics.event_queue_depth.set(
-            self._queue.qsize() + len(self._log_fetch_tasks)
+            self._queue.qsize()
+            + self._notification_queue.qsize()
+            + len(self._log_fetch_tasks)
         )
 
 

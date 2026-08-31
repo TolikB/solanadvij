@@ -617,6 +617,7 @@ async def test_logs_notification_uses_cached_block_time_without_transaction_fetc
     await gateway.handle_message(notification("second", 1))
     await gateway.handle_message(notification("third", 2))
     await gateway.handle_message(notification("fourth", 3))
+    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
     tasks = tuple(gateway._log_fetch_tasks)
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
     await asyncio.sleep(0)
@@ -693,6 +694,7 @@ async def test_logs_notification_block_time_failure_is_fail_closed(
     }
 
     await gateway.handle_message(notification)
+    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
     tasks = tuple(gateway._log_fetch_tasks)
     results = await asyncio.wait_for(
         asyncio.gather(*tasks, return_exceptions=True),
@@ -859,9 +861,77 @@ async def test_log_block_times_are_concurrent_but_dispatched_in_receive_order(
     assert dispatched == []
 
     first_release.set()
+    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
     tasks = tuple(gateway._log_fetch_tasks)
     await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
     assert dispatched == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_notification_ingress_is_bounded_and_overflow_is_fatal() -> None:
+    fatal_errors: list[BaseException] = []
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=_handler,
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        fatal_handler=fatal_errors.append,
+        log_fetch_concurrency=1,
+        notification_queue_size=2,
+    )
+    await gateway._log_fetch_semaphore.acquire()
+
+    def notification(signature: str) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": 1},
+                    "value": {
+                        "signature": signature,
+                        "err": None,
+                        "logs": [f"Program data: {signature}"],
+                    },
+                }
+            },
+        }
+
+    try:
+        await asyncio.wait_for(
+            gateway.handle_message(notification("active")),
+            timeout=0.1,
+        )
+        for _ in range(10):
+            if gateway._notification_queue.empty():
+                break
+            await asyncio.sleep(0)
+        assert gateway._notification_queue.empty()
+
+        await asyncio.wait_for(
+            gateway.handle_message(notification("queued-1")),
+            timeout=0.1,
+        )
+        await asyncio.wait_for(
+            gateway.handle_message(notification("queued-2")),
+            timeout=0.1,
+        )
+        assert gateway._notification_queue.full()
+
+        with pytest.raises(
+            RuntimeError,
+            match="notification ingress queue overflow",
+        ):
+            await gateway.handle_message(notification("overflow"))
+
+        assert len(fatal_errors) == 1
+        assert gateway._reconnect_requested.is_set()
+        assert "stream_fetch_error" in gateway.entry_gate.reasons
+        assert gateway._log_fetch_tasks == set()
+    finally:
+        await gateway._cancel_log_fetch_tasks()
+        gateway._log_fetch_semaphore.release()
 
 
 @pytest.mark.asyncio
@@ -952,6 +1022,7 @@ async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
     await gateway.handle_message(notification("first", 1))
     await gateway.handle_message(notification("second", 2))
     await asyncio.wait_for(first_dispatch_started.wait(), timeout=1)
+    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
     tasks = tuple(gateway._log_fetch_tasks)
     release_first_dispatch.set()
     results = await asyncio.wait_for(
