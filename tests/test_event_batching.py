@@ -16,7 +16,7 @@ from sniper_bot.database import (
 from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
-from sniper_bot.pipeline import ConfirmationPipeline, EVENT_LOOP_YIELD_INTERVAL
+from sniper_bot.pipeline import EVENT_LOOP_YIELD_INTERVAL, ConfirmationPipeline
 from sniper_bot.registry import TokenRecord
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import EntryGate, HeliusStreamGateway, TransactionItem
