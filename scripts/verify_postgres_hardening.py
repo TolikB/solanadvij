@@ -194,12 +194,14 @@ async def _probe_event_batch(
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
+        dedup_sql = dedup_inserts[0][0]
+        returning_clause = dedup_sql.partition(" returning ")[2]
         if (
-            " on conflict " not in dedup_inserts[0][0]
-            or " returning event_id" not in dedup_inserts[0][0]
+            " on conflict " not in dedup_sql
+            or returning_clause not in {"event_id", "event_dedup.event_id"}
         ):
             raise RuntimeError(
-                "PostgreSQL event claim is missing ON CONFLICT RETURNING"
+                "PostgreSQL event claim is missing ON CONFLICT RETURNING event_id"
             )
         if elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS:
             raise RuntimeError(
