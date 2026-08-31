@@ -80,25 +80,10 @@ SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
 POSTGRES_EVENT_STAGE_TABLE = "sniper_event_ingest_stage"
 POSTGRES_EVENT_STAGE_COLUMNS = (
-    "batch_order",
-    "raw_id",
     "event_id",
     "block_date",
     "first_seen_at",
     "processing_token",
-    "source",
-    "protocol",
-    "event_type",
-    "slot",
-    "signature",
-    "instruction_index",
-    "inner_instruction_index",
-    "block_time",
-    "observed_at",
-    "commitment",
-    "mint",
-    "pool_address",
-    "payload_json",
 )
 POSTGRES_RAW_EVENT_COLUMNS = (
     "id",
@@ -122,25 +107,10 @@ POSTGRES_RAW_EVENT_COLUMNS = (
 )
 POSTGRES_EVENT_STAGE_DDL = """
 CREATE TEMP TABLE IF NOT EXISTS sniper_event_ingest_stage (
-    batch_order integer NOT NULL,
-    raw_id text NOT NULL,
     event_id text NOT NULL,
     block_date date NOT NULL,
     first_seen_at timestamptz NOT NULL,
-    processing_token text NOT NULL,
-    source text NOT NULL,
-    protocol text NOT NULL,
-    event_type text NOT NULL,
-    slot bigint NOT NULL,
-    signature text NOT NULL,
-    instruction_index integer NOT NULL,
-    inner_instruction_index integer NOT NULL,
-    block_time timestamptz NOT NULL,
-    observed_at timestamptz NOT NULL,
-    commitment text NOT NULL,
-    mint text,
-    pool_address text,
-    payload_json jsonb NOT NULL
+    processing_token text NOT NULL
 ) ON COMMIT DELETE ROWS
 """
 
@@ -166,25 +136,10 @@ def _postgresql_event_stage_records(
 ) -> list[tuple[Any, ...]]:
     return [
         (
-            row["batch_order"],
-            row["raw_id"],
             row["event_id"],
             row["block_date"],
             row["first_seen_at"],
             row["processing_token"],
-            row["source"],
-            row["protocol"],
-            row["event_type"],
-            row["slot"],
-            row["signature"],
-            row["instruction_index"],
-            row["inner_instruction_index"],
-            row["block_time"],
-            row["observed_at"],
-            row["commitment"],
-            row["mint"],
-            row["pool_address"],
-            _postgresql_json_rows(row["payload_json"]),
         )
         for row in rows
     ]
@@ -1095,12 +1050,6 @@ class Database:
                         for batch_order, event in enumerate(unique_events)
                     ]
                     await session.execute(text(POSTGRES_EVENT_STAGE_DDL))
-                    await session.execute(
-                        text(
-                            "TRUNCATE TABLE "
-                            f"pg_temp.{POSTGRES_EVENT_STAGE_TABLE}"
-                        )
-                    )
                     session_connection = await session.connection()
                     raw_connection = (
                         await session_connection.get_raw_connection()

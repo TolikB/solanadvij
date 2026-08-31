@@ -240,10 +240,10 @@ async def _probe_event_batch(
         if accepted != [True] * len(batch):
             raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
         if (
-            len(statements) != 5
+            len(statements) != 4
             or len(partition_ensures) != 1
             or len(staging_creates) != 1
-            or len(staging_truncates) != 1
+            or len(staging_truncates) != 0
             or len(claim_inserts) != 1
             or len(raw_sql_inserts) != 0
             or len(sequence_allocations) != 1
