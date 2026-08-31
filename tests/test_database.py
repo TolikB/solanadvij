@@ -775,6 +775,7 @@ def _database_batch_events(
             slot=100_000 + index,
             instruction_index=0,
             block_time=now,
+            observed_at=now,
             mint="mint-batch",
             pool_address="pool-batch",
             payload={"index": index},
