@@ -145,11 +145,7 @@ def upgrade() -> None:
                     'migration 0008 refused to replace a non-empty '
                     'default partition';
             END IF;
-            ALTER TABLE public.raw_chain_events
-                DETACH PARTITION public.raw_chain_events_default;
-            DROP TABLE public.raw_chain_events_default;
-            CREATE TABLE public.raw_chain_events_default
-                PARTITION OF public.raw_chain_events DEFAULT;
+
         END
         $migration$;
         """
@@ -173,10 +169,9 @@ def upgrade() -> None:
             IF target_date IS NULL THEN
                 RAISE EXCEPTION 'raw-event partition date must not be null';
             END IF;
-            IF target_date < DATE '2020-03-16' OR target_date > utc_today + 1 THEN
+            IF target_date < utc_today - 1 OR target_date > utc_today + 1 THEN
                 RAISE EXCEPTION
-                    'raw-event partition date % is outside the allowed '
-                    'Solana range',
+                    'raw-event partition date % is outside the active UTC window',
                     target_date;
             END IF;
 
@@ -255,6 +250,7 @@ def downgrade() -> None:
         """
         DO $migration$
         DECLARE
+            partition_schema text;
             partition_name text;
             expected_rows bigint;
             moved_rows bigint;
@@ -262,29 +258,47 @@ def downgrade() -> None:
             LOCK TABLE public.raw_chain_events IN ACCESS EXCLUSIVE MODE;
             LOCK TABLE public.raw_chain_events_default IN ACCESS EXCLUSIVE MODE;
 
-            FOR partition_name IN
-                SELECT child.relname
+            IF EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_trigger
+                WHERE tgrelid IN (
+                    'public.raw_chain_events'::regclass,
+                    'public.raw_chain_events_default'::regclass
+                )
+                  AND NOT tgisinternal
+            ) THEN
+                RAISE EXCEPTION
+                    'migration 0008 downgrade blocked: raw-event user triggers exist';
+            END IF;
+
+            FOR partition_schema, partition_name IN
+                SELECT namespace.nspname, child.relname
                 FROM pg_catalog.pg_inherits AS inheritance
                 JOIN pg_catalog.pg_class AS parent
                   ON parent.oid = inheritance.inhparent
                 JOIN pg_catalog.pg_class AS child
                   ON child.oid = inheritance.inhrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = child.relnamespace
                 WHERE parent.oid = 'public.raw_chain_events'::regclass
                   AND child.relname <> 'raw_chain_events_default'
-                ORDER BY child.relname
+                ORDER BY namespace.nspname, child.relname
             LOOP
                 EXECUTE pg_catalog.format(
-                    'SELECT count(*) FROM public.%I',
+                    'SELECT count(*) FROM %I.%I',
+                    partition_schema,
                     partition_name
                 ) INTO expected_rows;
                 EXECUTE pg_catalog.format(
                     'ALTER TABLE public.raw_chain_events '
-                    'DETACH PARTITION public.%I',
+                    'DETACH PARTITION %I.%I',
+                    partition_schema,
                     partition_name
                 );
                 EXECUTE pg_catalog.format(
-                    'INSERT INTO public.raw_chain_events '
-                    'SELECT * FROM public.%I',
+                    'INSERT INTO public.raw_chain_events_default '
+                    'SELECT * FROM %I.%I',
+                    partition_schema,
                     partition_name
                 );
                 GET DIAGNOSTICS moved_rows = ROW_COUNT;
@@ -292,12 +306,13 @@ def downgrade() -> None:
                     RAISE EXCEPTION
                         'migration 0008 downgrade row-count mismatch for %: '
                         'expected %, moved %',
-                        partition_name,
+                        partition_schema || '.' || partition_name,
                         expected_rows,
                         moved_rows;
                 END IF;
                 EXECUTE pg_catalog.format(
-                    'DROP TABLE public.%I',
+                    'DROP TABLE %I.%I',
+                    partition_schema,
                     partition_name
                 );
             END LOOP;

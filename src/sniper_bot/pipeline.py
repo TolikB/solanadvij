@@ -200,21 +200,35 @@ class ConfirmationPipeline:
         transactions: list[tuple[Protocol, dict[str, Any], EventSource]],
     ) -> None:
         self._require_consistent_state()
-        events: list[EventEnvelope] = []
+        event_batches: list[list[EventEnvelope]] = []
+        current_batch: list[EventEnvelope] = []
         for protocol, transaction, source in transactions:
             decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
             try:
-                events.extend(decoder.decode_transaction(transaction, source=source))
+                decoded_events = decoder.decode_transaction(
+                    transaction,
+                    source=source,
+                )
             except AnchorDecodeError:
                 self.entry_gate.block_protocol(protocol)
                 await self._record_unknown(protocol, transaction, source)
                 raise
-        if not events:
-            return
-        for offset in range(0, len(events), MAX_EVENT_BATCH_SIZE):
-            await self._process_decoded_event_batch(
-                events[offset : offset + MAX_EVENT_BATCH_SIZE]
-            )
+            if len(decoded_events) > MAX_EVENT_BATCH_SIZE:
+                raise RuntimeError(
+                    "one decoded transaction exceeds the durable event batch limit"
+                )
+            if (
+                current_batch
+                and len(current_batch) + len(decoded_events)
+                > MAX_EVENT_BATCH_SIZE
+            ):
+                event_batches.append(current_batch)
+                current_batch = []
+            current_batch.extend(decoded_events)
+        if current_batch:
+            event_batches.append(current_batch)
+        for events in event_batches:
+            await self._process_decoded_event_batch(events)
 
     async def _process_decoded_event_batch(
         self,

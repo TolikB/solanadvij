@@ -127,8 +127,13 @@ async def _ensure_raw_event_partitions(
     session: AsyncSession,
     block_dates: set[date],
 ) -> None:
-    """Use the migration-owned narrow DDL capability before durable inserts."""
-    for block_date in sorted(block_dates):
+    """Use the narrow DDL capability only for the active UTC ingest window."""
+    utc_today = datetime.now(tz=timezone.utc).date()
+    earliest = utc_today - timedelta(days=1)
+    latest = utc_today + timedelta(days=1)
+    for block_date in sorted(
+        value for value in block_dates if earliest <= value <= latest
+    ):
         await session.execute(
             text("SELECT public.ensure_raw_chain_events_partition(:block_date)"),
             {"block_date": block_date},
@@ -759,11 +764,7 @@ class Database:
                     raise RuntimeError(
                         f"unsupported event-claim database dialect: {dialect or 'unknown'}"
                     )
-                if dialect == "postgresql":
-                    await _ensure_raw_event_partitions(
-                        session,
-                        {event.block_time.date() for event in unique_events},
-                    )
+
 
                 dedup_rows = [
                     {
@@ -907,6 +908,10 @@ class Database:
                 ]
                 if new_events:
                     if dialect == "postgresql":
+                        await _ensure_raw_event_partitions(
+                            session,
+                            {event.block_time.date() for event in new_events},
+                        )
                         sequence_rows = (
                             await session.scalars(
                                 text(

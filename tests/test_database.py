@@ -457,15 +457,15 @@ async def _run_pipeline_batch(pipeline: ConfirmationPipeline) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pipeline_splits_decoded_events_into_bounded_ordered_chunks(
+async def test_pipeline_never_splits_one_decoded_transaction(
     tmp_path, monkeypatch
 ) -> None:
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-chunks.db'}")
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-limit.db'}")
     await database.create_schema_for_tests()
     events = _pipeline_batch_events(
-        "pipeline-chunks",
+        "pipeline-limit",
         datetime(2026, 8, 25, tzinfo=timezone.utc),
-        count=5,
+        count=3,
     )
     pipeline = ConfirmationPipeline(
         data_dir=str(tmp_path),
@@ -478,6 +478,54 @@ async def test_pipeline_splits_decoded_events_into_bounded_ordered_chunks(
     )
     _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
     monkeypatch.setattr("sniper_bot.pipeline.MAX_EVENT_BATCH_SIZE", 2)
+
+    with pytest.raises(RuntimeError, match="one decoded transaction exceeds"):
+        await _run_pipeline_batch(pipeline)
+
+    async with database.sessions() as session:
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(RawChainEventRow)
+            )
+            == 0
+        )
+    assert database._event_claim_tokens == {}
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_groups_transactions_without_splitting_them(
+    tmp_path, monkeypatch
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-groups.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-groups",
+        datetime(2026, 8, 25, tzinfo=timezone.utc),
+        count=5,
+    )
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        record_raw=False,
+    )
+    decoded_by_signature = {
+        "first-transaction": events[:2],
+        "second-transaction": events[2:],
+    }
+    monkeypatch.setattr(
+        pipeline._pumpswap,
+        "decode_transaction",
+        lambda transaction, source: decoded_by_signature[
+            str(transaction["signature"])
+        ],
+    )
+    monkeypatch.setattr(pipeline, "_event_state_filter_reason", lambda _event: None)
+    monkeypatch.setattr("sniper_bot.pipeline.MAX_EVENT_BATCH_SIZE", 3)
     original_record_events = database.record_events
     durable_batches: list[list[str]] = []
 
@@ -495,13 +543,24 @@ async def test_pipeline_splits_decoded_events_into_bounded_ordered_chunks(
         )
 
     monkeypatch.setattr(database, "record_events", tracked_record_events)
-
-    await _run_pipeline_batch(pipeline)
+    await pipeline.process_transactions(
+        [
+            (
+                Protocol.PUMPSWAP,
+                {"signature": "first-transaction"},
+                EventSource.REPLAY,
+            ),
+            (
+                Protocol.PUMPSWAP,
+                {"signature": "second-transaction"},
+                EventSource.REPLAY,
+            ),
+        ]
+    )
 
     assert durable_batches == [
-        ["pipeline-chunks-0", "pipeline-chunks-1"],
-        ["pipeline-chunks-2", "pipeline-chunks-3"],
-        ["pipeline-chunks-4"],
+        ["pipeline-groups-0", "pipeline-groups-1"],
+        ["pipeline-groups-2", "pipeline-groups-3", "pipeline-groups-4"],
     ]
     assert database._event_claim_tokens == {}
     await database.close()
