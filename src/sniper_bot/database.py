@@ -517,8 +517,26 @@ class Database:
                     for event in sorted(unique_events, key=lambda item: item.event_id)
                 ]
                 for chunk in _bulk_insert_chunks(dedup_rows, dialect=dialect):
-                    if dialect == "postgresql":
-                        statement: Any = (
+                    statement: Any
+                    if dialect == "sqlite" and len(chunk) == 1:
+                        statement = (
+                            sqlite_insert(EventDedupRow)
+                            .values(**chunk[0])
+                            .on_conflict_do_nothing(
+                                index_elements=[EventDedupRow.event_id]
+                            )
+                        )
+                        result = await session.execute(statement)
+                        rowcount = getattr(result, "rowcount", None)
+                        if rowcount not in {0, 1}:
+                            raise RuntimeError(
+                                "single event claim returned an invalid row count"
+                            )
+                        returned_ids = (
+                            {str(chunk[0]["event_id"])} if rowcount == 1 else set()
+                        )
+                    elif dialect == "postgresql":
+                        statement = (
                             pg_insert(EventDedupRow)
                             .values(chunk)
                             .on_conflict_do_nothing(
@@ -526,6 +544,10 @@ class Database:
                             )
                             .returning(EventDedupRow.event_id)
                         )
+                        returned_ids = {
+                            str(event_id)
+                            for event_id in (await session.scalars(statement)).all()
+                        }
                     else:
                         statement = (
                             sqlite_insert(EventDedupRow)
@@ -535,10 +557,10 @@ class Database:
                             )
                             .returning(EventDedupRow.event_id)
                         )
-                    returned_ids = {
-                        str(event_id)
-                        for event_id in (await session.scalars(statement)).all()
-                    }
+                        returned_ids = {
+                            str(event_id)
+                            for event_id in (await session.scalars(statement)).all()
+                        }
                     chunk_ids = {str(row["event_id"]) for row in chunk}
                     if (
                         not returned_ids <= chunk_ids
@@ -674,15 +696,18 @@ class Database:
                         )
                     ]
                     for chunk in _bulk_insert_chunks(raw_rows, dialect=dialect):
-                        if dialect == "postgresql":
+                        if len(chunk) == 1:
+                            session.add(RawChainEventRow(**chunk[0]))
+                        elif dialect == "postgresql":
                             raw_statement: Any = pg_insert(RawChainEventRow).values(
                                 chunk
                             )
+                            await session.execute(raw_statement)
                         else:
                             raw_statement = sqlite_insert(RawChainEventRow).values(
                                 chunk
                             )
-                        await session.execute(raw_statement)
+                            await session.execute(raw_statement)
 
             retained_event_ids = claimed_event_ids | durably_owned_event_ids
             for event_id, claim_token in claim_tokens.items():
