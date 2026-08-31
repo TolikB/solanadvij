@@ -16,6 +16,7 @@ from sniper_bot.database import (
 from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
+from sniper_bot.pipeline import ConfirmationPipeline, EVENT_LOOP_YIELD_INTERVAL
 from sniper_bot.registry import TokenRecord
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import EntryGate, HeliusStreamGateway, TransactionItem
@@ -38,6 +39,45 @@ def _event(
         pool_address="POOL",
         payload={"base_amount_out": "1", "quote_amount_in": "1"},
     )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_large_decode_batch_yields_control(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=None,
+        record_raw=False,
+    )
+    monkeypatch.setattr(
+        pipeline._pumpswap,
+        "decode_transaction",
+        lambda _transaction, source: [],
+    )
+    yield_delays: list[float] = []
+
+    async def tracked_sleep(delay: float) -> None:
+        yield_delays.append(delay)
+
+    monkeypatch.setattr("sniper_bot.pipeline.asyncio.sleep", tracked_sleep)
+    transaction_count = EVENT_LOOP_YIELD_INTERVAL * 2 + 1
+    await pipeline.process_transactions(
+        [
+            (
+                Protocol.PUMPSWAP,
+                {"signature": f"yield-{index}"},
+                EventSource.REPLAY,
+            )
+            for index in range(transaction_count)
+        ]
+    )
+
+    assert yield_delays == [0, 0]
 
 
 @pytest.mark.asyncio

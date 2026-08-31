@@ -260,8 +260,10 @@ async def test_run_closes_transaction_socket_and_persists_logs_only_mode(
     )
     connections = [first, second, third]
     events: list[str] = []
+    connect_options: list[dict[str, object]] = []
 
-    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
+    def connect(*_args: object, **kwargs: object) -> FakeConnectionContext:
+        connect_options.append(dict(kwargs))
         index = 3 - len(connections)
         connection = connections.pop(0)
         return FakeConnectionContext(connection, events, str(index + 1))
@@ -273,6 +275,17 @@ async def test_run_closes_transaction_socket_and_persists_logs_only_mode(
         async with asyncio.timeout(1):
             await third_ready.wait()
         assert events[:5] == ["open:1", "close:1", "open:2", "close:2", "open:3"]
+        assert connect_options
+        assert all(
+            options["ping_timeout"]
+            == gateway.WEBSOCKET_PING_TIMEOUT_SECONDS
+            for options in connect_options
+        )
+        assert all(
+            options["ping_interval"]
+            == gateway.WEBSOCKET_PING_INTERVAL_SECONDS
+            for options in connect_options
+        )
         assert [item["method"] for item in second.sent] == [
             "logsSubscribe",
             "logsSubscribe",

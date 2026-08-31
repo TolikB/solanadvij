@@ -102,6 +102,9 @@ class _GapRecoveryTimeout(RuntimeError):
 
 class HeliusStreamGateway:
     BACKOFF_SECONDS = (1, 2, 4, 8, 15)
+    WEBSOCKET_PING_INTERVAL_SECONDS = 30.0
+    WEBSOCKET_PING_TIMEOUT_SECONDS = 60.0
+    WEBSOCKET_CLOSE_TIMEOUT_SECONDS = 5.0
     SUBSCRIPTION_ACK_TIMEOUT_SECONDS = 10.0
     NOTIFICATION_QUEUE_SIZE = 16_384
     SUBSCRIPTION_MESSAGE_BUFFER_LIMIT = NOTIFICATION_QUEUE_SIZE
@@ -235,9 +238,9 @@ class HeliusStreamGateway:
             try:
                 async with websockets.connect(
                     self.websocket_url,
-                    ping_interval=30,
-                    ping_timeout=15,
-                    close_timeout=5,
+                    ping_interval=self.WEBSOCKET_PING_INTERVAL_SECONDS,
+                    ping_timeout=self.WEBSOCKET_PING_TIMEOUT_SECONDS,
+                    close_timeout=self.WEBSOCKET_CLOSE_TIMEOUT_SECONDS,
                     max_queue=1024,
                 ) as websocket:
                     try:

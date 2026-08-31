@@ -50,6 +50,7 @@ NON_TRADABLE_EVENT_SOURCES = frozenset(
 )
 
 logger = logging.getLogger(__name__)
+EVENT_LOOP_YIELD_INTERVAL = 32
 
 SecurityProvider = Callable[[Candidate, FeatureSnapshot], Awaitable[SecurityContext]]
 EntryHandler = Callable[
@@ -202,7 +203,10 @@ class ConfirmationPipeline:
         self._require_consistent_state()
         event_batches: list[list[EventEnvelope]] = []
         current_batch: list[EventEnvelope] = []
-        for protocol, transaction, source in transactions:
+        for transaction_index, (protocol, transaction, source) in enumerate(
+            transactions,
+            start=1,
+        ):
             decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
             try:
                 decoded_events = decoder.decode_transaction(
@@ -225,6 +229,8 @@ class ConfirmationPipeline:
                 event_batches.append(current_batch)
                 current_batch = []
             current_batch.extend(decoded_events)
+            if transaction_index % EVENT_LOOP_YIELD_INTERVAL == 0:
+                await asyncio.sleep(0)
         if current_batch:
             event_batches.append(current_batch)
         for events in event_batches:
@@ -263,8 +269,9 @@ class ConfirmationPipeline:
             if self.record_raw:
                 await self.recorder.record_many(claimed_events)
             async with database.event_state_batch_transaction():
-                for event, durable_accepted in zip(
-                    events, durable_results, strict=True
+                for event_index, (event, durable_accepted) in enumerate(
+                    zip(events, durable_results, strict=True),
+                    start=1,
                 ):
                     processed = await self.process_event(
                         event,
@@ -277,6 +284,8 @@ class ConfirmationPipeline:
                         raise RuntimeError(
                             "durably claimed batch event was rejected by local deduplication"
                         )
+                    if event_index % EVENT_LOOP_YIELD_INTERVAL == 0:
+                        await asyncio.sleep(0)
         except BaseException as error:
             self._poison_state()
             try:
