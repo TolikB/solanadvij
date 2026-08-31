@@ -442,6 +442,7 @@ def _install_pipeline_batch_decoder(monkeypatch, pipeline, events) -> None:
         "decode_transaction",
         lambda _transaction, source: events,
     )
+    monkeypatch.setattr(pipeline, "_event_state_filter_reason", lambda _event: None)
 
 
 async def _run_pipeline_batch(pipeline: ConfirmationPipeline) -> None:
@@ -1145,3 +1146,126 @@ async def test_pipeline_batch_task_cancellation_rolls_back_and_poison_restarts(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await database.close()
+
+@pytest.mark.asyncio
+async def test_pipeline_untracked_swaps_remain_durable_raw_and_processed(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'filtered-swaps.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "filtered-swap", datetime(2026, 8, 25, tzinfo=timezone.utc)
+    )
+    metrics = BotMetrics()
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(metrics),
+        metrics=metrics,
+        database=database,
+        record_raw=True,
+    )
+    monkeypatch.setattr(
+        pipeline._pumpswap,
+        "decode_transaction",
+        lambda _transaction, source: events,
+    )
+    archived: list[str] = []
+    applied: list[str] = []
+
+    async def capture_raw(batch: list[EventEnvelope]) -> None:
+        archived.extend(event.event_id for event in batch)
+
+    async def capture_apply(
+        event: EventEnvelope,
+        *,
+        persist: bool,
+        observe: bool,
+        allow_candidate: bool = True,
+    ) -> None:
+        applied.append(event.event_id)
+
+    monkeypatch.setattr(pipeline.recorder, "record_many", capture_raw)
+    monkeypatch.setattr(pipeline, "_apply_event", capture_apply)
+
+    await _run_pipeline_batch(pipeline)
+
+    assert archived == [event.event_id for event in events]
+    assert applied == []
+    assert (
+        metrics.chain_event_state_filter_decisions.labels(
+            reason="unknown_pool"
+        )._value.get()
+        == len(events)
+    )
+    async with database.sessions() as session:
+        for event in events:
+            claim = await session.get(EventDedupRow, event.event_id)
+            assert claim is not None
+            assert claim.processing_status == "PROCESSED"
+    assert database._event_claim_tokens == {}
+    await database.close()
+
+@pytest.mark.asyncio
+async def test_load_processed_pool_creation_events_is_targeted(tmp_path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pool-bootstrap.db'}")
+    await database.create_schema_for_tests()
+    now = datetime(2026, 8, 25, tzinfo=timezone.utc)
+    events = [
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=Protocol.PUMPSWAP,
+            event_type=ChainEventType.POOL_CREATED,
+            slot=1,
+            signature="pool-a-created",
+            instruction_index=0,
+            block_time=now,
+            observed_at=now,
+            mint="TOKEN-A",
+            pool_address="POOL-A",
+            payload={},
+        ),
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=Protocol.PUMPSWAP,
+            event_type=ChainEventType.SWAP_BUY,
+            slot=2,
+            signature="pool-a-swap",
+            instruction_index=0,
+            block_time=now + timedelta(seconds=1),
+            observed_at=now + timedelta(seconds=1),
+            mint="TOKEN-A",
+            pool_address="POOL-A",
+            payload={},
+        ),
+        EventEnvelope(
+            source=EventSource.REPLAY,
+            protocol=Protocol.PUMPSWAP,
+            event_type=ChainEventType.POOL_CREATED,
+            slot=3,
+            signature="pool-b-created",
+            instruction_index=0,
+            block_time=now + timedelta(seconds=2),
+            observed_at=now + timedelta(seconds=2),
+            mint="TOKEN-B",
+            pool_address="POOL-B",
+            payload={},
+        ),
+    ]
+    assert await database.record_events(events) == [True, True, True]
+    async with database.event_state_batch_transaction():
+        for event in events:
+            await database.mark_event_processed(
+                event.event_id,
+                processed_at=event.observed_at,
+            )
+    for event in events:
+        database.release_event_claim(event.event_id)
+
+    loaded = await database.load_processed_pool_creation_events({"POOL-A"})
+
+    assert [event.event_id for event in loaded] == [events[0].event_id]
+    assert await database.load_processed_pool_creation_events(set()) == []
+    await database.close()

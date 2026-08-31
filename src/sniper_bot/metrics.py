@@ -14,6 +14,12 @@ class BotMetrics:
         self.chain_events_duplicate = Counter(
             "chain_events_duplicate_total", "Duplicate chain events", registry=self.registry
         )
+        self.chain_event_state_filter_decisions = Counter(
+            "chain_event_state_filter_decisions_total",
+            "Decoded swap decisions excluded from derived live state",
+            ["reason"],
+            registry=self.registry,
+        )
         self.chain_event_processing_lag_ms = Histogram(
             "chain_event_processing_lag_ms",
             "Observed processing lag for chain events",

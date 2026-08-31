@@ -46,6 +46,10 @@ from .wallet_analysis import WalletAnalyzer
 logger = logging.getLogger(__name__)
 
 
+class RecoveryStateError(RuntimeError):
+    """Raised when persisted runtime state cannot be recovered safely."""
+
+
 class SniperRuntime:
     def __init__(self, config: AppConfig, *, data_dir: str | Path = "data") -> None:
         self.config = config
@@ -219,30 +223,66 @@ class SniperRuntime:
                     )
                 profiles, relations = await self.database.load_wallet_analysis()
                 self.wallet_analyzer.restore(profiles, relations)
+                restored_candidates = await self.database.load_active_candidates(
+                    self.config.strategy_version
+                )
+                self.pipeline.restore_candidates(restored_candidates)
+                self.pipeline.restore_score_totals(
+                    await self.database.load_candidate_score_totals(
+                        self.config.strategy_version
+                    )
+                )
+                tracked_pool_addresses = {
+                    candidate.pool_address
+                    for candidate in restored_candidates
+                    if candidate.state
+                    not in {
+                        CandidateState.CLOSED,
+                        CandidateState.REJECTED,
+                    }
+                }
+                pool_bootstrap_events = (
+                    await self.database.load_processed_pool_creation_events(
+                        tracked_pool_addresses
+                    )
+                )
+                bootstrapped_pool_addresses = {
+                    event.pool_address
+                    for event in pool_bootstrap_events
+                    if event.pool_address is not None
+                }
+                missing_pool_addresses = (
+                    tracked_pool_addresses - bootstrapped_pool_addresses
+                )
+                if missing_pool_addresses:
+                    raise RecoveryStateError(
+                        "active candidate pool state is unavailable for recovery"
+                    )
+                bootstrap_event_ids = {
+                    event.event_id for event in pool_bootstrap_events
+                }
+                for event in pool_bootstrap_events:
+                    if await self.pipeline.rehydrate_event(event):
+                        self.wallet_analyzer.observe(event)
                 quarantined_protocols = (
                     await self.database.load_quarantined_event_protocols()
                 )
                 recovery_since = datetime.now(tz=timezone.utc) - timedelta(
                     seconds=max(
                         300,
-                        self.config.candidate.max_pool_age_seconds + 60,
-                        self.config.exits.maximum_holding_seconds + 60,
+                        self.config.candidate.max_pool_age_seconds
+                        + self.config.exits.maximum_holding_seconds
+                        + 60,
                     )
                 )
                 for event in await self.database.load_processed_events_since(recovery_since):
                     self.stream_gateway.restore_protocol_checkpoint(
                         event.protocol, event.signature
                     )
-                    self.wallet_analyzer.observe(event)
-                    await self.pipeline.rehydrate_event(event)
-                self.pipeline.restore_candidates(
-                    await self.database.load_active_candidates(self.config.strategy_version)
-                )
-                self.pipeline.restore_score_totals(
-                    await self.database.load_candidate_score_totals(
-                        self.config.strategy_version
-                    )
-                )
+                    if event.event_id in bootstrap_event_ids:
+                        continue
+                    if await self.pipeline.rehydrate_event(event):
+                        self.wallet_analyzer.observe(event)
                 runtime_checkpoint = await self.database.load_runtime_checkpoint(
                     "paper-main:exit-monitor"
                 )
@@ -291,7 +331,7 @@ class SniperRuntime:
                     await self.database.release_runtime_lease()
                 except Exception:
                     logger.exception("failed to release runtime lease after startup failure")
-                if isinstance(exc, ActiveRuntimeError):
+                if isinstance(exc, (ActiveRuntimeError, RecoveryStateError)):
                     raise
         if self.outbox_worker is not None and self.database_available:
             await self.outbox_worker.start()

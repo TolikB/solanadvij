@@ -1193,6 +1193,36 @@ class Database:
             ).all()
         return [_event_from_row(row) for row in rows]
 
+    async def load_processed_pool_creation_events(
+        self, pool_addresses: set[str]
+    ) -> list[EventEnvelope]:
+        addresses = sorted(pool_addresses)
+        if not addresses:
+            return []
+        rows: list[RawChainEventRow] = []
+        async with self.sessions() as session:
+            for offset in range(0, len(addresses), 500):
+                chunk = addresses[offset : offset + 500]
+                rows.extend(
+                    (
+                        await session.scalars(
+                            select(RawChainEventRow)
+                            .join(
+                                EventDedupRow,
+                                EventDedupRow.event_id == RawChainEventRow.event_id,
+                            )
+                            .where(
+                                EventDedupRow.processing_status == "PROCESSED",
+                                RawChainEventRow.event_type == "pool_created",
+                                RawChainEventRow.pool_address.in_(chunk),
+                                _processed_prefix_condition(),
+                            )
+                        )
+                    ).all()
+                )
+        rows.sort(key=lambda row: row.ingest_sequence)
+        return [_event_from_row(row) for row in rows]
+
     async def load_unprocessed_events(
         self, *, include_owned_processing: bool = False
     ) -> list[EventEnvelope]:

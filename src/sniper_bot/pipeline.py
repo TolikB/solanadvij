@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -281,6 +281,45 @@ class ConfirmationPipeline:
             return event
         return event.model_copy(update={"mint": pool.base_mint})
 
+    def _event_state_filter_reason(self, event: EventEnvelope) -> str | None:
+        if event.event_type not in {
+            ChainEventType.SWAP_BUY,
+            ChainEventType.SWAP_SELL,
+        }:
+            return None
+        if not event.pool_address:
+            return "unknown_pool"
+        pool = self.pools.pool(event.pool_address)
+        if pool is None:
+            return "unknown_pool"
+        candidate = self.candidates.get(
+            _candidate_id(pool.base_mint, pool.pool_address, self.strategy_version)
+        )
+        if candidate is None:
+            return "no_candidate"
+        if event.block_time < candidate.detected_at:
+            return "before_candidate"
+        if candidate.state in {
+            CandidateState.POSITION_OPEN,
+            CandidateState.POSITION_PARTIAL,
+            CandidateState.EXIT_PENDING,
+            CandidateState.RETRYING_EXIT,
+        }:
+            return None
+        if candidate.state in {
+            CandidateState.CLOSED,
+            CandidateState.REJECTED,
+        }:
+            return "terminal"
+        maximum_age_seconds = (
+            self.config.candidate.max_pool_age_seconds if self.config else 180
+        )
+        if event.block_time > candidate.detected_at + timedelta(
+            seconds=maximum_age_seconds
+        ):
+            return "expired"
+        return None
+
     async def process_event(
         self,
         event: EventEnvelope,
@@ -317,17 +356,24 @@ class ConfirmationPipeline:
         if not local_accepted:
             self.metrics.chain_events_duplicate.inc()
             return False
+        filter_reason = self._event_state_filter_reason(event)
+        apply_state = filter_reason is None
         requires_state_rebuild = False
         try:
             if self.record_raw and not recovering and not _raw_already_recorded:
                 await self.recorder.record(event)
             if self.database is None:
-                await self._apply_event(
-                    event,
-                    persist=True,
-                    observe=True,
-                    allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
-                )
+                if apply_state:
+                    await self._apply_event(
+                        event,
+                        persist=True,
+                        observe=True,
+                        allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+                    )
+                else:
+                    self.metrics.chain_event_state_filter_decisions.labels(
+                        reason=filter_reason
+                    ).inc()
             else:
                 transaction_entered = False
                 try:
@@ -336,6 +382,7 @@ class ConfirmationPipeline:
                         await self._persist_claimed_event_state(
                             event,
                             raw_context_changed=raw_context_changed,
+                            filter_reason=filter_reason,
                         )
                     else:
                         async with self.database.event_state_transaction():
@@ -343,6 +390,7 @@ class ConfirmationPipeline:
                             await self._persist_claimed_event_state(
                                 event,
                                 raw_context_changed=raw_context_changed,
+                                filter_reason=filter_reason,
                             )
                 except BaseException:
                     requires_state_rebuild = transaction_entered
@@ -377,29 +425,38 @@ class ConfirmationPipeline:
         event: EventEnvelope,
         *,
         raw_context_changed: bool,
+        filter_reason: str | None,
     ) -> None:
         if self.database is None:
             raise RuntimeError("durable event state requires a database")
         if raw_context_changed:
             await self.database.update_raw_event_context(event)
-        await self._apply_event(
-            event,
-            persist=True,
-            observe=True,
-            allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
-        )
+        if filter_reason is None:
+            await self._apply_event(
+                event,
+                persist=True,
+                observe=True,
+                allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
+            )
+        else:
+            self.metrics.chain_event_state_filter_decisions.labels(
+                reason=filter_reason
+            ).inc()
         await self.database.mark_event_processed(
             event.event_id, processed_at=datetime.now(tz=timezone.utc)
         )
 
-    async def rehydrate_event(self, event: EventEnvelope) -> None:
+    async def rehydrate_event(self, event: EventEnvelope) -> bool:
         """Rebuild bounded in-memory state from an already processed durable event."""
+        if self._event_state_filter_reason(event) is not None:
+            return False
         await self._apply_event(
             event,
             persist=False,
             observe=False,
             allow_candidate=event.source not in NON_TRADABLE_EVENT_SOURCES,
         )
+        return True
 
     def restore_candidates(self, candidates: list[Candidate]) -> None:
         for candidate in candidates:
