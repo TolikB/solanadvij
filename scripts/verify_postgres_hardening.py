@@ -148,6 +148,29 @@ async def _probe_event_batch(
     statements: list[tuple[str, bool]] = []
     listener_attached = False
 
+    async with database.sessions() as session:
+        status_index = await session.scalar(
+            text(
+                "SELECT pg_catalog.to_regclass("
+                "'public.ix_event_dedup_processing_status'"
+                ")"
+            )
+        )
+        event_dedup_options = await session.scalar(
+            text(
+                "SELECT reloptions FROM pg_catalog.pg_class "
+                "WHERE oid = 'public.event_dedup'::regclass"
+            )
+        )
+    if status_index is not None:
+        raise RuntimeError(
+            "PostgreSQL event completion still maintains the hot status index"
+        )
+    if "fillfactor=70" not in set(event_dedup_options or []):
+        raise RuntimeError(
+            "PostgreSQL event_dedup fillfactor is not tuned for HOT updates"
+        )
+
     def capture_sql(
         _connection: Any,
         _cursor: Any,

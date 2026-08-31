@@ -71,7 +71,10 @@ class EventDedupRow(Base):
     block_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     processing_status: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="PENDING", server_default="PROCESSED", index=True
+        String(16),
+        nullable=False,
+        default="PENDING",
+        server_default="PROCESSED",
     )
     processing_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
