@@ -9,6 +9,7 @@ def test_capacity_metrics_expose_queue_breakdown_and_bounded_batch_phases() -> N
     metrics.chain_transaction_batch_size.observe(512)
     metrics.chain_decoded_event_batch_size.observe(128)
     metrics.chain_batch_phase_seconds.labels(phase="decode").observe(0.25)
+    metrics.postgres_event_ingest_phase_seconds.labels(phase="raw_copy").observe(0.5)
 
     rendered = metrics.render().decode("utf-8")
 
@@ -18,3 +19,7 @@ def test_capacity_metrics_expose_queue_breakdown_and_bounded_batch_phases() -> N
     assert "chain_transaction_batch_size_count 1.0" in rendered
     assert "chain_decoded_event_batch_size_count 1.0" in rendered
     assert 'chain_batch_phase_seconds_count{phase="decode"} 1.0' in rendered
+    assert (
+        'postgres_event_ingest_phase_seconds_count{phase="raw_copy"} 1.0'
+        in rendered
+    )

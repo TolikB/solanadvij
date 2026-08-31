@@ -958,10 +958,12 @@ class Database:
         claim_tokens: dict[str, str],
     ) -> AsyncIterator[AsyncSession]:
         body_completed = False
+        commit_started: float | None = None
         try:
             async with self.sessions() as session, session.begin():
                 yield session
                 body_completed = True
+                commit_started = time.perf_counter()
         except BaseException:
             if not body_completed:
                 try:
@@ -971,6 +973,9 @@ class Database:
                         "failed to reconcile event claim tokens after transaction failure"
                     )
             raise
+        finally:
+            if commit_started is not None:
+                self._observe_event_ingest_phase("commit", commit_started)
 
     async def record_events(
         self,
@@ -1016,6 +1021,7 @@ class Database:
 
 
                 if dialect == "postgresql":
+                    postgres_prepare_started = time.perf_counter()
                     await _ensure_raw_event_partitions(
                         session,
                         {
@@ -1063,10 +1069,18 @@ class Database:
                         raise RuntimeError(
                             "PostgreSQL driver does not support COPY staging"
                         )
+                    self._observe_event_ingest_phase(
+                        "prepare", postgres_prepare_started
+                    )
+                    stage_records = _postgresql_event_stage_records(payload_rows)
+                    stage_copy_started = time.perf_counter()
                     stage_copy_status = await copy_records_to_table(
                         POSTGRES_EVENT_STAGE_TABLE,
-                        records=_postgresql_event_stage_records(payload_rows),
+                        records=stage_records,
                         columns=POSTGRES_EVENT_STAGE_COLUMNS,
+                    )
+                    self._observe_event_ingest_phase(
+                        "stage_copy", stage_copy_started
                     )
                     if stage_copy_status != f"COPY {len(payload_rows)}":
                         raise RuntimeError(
@@ -1100,6 +1114,7 @@ class Database:
                         ON CONFLICT (event_id) DO NOTHING
                         RETURNING event_id"""
                     )
+                    dedup_insert_started = time.perf_counter()
                     inserted_event_id_rows = list(
                         (
                             await session.scalars(
@@ -1107,6 +1122,9 @@ class Database:
                                 {"claimed_at": now},
                             )
                         ).all()
+                    )
+                    self._observe_event_ingest_phase(
+                        "dedup_insert", dedup_insert_started
                     )
                     inserted_event_ids = {
                         str(event_id)
@@ -1131,6 +1149,7 @@ class Database:
                             "event-id set"
                         )
                     if inserted_payload_rows:
+                        sequence_started = time.perf_counter()
                         ingest_sequences = [
                             int(sequence)
                             for sequence in (
@@ -1157,15 +1176,27 @@ class Database:
                                 )
                             ).all()
                         ]
+                        self._observe_event_ingest_phase(
+                            "sequence", sequence_started
+                        )
+                        raw_encode_started = time.perf_counter()
+                        raw_records = _postgresql_raw_event_records(
+                            inserted_payload_rows,
+                            ingest_sequences,
+                            created_at=now,
+                        )
+                        self._observe_event_ingest_phase(
+                            "raw_encode", raw_encode_started
+                        )
+                        raw_copy_started = time.perf_counter()
                         raw_copy_status = await copy_records_to_table(
                             "raw_chain_events",
-                            records=_postgresql_raw_event_records(
-                                inserted_payload_rows,
-                                ingest_sequences,
-                                created_at=now,
-                            ),
+                            records=raw_records,
                             columns=POSTGRES_RAW_EVENT_COLUMNS,
                             schema_name="public",
+                        )
+                        self._observe_event_ingest_phase(
+                            "raw_copy", raw_copy_started
                         )
                         if raw_copy_status != (
                             f"COPY {len(inserted_payload_rows)}"
@@ -3360,6 +3391,12 @@ class Database:
         result = await session.execute(statement)
         rowcount = getattr(result, "rowcount", None)
         return isinstance(rowcount, int) and rowcount > 0
+
+    def _observe_event_ingest_phase(self, phase: str, started: float) -> None:
+        if self.metrics is not None:
+            self.metrics.postgres_event_ingest_phase_seconds.labels(
+                phase=phase
+            ).observe(time.perf_counter() - started)
 
     def _observe_query(self, started: float) -> None:
         if self.metrics is not None:

@@ -116,6 +116,13 @@ class BotMetrics:
         self.database_query_latency_ms = Histogram(
             "database_query_latency_ms", "Database query latency", registry=self.registry
         )
+        self.postgres_event_ingest_phase_seconds = Histogram(
+            "postgres_event_ingest_phase_seconds",
+            "Wall time for a fixed PostgreSQL durable event-ingest phase",
+            labelnames=("phase",),
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+            registry=self.registry,
+        )
         self.outbox_pending = Gauge(
             "outbox_pending_total", "Undelivered outbox events", registry=self.registry
         )
