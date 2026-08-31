@@ -630,6 +630,7 @@ async def _probe_event_state_batch(
         f"{wallet_prefix}{index:04x}" for index in range(len(batch))
     ]
     relation_anchor = f"CI{uuid4().hex}A"
+    context_pool = f"CI{uuid4().hex}P"
     statements: list[tuple[str, bool]] = []
     listener_attached = False
 
@@ -660,7 +661,14 @@ async def _probe_event_state_batch(
         try:
             async with database.event_state_batch_transaction():
                 for index, event in enumerate(batch):
-                    await database.update_raw_event_context(event)
+                    await database.update_raw_event_context(
+                        event.model_copy(
+                            update={
+                                "mint": token_mint,
+                                "pool_address": context_pool,
+                            }
+                        )
+                    )
                     await database.upsert_token(
                         TokenRecord(
                             mint=token_mint,
@@ -748,9 +756,13 @@ async def _probe_event_state_batch(
         raw_context_sql = raw_context_updates[0]
         required_raw_context_fragments = (
             "from jsonb_to_recordset(",
+            "requested.block_date = raw.block_date",
             "order by raw.event_id, raw.block_date",
             "for update of raw",
+            "raw.mint is distinct from requested.mint",
+            "raw.pool_address is distinct from requested.pool_address",
             "returning raw.event_id",
+            "select event_id from locked order by event_id",
         )
         if any(
             fragment not in raw_context_sql
@@ -821,6 +833,17 @@ async def _probe_event_state_batch(
                     )
                 ).all()
             )
+            raw_contexts = list(
+                (
+                    await session.execute(
+                        select(
+                            RawChainEventRow.event_id,
+                            RawChainEventRow.mint,
+                            RawChainEventRow.pool_address,
+                        ).where(RawChainEventRow.event_id.in_(event_ids))
+                    )
+                ).all()
+            )
             token = await session.get(TokenRow, token_mint)
             profiles = list(
                 (
@@ -853,6 +876,17 @@ async def _probe_event_state_batch(
         ):
             raise RuntimeError(
                 "PostgreSQL event-state batch left unresolved claims"
+            )
+        if (
+            len(raw_contexts) != len(batch)
+            or any(
+                raw_context.mint != token_mint
+                or raw_context.pool_address != context_pool
+                for raw_context in raw_contexts
+            )
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch lost changed raw context"
             )
         if token is None:
             raise RuntimeError(

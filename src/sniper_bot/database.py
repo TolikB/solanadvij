@@ -473,9 +473,14 @@ class Database:
                          AND locked.block_date = requested.block_date
                         WHERE raw.event_id = locked.event_id
                           AND raw.block_date = locked.block_date
+                          AND (
+                              raw.mint IS DISTINCT FROM requested.mint
+                              OR raw.pool_address IS DISTINCT FROM
+                                  requested.pool_address
+                          )
                         RETURNING raw.event_id
                     )
-                    SELECT event_id FROM updated ORDER BY event_id
+                    SELECT event_id FROM locked ORDER BY event_id
                     """
                 ),
                 {
