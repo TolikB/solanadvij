@@ -9,13 +9,14 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, delete, func, or_, select, text, update
+from sqlalchemy import and_, case, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import (
@@ -135,6 +136,26 @@ def _processed_prefix_condition() -> Any:
     )
 
 
+@dataclass(slots=True)
+class _PendingUpsertGroup:
+    model: Any
+    keys: tuple[str, ...]
+    rows: dict[tuple[Any, ...], dict[str, Any]] = field(
+        default_factory=dict
+    )
+
+
+@dataclass(slots=True)
+class _EventStateBatch:
+    raw_contexts: dict[str, EventEnvelope] = field(default_factory=dict)
+    processed_claims: dict[str, tuple[str, datetime]] = field(
+        default_factory=dict
+    )
+    upsert_groups: dict[
+        tuple[Any, tuple[str, ...]],
+        _PendingUpsertGroup,
+    ] = field(default_factory=dict)
+
 class Database:
     def __init__(self, dsn: str, *, metrics: BotMetrics | None = None) -> None:
         self.dsn = _async_dsn(dsn)
@@ -154,6 +175,12 @@ class Database:
             f"event_write_session_{id(self)}",
             default=None,
         )
+        self._event_state_batch: ContextVar[_EventStateBatch | None] = (
+            ContextVar(
+                f"event_state_batch_{id(self)}",
+                default=None,
+            )
+        )
 
     @asynccontextmanager
     async def event_state_transaction(self) -> AsyncIterator[None]:
@@ -169,6 +196,214 @@ class Database:
             finally:
                 self._event_write_session.reset(token)
 
+    @asynccontextmanager
+    async def event_state_batch_transaction(self) -> AsyncIterator[None]:
+        """Commit one ordered batch with coalesced secondary-state writes."""
+        if (
+            self._event_write_session.get() is not None
+            or self._event_state_batch.get() is not None
+        ):
+            raise RuntimeError("event state transactions must not be nested")
+        batch = _EventStateBatch()
+        async with self.sessions.begin() as session:
+            if (
+                session.bind is not None
+                and session.bind.dialect.name == "postgresql"
+            ):
+                await session.execute(
+                    text("SET LOCAL synchronous_commit TO OFF")
+                )
+            session_token = self._event_write_session.set(session)
+            batch_token = self._event_state_batch.set(batch)
+            try:
+                yield
+                await self._flush_event_state_batch(session, batch)
+            finally:
+                self._event_state_batch.reset(batch_token)
+                self._event_write_session.reset(session_token)
+
+    def _stage_upsert(
+        self,
+        model: Any,
+        values: dict[str, Any],
+        keys: list[str],
+    ) -> None:
+        batch = self._event_state_batch.get()
+        if batch is None:
+            raise RuntimeError("event state batch is unavailable")
+        key_tuple = tuple(keys)
+        group_key = (model, key_tuple)
+        group = batch.upsert_groups.get(group_key)
+        if group is None:
+            group = _PendingUpsertGroup(model=model, keys=key_tuple)
+            batch.upsert_groups[group_key] = group
+        identity = tuple(values[key] for key in key_tuple)
+        group.rows[identity] = dict(values)
+
+    async def _flush_event_state_batch(
+        self,
+        session: AsyncSession,
+        batch: _EventStateBatch,
+    ) -> None:
+        started = time.perf_counter()
+        dialect = (
+            session.bind.dialect.name
+            if session.bind is not None
+            else ""
+        )
+        if dialect not in {"postgresql", "sqlite"}:
+            raise RuntimeError(
+                f"unsupported event-state batch dialect: "
+                f"{dialect or 'unknown'}"
+            )
+        raw_event_ids = sorted(batch.raw_contexts)
+        for event_id_chunk in _event_id_chunks(
+            raw_event_ids,
+            dialect=dialect,
+            parameters_per_id=6,
+        ):
+            events = [
+                batch.raw_contexts[event_id]
+                for event_id in event_id_chunk
+            ]
+            result = await session.execute(
+                update(RawChainEventRow)
+                .where(
+                    or_(
+                        *[
+                            and_(
+                                RawChainEventRow.event_id
+                                == event.event_id,
+                                RawChainEventRow.block_date
+                                == event.block_time.date(),
+                            )
+                            for event in events
+                        ]
+                    )
+                )
+                .values(
+                    mint=case(
+                        {
+                            event.event_id: event.mint
+                            for event in events
+                        },
+                        value=RawChainEventRow.event_id,
+                    ),
+                    pool_address=case(
+                        {
+                            event.event_id: event.pool_address
+                            for event in events
+                        },
+                        value=RawChainEventRow.event_id,
+                    ),
+                )
+            )
+            if getattr(result, "rowcount", None) != len(events):
+                raise RuntimeError(
+                    "raw event batch context update affected "
+                    f"{getattr(result, 'rowcount', None)} rows"
+                )
+        for group in batch.upsert_groups.values():
+            await self._execute_upsert_rows(
+                session,
+                group.model,
+                list(group.rows.values()),
+                group.keys,
+            )
+        await self._execute_mark_events_processed(
+            session,
+            batch.processed_claims,
+        )
+        self._observe_query(started)
+
+    async def _execute_mark_events_processed(
+        self,
+        session: AsyncSession,
+        claims: dict[str, tuple[str, datetime]],
+    ) -> None:
+        if not claims:
+            return
+        dialect = (
+            session.bind.dialect.name
+            if session.bind is not None
+            else ""
+        )
+        if dialect not in {"postgresql", "sqlite"}:
+            raise RuntimeError(
+                f"unsupported processed-event database dialect: "
+                f"{dialect or 'unknown'}"
+            )
+        event_ids = sorted(claims)
+        for event_id_chunk in _event_id_chunks(
+            event_ids,
+            dialect=dialect,
+            parameters_per_id=3,
+            reserved_parameters=4,
+        ):
+            rows = (
+                await session.execute(
+                    select(
+                        EventDedupRow.event_id,
+                        EventDedupRow.processing_status,
+                        EventDedupRow.processing_token,
+                    )
+                    .where(
+                        EventDedupRow.event_id.in_(event_id_chunk)
+                    )
+                    .order_by(EventDedupRow.event_id)
+                    .with_for_update()
+                )
+            ).all()
+            durable_claims = {
+                str(event_id): (
+                    str(processing_status),
+                    (
+                        str(processing_token)
+                        if processing_token is not None
+                        else None
+                    ),
+                )
+                for event_id, processing_status, processing_token in rows
+            }
+            if set(durable_claims) != set(event_id_chunk) or any(
+                durable_claims[event_id]
+                != ("PROCESSING", claims[event_id][0])
+                for event_id in event_id_chunk
+            ):
+                raise RuntimeError(
+                    "event processing claim was superseded"
+                )
+            processed_at = max(
+                claims[event_id][1]
+                for event_id in event_id_chunk
+            )
+            predicates = [
+                and_(
+                    EventDedupRow.event_id == event_id,
+                    EventDedupRow.processing_status == "PROCESSING",
+                    EventDedupRow.processing_token
+                    == claims[event_id][0],
+                )
+                for event_id in event_id_chunk
+            ]
+            result = await session.execute(
+                update(EventDedupRow)
+                .where(or_(*predicates))
+                .values(
+                    processing_status="PROCESSED",
+                    processed_at=processed_at,
+                    last_attempt_at=processed_at,
+                    last_error=None,
+                    processing_token=None,
+                )
+            )
+            if (
+                getattr(result, "rowcount", None)
+                != len(event_id_chunk)
+            ):
+                raise RuntimeError(
+                    "event processing claim was superseded"
+                )
     @asynccontextmanager
     async def _write_session(self) -> AsyncIterator[AsyncSession]:
         active = self._event_write_session.get()
@@ -742,10 +977,30 @@ class Database:
         """Claim one event through the ordered batch implementation."""
         return (await self.record_events([event], reclaim=reclaim))[0]
 
-    async def mark_event_processed(self, event_id: str, *, processed_at: datetime) -> None:
+    async def mark_event_processed(
+        self,
+        event_id: str,
+        *,
+        processed_at: datetime,
+    ) -> None:
         claim_token = self._event_claim_tokens.get(event_id)
         if claim_token is None:
             raise RuntimeError("event claim token is missing")
+        batch = self._event_state_batch.get()
+        if batch is not None:
+            previous = batch.processed_claims.get(event_id)
+            if previous is not None and previous[0] != claim_token:
+                raise RuntimeError(
+                    "event processing claim was superseded"
+                )
+            batch.processed_claims[event_id] = (
+                claim_token,
+                max(
+                    processed_at,
+                    previous[1] if previous is not None else processed_at,
+                ),
+            )
+            return
         shared_transaction = self._event_write_session.get() is not None
         async with self._write_session() as session:
             result = await session.execute(
@@ -764,10 +1019,56 @@ class Database:
                 )
             )
             if getattr(result, "rowcount", None) != 1:
-                raise RuntimeError("event processing claim was superseded")
+                raise RuntimeError(
+                    "event processing claim was superseded"
+                )
         if not shared_transaction:
             self.release_event_claim(event_id)
 
+    async def mark_events_processed(
+        self,
+        event_ids: list[str],
+        *,
+        processed_at: datetime,
+    ) -> None:
+        unique_event_ids = sorted(set(event_ids))
+        if not unique_event_ids:
+            return
+        claims: dict[str, tuple[str, datetime]] = {}
+        for event_id in unique_event_ids:
+            claim_token = self._event_claim_tokens.get(event_id)
+            if claim_token is None:
+                raise RuntimeError("event claim token is missing")
+            claims[event_id] = (claim_token, processed_at)
+        batch = self._event_state_batch.get()
+        if batch is not None:
+            for event_id, claim in claims.items():
+                previous = batch.processed_claims.get(event_id)
+                if previous is not None and previous[0] != claim[0]:
+                    raise RuntimeError(
+                        "event processing claim was superseded"
+                    )
+                batch.processed_claims[event_id] = claim
+            return
+        active_session = self._event_write_session.get()
+        if active_session is not None:
+            await self._execute_mark_events_processed(
+                active_session,
+                claims,
+            )
+            return
+        async with self._event_batch_lock:
+            async with self.sessions.begin() as session:
+                await self._execute_mark_events_processed(
+                    session,
+                    claims,
+                )
+            for event_id, (claim_token, _) in claims.items():
+                if (
+                    self._event_claim_tokens.get(event_id)
+                    == claim_token
+                ):
+                    self._event_claim_tokens.pop(event_id, None)
     async def mark_events_failed(
         self,
         event_ids: list[str],
@@ -854,6 +1155,10 @@ class Database:
 
     async def update_raw_event_context(self, event: EventEnvelope) -> None:
         """Persist decoder-enriched context within the active event transaction."""
+        batch = self._event_state_batch.get()
+        if batch is not None:
+            batch.raw_contexts[event.event_id] = event
+            return
         started = time.perf_counter()
         async with self._write_session() as session:
             result = await session.execute(
@@ -2454,25 +2759,65 @@ class Database:
                 "filled_at": filled_at,
             }
 
-    async def _upsert(self, model: Any, values: dict[str, Any], keys: list[str]) -> None:
+    async def _upsert(
+        self,
+        model: Any,
+        values: dict[str, Any],
+        keys: list[str],
+    ) -> None:
+        if self._event_state_batch.get() is not None:
+            self._stage_upsert(model, values, keys)
+            return
         async with self._write_session() as session:
-            dialect = session.bind.dialect.name if session.bind is not None else ""
-            update_values = {key: value for key, value in values.items() if key not in keys}
-            if dialect == "postgresql":
-                pg_statement = pg_insert(model).values(**values)
-                pg_statement = pg_statement.on_conflict_do_update(
-                    index_elements=keys, set_=update_values
-                )
-                await session.execute(pg_statement)
-            elif dialect == "sqlite":
-                sqlite_statement = sqlite_insert(model).values(**values)
-                sqlite_statement = sqlite_statement.on_conflict_do_update(
-                    index_elements=keys, set_=update_values
-                )
-                await session.execute(sqlite_statement)
-            else:
-                await session.merge(model(**values))
+            await self._execute_upsert_rows(
+                session,
+                model,
+                [values],
+                tuple(keys),
+            )
 
+    async def _execute_upsert_rows(
+        self,
+        session: AsyncSession,
+        model: Any,
+        rows: list[dict[str, Any]],
+        keys: tuple[str, ...],
+    ) -> None:
+        if not rows:
+            return
+        dialect = (
+            session.bind.dialect.name
+            if session.bind is not None
+            else ""
+        )
+        for chunk in _bulk_insert_chunks(rows, dialect=dialect):
+            if dialect == "postgresql":
+                statement: Any = pg_insert(model).values(chunk)
+                update_values = {
+                    column: statement.excluded[column]
+                    for column in chunk[0]
+                    if column not in keys
+                }
+                statement = statement.on_conflict_do_update(
+                    index_elements=list(keys),
+                    set_=update_values,
+                )
+                await session.execute(statement)
+            elif dialect == "sqlite":
+                statement = sqlite_insert(model).values(chunk)
+                update_values = {
+                    column: statement.excluded[column]
+                    for column in chunk[0]
+                    if column not in keys
+                }
+                statement = statement.on_conflict_do_update(
+                    index_elements=list(keys),
+                    set_=update_values,
+                )
+                await session.execute(statement)
+            else:
+                for values in chunk:
+                    await session.merge(model(**values))
     async def _insert_outbox(self, session: AsyncSession, values: dict[str, Any]) -> bool:
         dialect = session.bind.dialect.name if session.bind is not None else ""
         if dialect == "postgresql":

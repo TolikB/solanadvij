@@ -470,7 +470,7 @@ async def test_pipeline_commits_claimed_batch_in_one_state_transaction(
     )
     _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
     transaction_count = 0
-    original_transaction = database.event_state_transaction
+    original_transaction = database.event_state_batch_transaction
 
     @asynccontextmanager
     async def counted_transaction():
@@ -479,7 +479,11 @@ async def test_pipeline_commits_claimed_batch_in_one_state_transaction(
         async with original_transaction():
             yield
 
-    monkeypatch.setattr(database, "event_state_transaction", counted_transaction)
+    monkeypatch.setattr(
+        database,
+        "event_state_batch_transaction",
+        counted_transaction,
+    )
 
     await _run_pipeline_batch(pipeline)
 
@@ -508,6 +512,88 @@ async def test_pipeline_commits_claimed_batch_in_one_state_transaction(
         "pipeline-batch-1",
     ]
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_archives_claims_once(tmp_path, monkeypatch) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'pipeline-archive.db'}")
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-archive", datetime(2026, 8, 25, tzinfo=timezone.utc)
+    )
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        record_raw=True,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+    archived_batches: list[list[str]] = []
+
+    async def capture_batch(batch: list[EventEnvelope]) -> None:
+        archived_batches.append([event.event_id for event in batch])
+
+    async def forbid_single_record(_event: EventEnvelope) -> None:
+        raise AssertionError("batch pipeline must not archive events one at a time")
+
+    monkeypatch.setattr(pipeline.recorder, "record_many", capture_batch)
+    monkeypatch.setattr(pipeline.recorder, "record", forbid_single_record)
+
+    try:
+        await _run_pipeline_batch(pipeline)
+
+        assert archived_batches == [[event.event_id for event in events]]
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_batch_archive_failure_fails_claims_and_poison_pipeline(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = Database(
+        f"sqlite+aiosqlite:///{tmp_path / 'pipeline-archive-failure.db'}"
+    )
+    await database.create_schema_for_tests()
+    events = _pipeline_batch_events(
+        "pipeline-archive-failure", datetime(2026, 8, 25, tzinfo=timezone.utc)
+    )
+    fatal_errors: list[BaseException] = []
+    pipeline = ConfirmationPipeline(
+        data_dir=str(tmp_path),
+        strategy_version="test",
+        config_hash="hash",
+        entry_gate=EntryGate(BotMetrics()),
+        metrics=BotMetrics(),
+        database=database,
+        fatal_handler=fatal_errors.append,
+        record_raw=True,
+    )
+    _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
+
+    async def fail_archive(_batch: list[EventEnvelope]) -> None:
+        raise OSError("simulated archive failure")
+
+    monkeypatch.setattr(pipeline.recorder, "record_many", fail_archive)
+
+    try:
+        with pytest.raises(OSError, match="simulated archive failure"):
+            await _run_pipeline_batch(pipeline)
+
+        assert len(fatal_errors) == 1
+        assert database._event_claim_tokens == {}
+        assert "event_processing_error" in pipeline.entry_gate.reasons
+        async with database.sessions() as session:
+            claims = list((await session.scalars(select(EventDedupRow))).all())
+        assert len(claims) == len(events)
+        assert all(claim.processing_status == "FAILED" for claim in claims)
+        assert all(claim.processing_token is None for claim in claims)
+    finally:
+        await database.close()
 
 
 @pytest.mark.asyncio
@@ -596,7 +682,7 @@ async def test_pipeline_batch_uncertain_commit_retains_tokens_and_poison_pipelin
         record_raw=False,
     )
     _install_pipeline_batch_decoder(monkeypatch, pipeline, events)
-    original_transaction = database.event_state_transaction
+    original_transaction = database.event_state_batch_transaction
 
     @asynccontextmanager
     async def fail_after_commit():
@@ -604,7 +690,11 @@ async def test_pipeline_batch_uncertain_commit_retains_tokens_and_poison_pipelin
             yield
         raise RuntimeError("batch commit acknowledgement failure")
 
-    monkeypatch.setattr(database, "event_state_transaction", fail_after_commit)
+    monkeypatch.setattr(
+        database,
+        "event_state_batch_transaction",
+        fail_after_commit,
+    )
 
     with pytest.raises(RuntimeError, match="batch commit acknowledgement failure"):
         await _run_pipeline_batch(pipeline)

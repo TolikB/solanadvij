@@ -8,10 +8,15 @@ import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select, update
 
-from sniper_bot.database import MAX_EVENT_BATCH_SIZE, Database
-from sniper_bot.db_models import EventDedupRow, RawChainEventRow
+from sniper_bot.database import (
+    MAX_EVENT_BATCH_SIZE,
+    SQLITE_SAFE_BOUND_PARAMETER_BUDGET,
+    Database,
+)
+from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
+from sniper_bot.records import TokenRecord
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import EntryGate, HeliusStreamGateway, TransactionItem
 
@@ -631,3 +636,228 @@ async def test_record_events_preserves_token_for_unknown_commit_phase(
             == 1
         )
     await database.close()
+
+@pytest.mark.asyncio
+async def test_event_state_batch_coalesces_upserts_and_marks_processed(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'state-batch.db'}")
+    await database.create_schema_for_tests()
+    events = [
+        _event(f"state-batch-{index:03d}", 0, slot=20_000 + index)
+        for index in range(64)
+    ]
+    statements: list[tuple[str, bool]] = []
+
+    def capture_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        executemany: bool,
+    ) -> None:
+        statements.append((" ".join(statement.lower().split()), executemany))
+
+    try:
+        assert await database.record_events(events) == [True] * len(events)
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_sql,
+        )
+        try:
+            async with database.event_state_batch_transaction():
+                for index, event in enumerate(events):
+                    await database.upsert_token(
+                        TokenRecord(
+                            mint="STATE-BATCH-TOKEN",
+                            creation_time=events[0].block_time,
+                            updated_at=event.observed_at + timedelta(milliseconds=index),
+                        )
+                    )
+                    await database.mark_event_processed(
+                        event.event_id,
+                        processed_at=event.observed_at,
+                    )
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_sql,
+            )
+
+        token_inserts = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("insert into tokens")
+        ]
+        claim_locks = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in statement
+        ]
+        claim_updates = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("update event_dedup set")
+        ]
+        assert len(statements) == 3
+        assert len(token_inserts) == 1
+        assert len(claim_locks) == 1
+        assert len(claim_updates) == 1
+        assert all(executemany is False for _, executemany in statements)
+
+        async with database.sessions() as session:
+            token = await session.get(TokenRow, "STATE-BATCH-TOKEN")
+            claims = list(
+                (
+                    await session.scalars(
+                        select(EventDedupRow).where(
+                            EventDedupRow.event_id.in_(
+                                [event.event_id for event in events]
+                            )
+                        )
+                    )
+                ).all()
+            )
+        assert token is not None
+        assert len(claims) == len(events)
+        assert all(claim.processing_status == "PROCESSED" for claim in claims)
+        assert all(claim.processing_token is None for claim in claims)
+    finally:
+        for event in events:
+            database.release_event_claim(event.event_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_event_state_batch_chunks_processed_claims_under_sqlite_budget(
+    tmp_path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'state-chunks.db'}")
+    await database.create_schema_for_tests()
+    events = [
+        _event(f"state-chunks-{index:04d}", 0, slot=30_000 + index)
+        for index in range(600)
+    ]
+    lock_parameter_counts: list[int] = []
+    update_parameter_counts: list[int] = []
+
+    def capture_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = " ".join(statement.lower().split())
+        if (
+            normalized.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in normalized
+        ):
+            lock_parameter_counts.append(len(parameters))
+        elif normalized.startswith("update event_dedup set"):
+            update_parameter_counts.append(len(parameters))
+
+    try:
+        assert await database.record_events(events) == [True] * len(events)
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_sql,
+        )
+        try:
+            async with database.event_state_batch_transaction():
+                for event in events:
+                    await database.mark_event_processed(
+                        event.event_id,
+                        processed_at=event.observed_at,
+                    )
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_sql,
+            )
+
+        assert len(lock_parameter_counts) > 1
+        assert len(update_parameter_counts) > 1
+        assert max(lock_parameter_counts) <= SQLITE_SAFE_BOUND_PARAMETER_BUDGET
+        assert max(update_parameter_counts) <= SQLITE_SAFE_BOUND_PARAMETER_BUDGET
+
+        async with database.sessions() as session:
+            processed_count = int(
+                (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(EventDedupRow)
+                        .where(EventDedupRow.processing_status == "PROCESSED")
+                    )
+                )
+                or 0
+            )
+        assert processed_count == len(events)
+    finally:
+        for event in events:
+            database.release_event_claim(event.event_id)
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_event_state_batch_superseded_claim_is_atomic(tmp_path) -> None:
+    url = f"sqlite+aiosqlite:///{tmp_path / 'state-superseded.db'}"
+    owner = Database(url)
+    competitor = Database(url)
+    await owner.create_schema_for_tests()
+    active = _event("state-active", 0, slot=40_000)
+    stale = _event("state-stale", 0, slot=40_001)
+    events = [active, stale]
+
+    try:
+        assert await owner.record_events(events) == [True, True]
+        original_tokens = dict(owner._event_claim_tokens)
+        async with owner.sessions.begin() as session:
+            stale_row = await session.get(EventDedupRow, stale.event_id)
+            assert stale_row is not None
+            stale_row.last_attempt_at = (
+                datetime.now(tz=timezone.utc) - timedelta(minutes=3)
+            )
+        assert await competitor.record_event(stale) is True
+        competitor_token = competitor._event_claim_tokens[stale.event_id]
+        assert competitor_token != original_tokens[stale.event_id]
+
+        with pytest.raises(RuntimeError, match="claim"):
+            async with owner.event_state_batch_transaction():
+                for event in events:
+                    await owner.mark_event_processed(
+                        event.event_id,
+                        processed_at=event.observed_at,
+                    )
+
+        assert owner._event_claim_tokens == original_tokens
+        async with owner.sessions() as session:
+            rows = {
+                row.event_id: row
+                for row in (
+                    await session.scalars(
+                        select(EventDedupRow).where(
+                            EventDedupRow.event_id.in_(
+                                [event.event_id for event in events]
+                            )
+                        )
+                    )
+                ).all()
+            }
+        assert rows[active.event_id].processing_status == "PROCESSING"
+        assert rows[active.event_id].processing_token == original_tokens[active.event_id]
+        assert rows[stale.event_id].processing_status == "PROCESSING"
+        assert rows[stale.event_id].processing_token == competitor_token
+    finally:
+        for event in events:
+            owner.release_event_claim(event.event_id)
+            competitor.release_event_claim(event.event_id)
+        await competitor.close()
+        await owner.close()

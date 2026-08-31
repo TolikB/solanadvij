@@ -237,7 +237,9 @@ class ConfirmationPipeline:
             if durable_accepted
         ]
         try:
-            async with database.event_state_transaction():
+            if self.record_raw:
+                await self.recorder.record_many(claimed_events)
+            async with database.event_state_batch_transaction():
                 for event, durable_accepted in zip(
                     events, durable_results, strict=True
                 ):
@@ -246,6 +248,7 @@ class ConfirmationPipeline:
                         durable_claim=durable_accepted,
                         _batch_state_transaction=True,
                         _defer_failure_cleanup=True,
+                        _raw_already_recorded=self.record_raw,
                     )
                     if durable_accepted and not processed:
                         raise RuntimeError(
@@ -286,6 +289,7 @@ class ConfirmationPipeline:
         durable_claim: bool | None = None,
         _batch_state_transaction: bool = False,
         _defer_failure_cleanup: bool = False,
+        _raw_already_recorded: bool = False,
     ) -> bool:
         self._require_consistent_state()
         original_mint = event.mint
@@ -315,7 +319,7 @@ class ConfirmationPipeline:
             return False
         requires_state_rebuild = False
         try:
-            if self.record_raw and not recovering:
+            if self.record_raw and not recovering and not _raw_already_recorded:
                 await self.recorder.record(event)
             if self.database is None:
                 await self._apply_event(

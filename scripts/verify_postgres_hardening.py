@@ -16,9 +16,10 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from sniper_bot.database import ActiveRuntimeError, Database
-from sniper_bot.db_models import EventDedupRow, RawChainEventRow
+from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource
 from sniper_bot.events import Protocol as EventProtocol
+from sniper_bot.records import TokenRecord
 
 
 class _AsyncClosable(Protocol):
@@ -96,6 +97,7 @@ async def _must_reject(
 POSTGRES_EVENT_BATCH_SIZE = 64
 POSTGRES_EVENT_BATCH_MAX_SECONDS = 1.0
 POSTGRES_EVENT_FAILURE_BATCH_MAX_SECONDS = 1.0
+POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS = 1.0
 
 
 def _event_batch(prefix: str, now: datetime, *, count: int) -> list[EventEnvelope]:
@@ -500,6 +502,168 @@ async def _probe_event_failure_batch(
             )
 
 
+async def _probe_event_state_batch(
+    database: Database,
+    now: datetime,
+) -> None:
+    batch = _event_batch(
+        f"ci-state-batch-{uuid4().hex}",
+        now,
+        count=POSTGRES_EVENT_BATCH_SIZE,
+    )
+    event_ids = [event.event_id for event in batch]
+    token_mint = f"CI{uuid4().hex}"
+    statements: list[tuple[str, bool]] = []
+    listener_attached = False
+
+    def capture_state_sql(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        executemany: bool,
+    ) -> None:
+        statements.append((" ".join(statement.lower().split()), executemany))
+
+    try:
+        accepted = await database.record_events(batch)
+        if accepted != [True] * len(batch):
+            raise RuntimeError(
+                "PostgreSQL event-state batch probe rejected a new event"
+            )
+
+        sqlalchemy_event.listen(
+            database.engine.sync_engine,
+            "before_cursor_execute",
+            capture_state_sql,
+        )
+        listener_attached = True
+        started = time.perf_counter()
+        try:
+            async with database.event_state_batch_transaction():
+                for event in batch:
+                    await database.upsert_token(
+                        TokenRecord(
+                            mint=token_mint,
+                            creation_time=now,
+                            updated_at=now,
+                        )
+                    )
+                    await database.mark_event_processed(
+                        event.event_id,
+                        processed_at=now,
+                    )
+        finally:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_state_sql,
+            )
+            listener_attached = False
+        elapsed = time.perf_counter() - started
+
+        set_local = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("set local synchronous_commit")
+        ]
+        token_inserts = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("insert into tokens")
+        ]
+        claim_locks = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("select event_dedup.event_id")
+            and "order by event_dedup.event_id" in statement
+            and "for update" in statement
+        ]
+        claim_updates = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("update event_dedup set")
+        ]
+        if (
+            len(statements) != 4
+            or len(set_local) != 1
+            or len(token_inserts) != 1
+            or len(claim_locks) != 1
+            or len(claim_updates) != 1
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch did not use the required "
+                "four-statement shape"
+            )
+        if any(executemany for _, executemany in statements):
+            raise RuntimeError(
+                "PostgreSQL event-state batch unexpectedly used executemany"
+            )
+        if elapsed > POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS:
+            raise RuntimeError(
+                "PostgreSQL event-state batch exceeded the one-second "
+                "performance budget"
+            )
+
+        async with database.sessions() as session:
+            claims = list(
+                (
+                    await session.execute(
+                        select(
+                            EventDedupRow.processing_status,
+                            EventDedupRow.processing_token,
+                        ).where(EventDedupRow.event_id.in_(event_ids))
+                    )
+                ).all()
+            )
+            token = await session.get(TokenRow, token_mint)
+        if len(claims) != len(batch):
+            raise RuntimeError(
+                "PostgreSQL event-state batch lost durable claims"
+            )
+        if any(
+            claim.processing_status != "PROCESSED"
+            or claim.processing_token is not None
+            for claim in claims
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch left unresolved claims"
+            )
+        if token is None:
+            raise RuntimeError(
+                "PostgreSQL event-state batch lost the coalesced token upsert"
+            )
+        print(
+            "POSTGRES_EVENT_STATE_BATCH_OK "
+            f"rows={len(batch)} statements={len(statements)} "
+            f"elapsed_ms={elapsed * 1000:.3f}"
+        )
+    finally:
+        if listener_attached:
+            sqlalchemy_event.remove(
+                database.engine.sync_engine,
+                "before_cursor_execute",
+                capture_state_sql,
+            )
+        for event_id in event_ids:
+            database.release_event_claim(event_id)
+        async with database.sessions.begin() as session:
+            await session.execute(
+                delete(RawChainEventRow).where(
+                    RawChainEventRow.event_id.in_(event_ids)
+                )
+            )
+            await session.execute(
+                delete(EventDedupRow).where(
+                    EventDedupRow.event_id.in_(event_ids)
+                )
+            )
+            await session.execute(
+                delete(TokenRow).where(TokenRow.mint == token_mint)
+            )
+
+
 async def main() -> None:
     dsn = os.environ.get("MIGRATION_POSTGRES_DSN", "").strip()
     _validate_probe_target(
@@ -636,6 +800,7 @@ async def main() -> None:
         active_run_id = None
         await _probe_event_batch(database, competitor, now)
         await _probe_event_failure_batch(database, competitor, now)
+        await _probe_event_state_batch(database, now)
         async with database.engine.connect() as connection:
             transaction = await connection.begin()
             try:

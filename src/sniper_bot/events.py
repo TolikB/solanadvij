@@ -133,14 +133,48 @@ class RawEventRecorder:
         return self.root / day / f"{event.protocol.value}-events-{hour}.ndjson.zst"
 
     async def record(self, event: EventEnvelope) -> Path:
-        target = self.path_for(event)
-        payload = event.model_dump_json(exclude_none=True) + "\n"
-        compressed = self._compressor.compress(payload.encode("utf-8"))
-        async with self._lock:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(_append_bytes, target, compressed)
-        return target
+        return (await self.record_many([event]))[0]
 
+    async def record_many(
+        self,
+        events: list[EventEnvelope],
+    ) -> list[Path]:
+        if not events:
+            return []
+        async with self._lock:
+            operation = asyncio.create_task(
+                asyncio.to_thread(
+                    self._record_many_sync,
+                    tuple(events),
+                )
+            )
+            cancellation: asyncio.CancelledError | None = None
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+            paths = operation.result()
+            if cancellation is not None:
+                raise cancellation
+            return paths
+
+    def _record_many_sync(
+        self,
+        events: tuple[EventEnvelope, ...],
+    ) -> list[Path]:
+        paths: list[Path] = []
+        payloads: dict[Path, bytearray] = {}
+        for event in events:
+            target = self.path_for(event)
+            paths.append(target)
+            payload = event.model_dump_json(exclude_none=True) + "\n"
+            compressed = self._compressor.compress(payload.encode("utf-8"))
+            payloads.setdefault(target, bytearray()).extend(compressed)
+        for target, payload in payloads.items():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _append_bytes(target, bytes(payload))
+        return paths
 
 class RawEventReader:
     def __init__(self, root: str | Path) -> None:

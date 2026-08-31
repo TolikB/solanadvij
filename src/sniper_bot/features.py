@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from decimal import Decimal
 from enum import StrEnum
 
@@ -133,8 +135,10 @@ class EventTimeFeatureEngine:
     def ingest_trade(self, event: TradeObservation) -> bool:
         if not self._accept(event.event_id):
             return False
-        self._trades.setdefault(event.pool_address, []).append(event)
-        self._trades[event.pool_address].sort(key=lambda item: (item.event_time, item.event_id))
+        _insert_ordered(
+            self._trades.setdefault(event.pool_address, []),
+            event,
+        )
         return True
 
     def trades(
@@ -148,15 +152,19 @@ class EventTimeFeatureEngine:
     def ingest_liquidity(self, event: LiquidityObservation) -> bool:
         if not self._accept(event.event_id):
             return False
-        self._liquidity.setdefault(event.pool_address, []).append(event)
-        self._liquidity[event.pool_address].sort(key=lambda item: (item.event_time, item.event_id))
+        _insert_ordered(
+            self._liquidity.setdefault(event.pool_address, []),
+            event,
+        )
         return True
 
     def ingest_holders(self, event: HolderObservation) -> bool:
         if not self._accept(event.event_id):
             return False
-        self._holders.setdefault(event.pool_address, []).append(event)
-        self._holders[event.pool_address].sort(key=lambda item: (item.event_time, item.event_id))
+        _insert_ordered(
+            self._holders.setdefault(event.pool_address, []),
+            event,
+        )
         return True
 
     def snapshot(self, pool_address: str, at: datetime) -> FeatureSnapshot:
@@ -284,6 +292,24 @@ class EventTimeFeatureEngine:
         self._seen.add(event_id)
         return True
 
+
+def _insert_ordered(
+    events: list[Any],
+    event: Any,
+) -> None:
+    event_key = (event.event_time, event.event_id)
+    if not events or event_key >= (
+        events[-1].event_time,
+        events[-1].event_id,
+    ):
+        events.append(event)
+        return
+    index = bisect_right(
+        events,
+        event_key,
+        key=lambda item: (item.event_time, item.event_id),
+    )
+    events.insert(index, event)
 
 def _volume(events: list[TradeObservation]) -> Decimal:
     return sum((event.volume_usd for event in events), Decimal("0"))

@@ -164,3 +164,62 @@ def test_scoring_categories_are_capped_and_organic_case_exceeds_entry_score() ->
     assert result.distribution_score <= Decimal("20")
     assert result.execution_score <= Decimal("20")
     assert result.liquidity_score <= Decimal("15")
+
+
+def _trade(
+    event_id: str,
+    at: datetime,
+    price: str,
+) -> TradeObservation:
+    return TradeObservation(
+        event_id=event_id,
+        pool_address="ORDERED-POOL",
+        event_time=at,
+        side=TradeSide.BUY,
+        wallet=event_id,
+        volume_usd=Decimal("10"),
+        price_usd=Decimal(price),
+    )
+
+
+def test_feature_engine_ordered_append_does_not_sort_existing_history() -> None:
+    class NoSortList(list):
+        def sort(self, *args, **kwargs) -> None:
+            raise AssertionError("ordered ingestion must not sort history")
+
+    engine = EventTimeFeatureEngine()
+    now = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    engine._trades["ORDERED-POOL"] = NoSortList()
+
+    assert engine.ingest_trade(_trade("first", now, "1")) is True
+    assert (
+        engine.ingest_trade(
+            _trade("second", now + timedelta(seconds=1), "2")
+        )
+        is True
+    )
+    assert [event.event_id for event in engine.trades("ORDERED-POOL")] == [
+        "first",
+        "second",
+    ]
+
+
+def test_feature_engine_out_of_order_insert_matches_ordered_snapshot() -> None:
+    now = datetime(2026, 8, 24, tzinfo=timezone.utc)
+    events = [
+        _trade("first", now, "1"),
+        _trade("second", now + timedelta(seconds=1), "2"),
+        _trade("third", now + timedelta(seconds=2), "3"),
+    ]
+    ordered = EventTimeFeatureEngine()
+    recovered = EventTimeFeatureEngine()
+    for event in events:
+        ordered.ingest_trade(event)
+    for event in reversed(events):
+        recovered.ingest_trade(event)
+
+    at = now + timedelta(seconds=3)
+    assert recovered.snapshot("ORDERED-POOL", at) == ordered.snapshot(
+        "ORDERED-POOL",
+        at,
+    )
