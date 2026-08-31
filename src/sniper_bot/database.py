@@ -366,6 +366,78 @@ class Database:
                 f"{dialect or 'unknown'}"
             )
         event_ids = sorted(claims)
+        if dialect == "postgresql":
+            processed_at = max(
+                claim_processed_at
+                for _, claim_processed_at in claims.values()
+            )
+            claim_rows = [
+                {
+                    "event_id": event_id,
+                    "processing_token": claims[event_id][0],
+                }
+                for event_id in event_ids
+            ]
+            statement = text(
+                """WITH requested AS MATERIALIZED (
+                    SELECT payload.event_id, payload.processing_token
+                    FROM jsonb_to_recordset(
+                        CAST(:claims_json AS jsonb)
+                    ) AS payload(
+                        event_id text,
+                        processing_token text
+                    )
+                ),
+                locked AS MATERIALIZED (
+                    SELECT claim.event_id
+                    FROM event_dedup AS claim
+                    JOIN requested AS requested_claim
+                      ON requested_claim.event_id = claim.event_id
+                     AND requested_claim.processing_token =
+                         claim.processing_token
+                    WHERE claim.processing_status = 'PROCESSING'
+                    ORDER BY claim.event_id
+                    FOR UPDATE OF claim
+                ),
+                updated AS (
+                    UPDATE event_dedup AS claim
+                    SET processing_status = 'PROCESSED',
+                        processed_at = :processed_at,
+                        last_attempt_at = :processed_at,
+                        last_error = NULL,
+                        processing_token = NULL
+                    FROM requested AS requested_claim
+                    JOIN locked
+                      ON locked.event_id = requested_claim.event_id
+                    WHERE claim.event_id = requested_claim.event_id
+                      AND claim.processing_status = 'PROCESSING'
+                      AND claim.processing_token =
+                          requested_claim.processing_token
+                    RETURNING claim.event_id
+                )
+                SELECT event_id
+                FROM updated
+                ORDER BY event_id"""
+            )
+            updated_event_ids = {
+                str(event_id)
+                for event_id in (
+                    await session.scalars(
+                        statement,
+                        {
+                            "claims_json": _postgresql_json_rows(
+                                claim_rows
+                            ),
+                            "processed_at": processed_at,
+                        },
+                    )
+                ).all()
+            }
+            if updated_event_ids != set(event_ids):
+                raise RuntimeError(
+                    "event processing claim was superseded"
+                )
+            return
         for event_id_chunk in _event_id_chunks(
             event_ids,
             dialect=dialect,

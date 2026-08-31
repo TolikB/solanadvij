@@ -611,28 +611,37 @@ async def _probe_event_state_batch(
             for statement, _ in statements
             if statement.startswith("insert into tokens")
         ]
-        claim_locks = [
+        claim_completions = [
             statement
             for statement, _ in statements
-            if statement.startswith("select event_dedup.event_id")
-            and "order by event_dedup.event_id" in statement
-            and "for update" in statement
-        ]
-        claim_updates = [
-            statement
-            for statement, _ in statements
-            if statement.startswith("update event_dedup set")
+            if statement.startswith("with requested as materialized")
+            and "update event_dedup as claim" in statement
         ]
         if (
-            len(statements) != 4
+            len(statements) != 3
             or len(set_local) != 1
             or len(token_inserts) != 1
-            or len(claim_locks) != 1
-            or len(claim_updates) != 1
+            or len(claim_completions) != 1
         ):
             raise RuntimeError(
                 "PostgreSQL event-state batch did not use the required "
-                "four-statement shape"
+                "three-statement shape"
+            )
+        completion_sql = claim_completions[0]
+        required_completion_fragments = (
+            "from jsonb_to_recordset(",
+            "order by claim.event_id",
+            "for update of claim",
+            "claim.processing_token = requested_claim.processing_token",
+            "returning claim.event_id",
+        )
+        if any(
+            fragment not in completion_sql
+            for fragment in required_completion_fragments
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch completion lost JSON bulk "
+                "binding, canonical locking, or claim-token fencing"
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError(
