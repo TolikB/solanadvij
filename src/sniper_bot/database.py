@@ -922,42 +922,69 @@ class Database:
                     )
 
 
-                dedup_rows = [
-                    {
-                        "event_id": event.event_id,
-                        "block_date": event.block_time.date(),
-                        "first_seen_at": event.observed_at,
-                        "processing_status": "PROCESSING",
-                        "processing_attempts": 1,
-                        "last_attempt_at": now,
-                        "processed_at": None,
-                        "last_error": None,
-                        "processing_token": claim_tokens[event.event_id],
-                    }
-                    for event in sorted(unique_events, key=lambda item: item.event_id)
-                ]
-                for chunk in _bulk_insert_chunks(dedup_rows, dialect=dialect):
-                    statement: Any
-                    if dialect == "sqlite" and len(chunk) == 1:
-                        statement = (
-                            sqlite_insert(EventDedupRow)
-                            .values(**chunk[0])
-                            .on_conflict_do_nothing(
-                                index_elements=[EventDedupRow.event_id]
+                if dialect == "postgresql":
+                    await _ensure_raw_event_partitions(
+                        session,
+                        {
+                            event.block_time.date()
+                            for event in unique_events
+                        },
+                    )
+                    payload_rows = [
+                        {
+                            "batch_order": batch_order,
+                            "raw_id": str(uuid4()),
+                            "event_id": event.event_id,
+                            "block_date": event.block_time.date(),
+                            "first_seen_at": event.observed_at,
+                            "processing_token": claim_tokens[event.event_id],
+                            "source": event.source.value,
+                            "protocol": event.protocol.value,
+                            "event_type": event.event_type.value,
+                            "slot": event.slot,
+                            "signature": event.signature,
+                            "instruction_index": event.instruction_index,
+                            "inner_instruction_index": (
+                                event.inner_instruction_index
+                            ),
+                            "block_time": event.block_time,
+                            "observed_at": event.observed_at,
+                            "commitment": event.commitment,
+                            "mint": event.mint,
+                            "pool_address": event.pool_address,
+                            "payload_json": event.payload,
+                        }
+                        for batch_order, event in enumerate(unique_events)
+                    ]
+                    insert_statement = text(
+                        """WITH payload AS MATERIALIZED (
+                            SELECT *
+                            FROM jsonb_to_recordset(
+                                CAST(:rows_json AS jsonb)
+                            ) AS incoming(
+                                batch_order integer,
+                                raw_id text,
+                                event_id text,
+                                block_date date,
+                                first_seen_at timestamptz,
+                                processing_token text,
+                                source text,
+                                protocol text,
+                                event_type text,
+                                slot bigint,
+                                signature text,
+                                instruction_index integer,
+                                inner_instruction_index integer,
+                                block_time timestamptz,
+                                observed_at timestamptz,
+                                commitment text,
+                                mint text,
+                                pool_address text,
+                                payload_json jsonb
                             )
-                        )
-                        result = await session.execute(statement)
-                        rowcount = getattr(result, "rowcount", None)
-                        if rowcount not in {0, 1}:
-                            raise RuntimeError(
-                                "single event claim returned an invalid row count"
-                            )
-                        returned_ids = (
-                            {str(chunk[0]["event_id"])} if rowcount == 1 else set()
-                        )
-                    elif dialect == "postgresql":
-                        statement = text(
-                            """INSERT INTO event_dedup (
+                        ),
+                        inserted_claims AS (
+                            INSERT INTO event_dedup (
                                 event_id,
                                 block_date,
                                 first_seen_at,
@@ -972,64 +999,170 @@ class Database:
                                 payload.event_id,
                                 payload.block_date,
                                 payload.first_seen_at,
-                                payload.processing_status,
-                                payload.processing_attempts,
-                                payload.last_attempt_at,
-                                payload.processed_at,
-                                payload.last_error,
+                                'PROCESSING',
+                                1,
+                                CAST(:claimed_at AS timestamptz),
+                                NULL,
+                                NULL,
                                 payload.processing_token
-                            FROM jsonb_to_recordset(
-                                CAST(:rows_json AS jsonb)
-                            ) AS payload(
-                                event_id text,
-                                block_date date,
-                                first_seen_at timestamptz,
-                                processing_status text,
-                                processing_attempts integer,
-                                last_attempt_at timestamptz,
-                                processed_at timestamptz,
-                                last_error text,
-                                processing_token text
-                            )
+                            FROM payload
                             ORDER BY payload.event_id
                             ON CONFLICT (event_id) DO NOTHING
-                            RETURNING event_id"""
-                        )
-                        returned_ids = {
-                            str(event_id)
-                            for event_id in (
-                                await session.scalars(
-                                    statement,
-                                    {
-                                        "rows_json": _postgresql_json_rows(
-                                            chunk
-                                        )
-                                    },
-                                )
-                            ).all()
-                        }
-                    else:
-                        statement = (
-                            sqlite_insert(EventDedupRow)
-                            .values(chunk)
-                            .on_conflict_do_nothing(
-                                index_elements=[EventDedupRow.event_id]
+                            RETURNING event_id
+                        ),
+                        inserted_raw AS (
+                            INSERT INTO raw_chain_events (
+                                id,
+                                ingest_sequence,
+                                block_date,
+                                event_id,
+                                source,
+                                protocol,
+                                event_type,
+                                slot,
+                                signature,
+                                instruction_index,
+                                inner_instruction_index,
+                                block_time,
+                                observed_at,
+                                commitment,
+                                mint,
+                                pool_address,
+                                payload_json,
+                                created_at
                             )
-                            .returning(EventDedupRow.event_id)
+                            SELECT
+                                payload.raw_id,
+                                nextval(
+                                    'raw_chain_events_ingest_sequence_seq'
+                                ),
+                                payload.block_date,
+                                payload.event_id,
+                                payload.source,
+                                payload.protocol,
+                                payload.event_type,
+                                payload.slot,
+                                payload.signature,
+                                payload.instruction_index,
+                                payload.inner_instruction_index,
+                                payload.block_time,
+                                payload.observed_at,
+                                payload.commitment,
+                                payload.mint,
+                                payload.pool_address,
+                                CAST(payload.payload_json AS json),
+                                CAST(:claimed_at AS timestamptz)
+                            FROM payload
+                            JOIN inserted_claims
+                              ON inserted_claims.event_id = payload.event_id
+                            ORDER BY payload.batch_order
+                            RETURNING event_id
                         )
-                        returned_ids = {
-                            str(event_id)
-                            for event_id in (await session.scalars(statement)).all()
-                        }
-                    chunk_ids = {str(row["event_id"]) for row in chunk}
-                    if (
-                        not returned_ids <= chunk_ids
-                        or inserted_event_ids & returned_ids
+                        SELECT
+                            inserted_claims.event_id AS claimed_event_id,
+                            inserted_raw.event_id AS raw_event_id
+                        FROM inserted_claims
+                        LEFT JOIN inserted_raw
+                          ON inserted_raw.event_id = inserted_claims.event_id
+                        ORDER BY inserted_claims.event_id"""
+                    )
+                    inserted_rows = (
+                        await session.execute(
+                            insert_statement,
+                            {
+                                "rows_json": _postgresql_json_rows(
+                                    payload_rows
+                                ),
+                                "claimed_at": now,
+                            },
+                        )
+                    ).all()
+                    if any(
+                        raw_event_id is None
+                        for _, raw_event_id in inserted_rows
                     ):
                         raise RuntimeError(
-                            "event claim insert returned an invalid event-id set"
+                            "event claim insert did not persist matching raw "
+                            "events"
                         )
-                    inserted_event_ids.update(returned_ids)
+                    inserted_event_ids = {
+                        str(event_id)
+                        for event_id, _ in inserted_rows
+                    }
+                    if len(inserted_rows) != len(inserted_event_ids):
+                        raise RuntimeError(
+                            "event claim insert returned duplicate event ids"
+                        )
+                else:
+                    dedup_rows = [
+                        {
+                            "event_id": event.event_id,
+                            "block_date": event.block_time.date(),
+                            "first_seen_at": event.observed_at,
+                            "processing_status": "PROCESSING",
+                            "processing_attempts": 1,
+                            "last_attempt_at": now,
+                            "processed_at": None,
+                            "last_error": None,
+                            "processing_token": claim_tokens[event.event_id],
+                        }
+                        for event in sorted(
+                            unique_events,
+                            key=lambda item: item.event_id,
+                        )
+                    ]
+                    for chunk in _bulk_insert_chunks(
+                        dedup_rows,
+                        dialect=dialect,
+                    ):
+                        statement: Any
+                        if len(chunk) == 1:
+                            statement = (
+                                sqlite_insert(EventDedupRow)
+                                .values(**chunk[0])
+                                .on_conflict_do_nothing(
+                                    index_elements=[EventDedupRow.event_id]
+                                )
+                            )
+                            result = await session.execute(statement)
+                            rowcount = getattr(result, "rowcount", None)
+                            if rowcount not in {0, 1}:
+                                raise RuntimeError(
+                                    "single event claim returned an invalid "
+                                    "row count"
+                                )
+                            returned_ids = (
+                                {str(chunk[0]["event_id"])}
+                                if rowcount == 1
+                                else set()
+                            )
+                        else:
+                            statement = (
+                                sqlite_insert(EventDedupRow)
+                                .values(chunk)
+                                .on_conflict_do_nothing(
+                                    index_elements=[EventDedupRow.event_id]
+                                )
+                                .returning(EventDedupRow.event_id)
+                            )
+                            returned_ids = {
+                                str(event_id)
+                                for event_id in (
+                                    await session.scalars(statement)
+                                ).all()
+                            }
+                        chunk_ids = {
+                            str(row["event_id"]) for row in chunk
+                        }
+                        if (
+                            not returned_ids <= chunk_ids
+                            or inserted_event_ids & returned_ids
+                        ):
+                            raise RuntimeError(
+                                "event claim insert returned an invalid "
+                                "event-id set"
+                            )
+                        inserted_event_ids.update(returned_ids)
 
                 if not inserted_event_ids <= unique_event_ids:
                     raise RuntimeError("event claim insert returned an unknown event id")
@@ -1102,34 +1235,21 @@ class Database:
                     for event in unique_events
                     if event.event_id in inserted_event_ids
                 ]
-                if new_events:
-                    if dialect == "postgresql":
-                        await _ensure_raw_event_partitions(
-                            session,
-                            {event.block_time.date() for event in new_events},
+                if new_events and dialect == "sqlite":
+                    last_sequence = await session.scalar(
+                        select(func.max(RawChainEventRow.ingest_sequence))
+                    )
+                    first_sequence = int(last_sequence or 0) + 1
+                    ingest_sequences = list(
+                        range(
+                            first_sequence,
+                            first_sequence + len(new_events),
                         )
-                        sequence_rows = (
-                            await session.scalars(
-                                text(
-                                    "SELECT "
-                                    "nextval('raw_chain_events_ingest_sequence_seq') "
-                                    "FROM generate_series(1, :batch_size)"
-                                ),
-                                {"batch_size": len(new_events)},
-                            )
-                        ).all()
-                        ingest_sequences = [int(value) for value in sequence_rows]
-                    else:
-                        last_sequence = await session.scalar(
-                            select(func.max(RawChainEventRow.ingest_sequence))
-                        )
-                        first_sequence = int(last_sequence or 0) + 1
-                        ingest_sequences = list(
-                            range(first_sequence, first_sequence + len(new_events))
-                        )
+                    )
                     if len(ingest_sequences) != len(new_events):
                         raise RuntimeError(
-                            "database returned an incomplete ingest-sequence allocation"
+                            "database returned an incomplete ingest-sequence "
+                            "allocation"
                         )
 
                     raw_rows = [
@@ -1156,85 +1276,21 @@ class Database:
                             "created_at": now,
                         }
                         for event, ingest_sequence in zip(
-                            new_events, ingest_sequences, strict=True
+                            new_events,
+                            ingest_sequences,
+                            strict=True,
                         )
                     ]
-                    for chunk in _bulk_insert_chunks(raw_rows, dialect=dialect):
+                    for chunk in _bulk_insert_chunks(
+                        raw_rows,
+                        dialect=dialect,
+                    ):
                         if len(chunk) == 1:
                             session.add(RawChainEventRow(**chunk[0]))
-                        elif dialect == "postgresql":
-                            raw_statement: Any = text(
-                                """INSERT INTO raw_chain_events (
-                                    id,
-                                    ingest_sequence,
-                                    block_date,
-                                    event_id,
-                                    source,
-                                    protocol,
-                                    event_type,
-                                    slot,
-                                    signature,
-                                    instruction_index,
-                                    inner_instruction_index,
-                                    block_time,
-                                    observed_at,
-                                    commitment,
-                                    mint,
-                                    pool_address,
-                                    payload_json,
-                                    created_at
-                                )
-                                SELECT
-                                    payload.id,
-                                    payload.ingest_sequence,
-                                    payload.block_date,
-                                    payload.event_id,
-                                    payload.source,
-                                    payload.protocol,
-                                    payload.event_type,
-                                    payload.slot,
-                                    payload.signature,
-                                    payload.instruction_index,
-                                    payload.inner_instruction_index,
-                                    payload.block_time,
-                                    payload.observed_at,
-                                    payload.commitment,
-                                    payload.mint,
-                                    payload.pool_address,
-                                    CAST(payload.payload_json AS json),
-                                    payload.created_at
-                                FROM jsonb_to_recordset(
-                                    CAST(:rows_json AS jsonb)
-                                ) AS payload(
-                                    id text,
-                                    ingest_sequence bigint,
-                                    block_date date,
-                                    event_id text,
-                                    source text,
-                                    protocol text,
-                                    event_type text,
-                                    slot bigint,
-                                    signature text,
-                                    instruction_index integer,
-                                    inner_instruction_index integer,
-                                    block_time timestamptz,
-                                    observed_at timestamptz,
-                                    commitment text,
-                                    mint text,
-                                    pool_address text,
-                                    payload_json jsonb,
-                                    created_at timestamptz
-                                )
-                                ORDER BY payload.ingest_sequence"""
-                            )
-                            await session.execute(
-                                raw_statement,
-                                {"rows_json": _postgresql_json_rows(chunk)},
-                            )
                         else:
-                            raw_statement = sqlite_insert(RawChainEventRow).values(
-                                chunk
-                            )
+                            raw_statement = sqlite_insert(
+                                RawChainEventRow
+                            ).values(chunk)
                             await session.execute(raw_statement)
 
             retained_event_ids = claimed_event_ids | durably_owned_event_ids

@@ -177,15 +177,12 @@ async def _probe_event_batch(
             listener_attached = False
         elapsed = time.perf_counter() - started
 
-        dedup_inserts = [
+        combined_inserts = [
             item
             for item in statements
-            if item[0].startswith("insert into event_dedup")
-        ]
-        raw_inserts = [
-            item
-            for item in statements
-            if item[0].startswith("insert into raw_chain_events")
+            if item[0].startswith("with payload as materialized")
+            and "insert into event_dedup" in item[0]
+            and "insert into raw_chain_events" in item[0]
         ]
         partition_ensures = [
             item
@@ -202,25 +199,36 @@ async def _probe_event_batch(
         if accepted != [True] * len(batch):
             raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
         if (
-            len(statements) != 4
+            len(statements) != 2
             or len(partition_ensures) != 1
-            or len(dedup_inserts) != 1
-            or len(raw_inserts) != 1
+            or len(combined_inserts) != 1
             or len(sequence_allocations) != 1
         ):
             raise RuntimeError(
-                "PostgreSQL event batch did not use the required four-statement shape"
+                "PostgreSQL event batch did not use the required "
+                "two-statement atomic shape"
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
-        dedup_sql = dedup_inserts[0][0]
-        returning_clause = dedup_sql.partition(" returning ")[2]
-        if (
-            " on conflict " not in dedup_sql
-            or returning_clause not in {"event_id", "event_dedup.event_id"}
+        combined_sql = combined_inserts[0][0]
+        required_combined_fragments = (
+            "from jsonb_to_recordset(",
+            "insert into event_dedup",
+            "order by payload.event_id",
+            "on conflict (event_id) do nothing",
+            "returning event_id",
+            "insert into raw_chain_events",
+            "nextval( 'raw_chain_events_ingest_sequence_seq' )",
+            "order by payload.batch_order",
+            "left join inserted_raw",
+        )
+        if any(
+            fragment not in combined_sql
+            for fragment in required_combined_fragments
         ):
             raise RuntimeError(
-                "PostgreSQL event claim is missing ON CONFLICT RETURNING event_id"
+                "PostgreSQL event claim/raw insert lost atomic JSON bulk "
+                "binding, canonical ordering, or ingest sequencing"
             )
         if elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS:
             raise RuntimeError(
