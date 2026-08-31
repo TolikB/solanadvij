@@ -78,6 +78,51 @@ MAX_EVENT_PROCESSING_ATTEMPTS = 3
 MAX_EVENT_BATCH_SIZE = 1024
 SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
+POSTGRES_EVENT_STAGE_TABLE = "sniper_event_ingest_stage"
+POSTGRES_EVENT_STAGE_COLUMNS = (
+    "batch_order",
+    "raw_id",
+    "event_id",
+    "block_date",
+    "first_seen_at",
+    "processing_token",
+    "source",
+    "protocol",
+    "event_type",
+    "slot",
+    "signature",
+    "instruction_index",
+    "inner_instruction_index",
+    "block_time",
+    "observed_at",
+    "commitment",
+    "mint",
+    "pool_address",
+    "payload_json",
+)
+POSTGRES_EVENT_STAGE_DDL = """
+CREATE TEMP TABLE IF NOT EXISTS sniper_event_ingest_stage (
+    batch_order integer NOT NULL,
+    raw_id text NOT NULL,
+    event_id text NOT NULL,
+    block_date date NOT NULL,
+    first_seen_at timestamptz NOT NULL,
+    processing_token text NOT NULL,
+    source text NOT NULL,
+    protocol text NOT NULL,
+    event_type text NOT NULL,
+    slot bigint NOT NULL,
+    signature text NOT NULL,
+    instruction_index integer NOT NULL,
+    inner_instruction_index integer NOT NULL,
+    block_time timestamptz NOT NULL,
+    observed_at timestamptz NOT NULL,
+    commitment text NOT NULL,
+    mint text,
+    pool_address text,
+    payload_json jsonb NOT NULL
+) ON COMMIT DELETE ROWS
+"""
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +139,35 @@ def _json_batch_default(value: object) -> str:
 
 def _postgresql_json_rows(rows: object) -> str:
     return json.dumps(rows, default=_json_batch_default, separators=(",", ":"))
+
+
+def _postgresql_event_stage_records(
+    rows: list[dict[str, Any]],
+) -> list[tuple[Any, ...]]:
+    return [
+        (
+            row["batch_order"],
+            row["raw_id"],
+            row["event_id"],
+            row["block_date"],
+            row["first_seen_at"],
+            row["processing_token"],
+            row["source"],
+            row["protocol"],
+            row["event_type"],
+            row["slot"],
+            row["signature"],
+            row["instruction_index"],
+            row["inner_instruction_index"],
+            row["block_time"],
+            row["observed_at"],
+            row["commitment"],
+            row["mint"],
+            row["pool_address"],
+            _postgresql_json_rows(row["payload_json"]),
+        )
+        for row in rows
+    ]
 
 
 def _parameter_budget(dialect: str) -> int:
@@ -956,34 +1030,33 @@ class Database:
                         }
                         for batch_order, event in enumerate(unique_events)
                     ]
+                    await session.execute(text(POSTGRES_EVENT_STAGE_DDL))
+                    await session.execute(
+                        text(
+                            "TRUNCATE TABLE "
+                            f"pg_temp.{POSTGRES_EVENT_STAGE_TABLE}"
+                        )
+                    )
+                    session_connection = await session.connection()
+                    raw_connection = (
+                        await session_connection.get_raw_connection()
+                    )
+                    copy_records_to_table = getattr(
+                        raw_connection.driver_connection,
+                        "copy_records_to_table",
+                        None,
+                    )
+                    if not callable(copy_records_to_table):
+                        raise RuntimeError(
+                            "PostgreSQL driver does not support COPY staging"
+                        )
+                    await copy_records_to_table(
+                        POSTGRES_EVENT_STAGE_TABLE,
+                        records=_postgresql_event_stage_records(payload_rows),
+                        columns=POSTGRES_EVENT_STAGE_COLUMNS,
+                    )
                     insert_statement = text(
-                        """WITH payload AS MATERIALIZED (
-                            SELECT *
-                            FROM jsonb_to_recordset(
-                                CAST(:rows_json AS jsonb)
-                            ) AS incoming(
-                                batch_order integer,
-                                raw_id text,
-                                event_id text,
-                                block_date date,
-                                first_seen_at timestamptz,
-                                processing_token text,
-                                source text,
-                                protocol text,
-                                event_type text,
-                                slot bigint,
-                                signature text,
-                                instruction_index integer,
-                                inner_instruction_index integer,
-                                block_time timestamptz,
-                                observed_at timestamptz,
-                                commitment text,
-                                mint text,
-                                pool_address text,
-                                payload_json jsonb
-                            )
-                        ),
-                        inserted_claims AS (
+                        """WITH inserted_claims AS (
                             INSERT INTO event_dedup (
                                 event_id,
                                 block_date,
@@ -1005,7 +1078,7 @@ class Database:
                                 NULL,
                                 NULL,
                                 payload.processing_token
-                            FROM payload
+                            FROM pg_temp.sniper_event_ingest_stage AS payload
                             ORDER BY payload.event_id
                             ON CONFLICT (event_id) DO NOTHING
                             RETURNING event_id
@@ -1052,7 +1125,7 @@ class Database:
                                 payload.pool_address,
                                 CAST(payload.payload_json AS json),
                                 CAST(:claimed_at AS timestamptz)
-                            FROM payload
+                            FROM pg_temp.sniper_event_ingest_stage AS payload
                             JOIN inserted_claims
                               ON inserted_claims.event_id = payload.event_id
                             ORDER BY payload.batch_order
@@ -1070,9 +1143,7 @@ class Database:
                         await session.execute(
                             insert_statement,
                             {
-                                "rows_json": _postgresql_json_rows(
-                                    payload_rows
-                                ),
+
                                 "claimed_at": now,
                             },
                         )

@@ -180,9 +180,23 @@ async def _probe_event_batch(
         combined_inserts = [
             item
             for item in statements
-            if item[0].startswith("with payload as materialized")
+            if item[0].startswith("with inserted_claims as")
             and "insert into event_dedup" in item[0]
             and "insert into raw_chain_events" in item[0]
+        ]
+        staging_creates = [
+            item
+            for item in statements
+            if item[0].startswith(
+                "create temp table if not exists sniper_event_ingest_stage"
+            )
+        ]
+        staging_truncates = [
+            item
+            for item in statements
+            if item[0].startswith(
+                "truncate table pg_temp.sniper_event_ingest_stage"
+            )
         ]
         partition_ensures = [
             item
@@ -199,20 +213,22 @@ async def _probe_event_batch(
         if accepted != [True] * len(batch):
             raise RuntimeError("PostgreSQL bulk event probe rejected a new event")
         if (
-            len(statements) != 2
+            len(statements) != 4
             or len(partition_ensures) != 1
+            or len(staging_creates) != 1
+            or len(staging_truncates) != 1
             or len(combined_inserts) != 1
             or len(sequence_allocations) != 1
         ):
             raise RuntimeError(
                 "PostgreSQL event batch did not use the required "
-                "two-statement atomic shape"
+                "transaction-local COPY staging shape"
             )
         if any(executemany for _, executemany in statements):
             raise RuntimeError("PostgreSQL event batch unexpectedly used executemany")
         combined_sql = combined_inserts[0][0]
         required_combined_fragments = (
-            "from jsonb_to_recordset(",
+            "from pg_temp.sniper_event_ingest_stage as payload",
             "insert into event_dedup",
             "order by payload.event_id",
             "on conflict (event_id) do nothing",
@@ -225,10 +241,14 @@ async def _probe_event_batch(
         if any(
             fragment not in combined_sql
             for fragment in required_combined_fragments
-        ):
+        ) or "jsonb_to_recordset" in combined_sql:
             raise RuntimeError(
-                "PostgreSQL event claim/raw insert lost atomic JSON bulk "
-                "binding, canonical ordering, or ingest sequencing"
+                "PostgreSQL event claim/raw insert lost COPY staging, "
+                "canonical ordering, or ingest sequencing"
+            )
+        if "on commit delete rows" not in staging_creates[0][0]:
+            raise RuntimeError(
+                "PostgreSQL event staging is not transaction-local"
             )
         if elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS:
             raise RuntimeError(
