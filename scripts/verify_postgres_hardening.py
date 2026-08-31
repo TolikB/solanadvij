@@ -15,11 +15,19 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from sniper_bot.clustering import WalletRelation
 from sniper_bot.database import ActiveRuntimeError, Database
-from sniper_bot.db_models import EventDedupRow, RawChainEventRow, TokenRow
+from sniper_bot.db_models import (
+    EventDedupRow,
+    RawChainEventRow,
+    TokenRow,
+    WalletProfileRow,
+    WalletRelationRow,
+)
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource
 from sniper_bot.events import Protocol as EventProtocol
 from sniper_bot.registry import TokenRecord
+from sniper_bot.wallet_analysis import WalletProfile
 
 
 class _AsyncClosable(Protocol):
@@ -551,6 +559,11 @@ async def _probe_event_state_batch(
     )
     event_ids = [event.event_id for event in batch]
     token_mint = f"CI{uuid4().hex}"
+    wallet_prefix = f"CI{uuid4().hex}"
+    wallet_addresses = [
+        f"{wallet_prefix}{index:04x}" for index in range(len(batch))
+    ]
+    relation_anchor = f"CI{uuid4().hex}A"
     statements: list[tuple[str, bool]] = []
     listener_attached = False
 
@@ -580,13 +593,33 @@ async def _probe_event_state_batch(
         started = time.perf_counter()
         try:
             async with database.event_state_batch_transaction():
-                for event in batch:
+                for index, event in enumerate(batch):
+                    await database.update_raw_event_context(event)
                     await database.upsert_token(
                         TokenRecord(
                             mint=token_mint,
                             creation_time=now,
                             updated_at=now,
                         )
+                    )
+                    await database.upsert_wallet_profile(
+                        WalletProfile(
+                            wallet_address=wallet_addresses[index],
+                            first_seen_at=now,
+                            tokens_traded=index,
+                            median_peak_return=Decimal("1.25"),
+                            profile_updated_at=now,
+                        )
+                    )
+                    await database.upsert_wallet_relation(
+                        WalletRelation(
+                            wallet_a=relation_anchor,
+                            wallet_b=wallet_addresses[index],
+                            relation_score=Decimal("0.8"),
+                            evidence=["same_slot_buying"],
+                            eligible_for_cluster=True,
+                        ),
+                        now,
                     )
                     await database.mark_event_processed(
                         event.event_id,
@@ -611,6 +644,22 @@ async def _probe_event_state_batch(
             for statement, _ in statements
             if statement.startswith("insert into tokens")
         ]
+        raw_context_updates = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("with requested as materialized")
+            and "update raw_chain_events as raw" in statement
+        ]
+        wallet_profile_inserts = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("insert into wallet_profiles")
+        ]
+        wallet_relation_inserts = [
+            statement
+            for statement, _ in statements
+            if statement.startswith("insert into wallet_relations")
+        ]
         claim_completions = [
             statement
             for statement, _ in statements
@@ -618,14 +667,56 @@ async def _probe_event_state_batch(
             and "update event_dedup as claim" in statement
         ]
         if (
-            len(statements) != 3
+            len(statements) != 6
             or len(set_local) != 1
+            or len(raw_context_updates) != 1
             or len(token_inserts) != 1
+            or len(wallet_profile_inserts) != 1
+            or len(wallet_relation_inserts) != 1
             or len(claim_completions) != 1
         ):
             raise RuntimeError(
                 "PostgreSQL event-state batch did not use the required "
-                "three-statement shape"
+                "six-statement bulk shape"
+            )
+        raw_context_sql = raw_context_updates[0]
+        required_raw_context_fragments = (
+            "from jsonb_to_recordset(",
+            "order by raw.event_id, raw.block_date",
+            "for update of raw",
+            "returning raw.event_id",
+        )
+        if any(
+            fragment not in raw_context_sql
+            for fragment in required_raw_context_fragments
+        ):
+            raise RuntimeError(
+                "PostgreSQL raw-context update lost JSON bulk binding or "
+                "canonical locking"
+            )
+        required_profile_fragments = (
+            "from jsonb_populate_recordset(",
+            "cast(null as wallet_profiles)",
+            "on conflict (wallet_address) do update",
+        )
+        if any(
+            fragment not in wallet_profile_inserts[0]
+            for fragment in required_profile_fragments
+        ):
+            raise RuntimeError(
+                "PostgreSQL wallet-profile upsert lost JSON bulk binding"
+            )
+        required_relation_fragments = (
+            "from jsonb_populate_recordset(",
+            "cast(null as wallet_relations)",
+            "on conflict (wallet_a, wallet_b) do update",
+        )
+        if any(
+            fragment not in wallet_relation_inserts[0]
+            for fragment in required_relation_fragments
+        ):
+            raise RuntimeError(
+                "PostgreSQL wallet-relation upsert lost JSON bulk binding"
             )
         completion_sql = claim_completions[0]
         required_completion_fragments = (
@@ -665,6 +756,26 @@ async def _probe_event_state_batch(
                 ).all()
             )
             token = await session.get(TokenRow, token_mint)
+            profiles = list(
+                (
+                    await session.execute(
+                        select(WalletProfileRow).where(
+                            WalletProfileRow.wallet_address.in_(
+                                wallet_addresses
+                            )
+                        )
+                    )
+                ).scalars()
+            )
+            relations = list(
+                (
+                    await session.execute(
+                        select(WalletRelationRow).where(
+                            WalletRelationRow.wallet_a == relation_anchor
+                        )
+                    )
+                ).scalars()
+            )
         if len(claims) != len(batch):
             raise RuntimeError(
                 "PostgreSQL event-state batch lost durable claims"
@@ -680,6 +791,27 @@ async def _probe_event_state_batch(
         if token is None:
             raise RuntimeError(
                 "PostgreSQL event-state batch lost the coalesced token upsert"
+            )
+        if (
+            len(profiles) != len(batch)
+            or any(
+                profile.median_peak_return != Decimal("1.25")
+                for profile in profiles
+            )
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch lost wallet profiles"
+            )
+        if (
+            len(relations) != len(batch)
+            or any(
+                relation.relation_score != Decimal("0.8")
+                or relation.relation_types_json != ["same_slot_buying"]
+                for relation in relations
+            )
+        ):
+            raise RuntimeError(
+                "PostgreSQL event-state batch lost wallet relations"
             )
         print(
             "POSTGRES_EVENT_STATE_BATCH_OK "
@@ -708,6 +840,16 @@ async def _probe_event_state_batch(
             )
             await session.execute(
                 delete(TokenRow).where(TokenRow.mint == token_mint)
+            )
+            await session.execute(
+                delete(WalletRelationRow).where(
+                    WalletRelationRow.wallet_a == relation_anchor
+                )
+            )
+            await session.execute(
+                delete(WalletProfileRow).where(
+                    WalletProfileRow.wallet_address.in_(wallet_addresses)
+                )
             )
 
 

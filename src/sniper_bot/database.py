@@ -289,52 +289,121 @@ class Database:
                 f"{dialect or 'unknown'}"
             )
         raw_event_ids = sorted(batch.raw_contexts)
-        for event_id_chunk in _event_id_chunks(
-            raw_event_ids,
-            dialect=dialect,
-            parameters_per_id=6,
-        ):
-            events = [
-                batch.raw_contexts[event_id]
-                for event_id in event_id_chunk
+        if dialect == "postgresql" and raw_event_ids:
+            raw_context_rows = [
+                {
+                    "event_id": event.event_id,
+                    "block_date": event.block_time.date(),
+                    "mint": event.mint,
+                    "pool_address": event.pool_address,
+                }
+                for event in (
+                    batch.raw_contexts[event_id]
+                    for event_id in raw_event_ids
+                )
             ]
             result = await session.execute(
-                update(RawChainEventRow)
-                .where(
-                    or_(
-                        *[
-                            and_(
-                                RawChainEventRow.event_id
-                                == event.event_id,
-                                RawChainEventRow.block_date
-                                == event.block_time.date(),
-                            )
-                            for event in events
-                        ]
+                text(
+                    """
+                    WITH requested AS MATERIALIZED (
+                        SELECT
+                            incoming.event_id,
+                            incoming.block_date,
+                            incoming.mint,
+                            incoming.pool_address
+                        FROM jsonb_to_recordset(
+                            CAST(:raw_context_rows AS jsonb)
+                        ) AS incoming(
+                            event_id text,
+                            block_date date,
+                            mint text,
+                            pool_address text
+                        )
+                    ),
+                    locked AS MATERIALIZED (
+                        SELECT raw.event_id, raw.block_date
+                        FROM raw_chain_events AS raw
+                        JOIN requested
+                          ON requested.event_id = raw.event_id
+                         AND requested.block_date = raw.block_date
+                        ORDER BY raw.event_id, raw.block_date
+                        FOR UPDATE OF raw
+                    ),
+                    updated AS (
+                        UPDATE raw_chain_events AS raw
+                        SET
+                            mint = requested.mint,
+                            pool_address = requested.pool_address
+                        FROM requested
+                        JOIN locked
+                          ON locked.event_id = requested.event_id
+                         AND locked.block_date = requested.block_date
+                        WHERE raw.event_id = locked.event_id
+                          AND raw.block_date = locked.block_date
+                        RETURNING raw.event_id
+                    )
+                    SELECT event_id FROM updated ORDER BY event_id
+                    """
+                ),
+                {
+                    "raw_context_rows": _postgresql_json_rows(
+                        raw_context_rows
+                    )
+                },
+            )
+            updated_event_ids = list(result.scalars())
+            if updated_event_ids != raw_event_ids:
+                raise RuntimeError(
+                    "raw event batch context update returned an unexpected "
+                    "event-id set"
+                )
+        elif raw_event_ids:
+            for event_id_chunk in _event_id_chunks(
+                raw_event_ids,
+                dialect=dialect,
+                parameters_per_id=6,
+            ):
+                events = [
+                    batch.raw_contexts[event_id]
+                    for event_id in event_id_chunk
+                ]
+                result = await session.execute(
+                    update(RawChainEventRow)
+                    .where(
+                        or_(
+                            *[
+                                and_(
+                                    RawChainEventRow.event_id
+                                    == event.event_id,
+                                    RawChainEventRow.block_date
+                                    == event.block_time.date(),
+                                )
+                                for event in events
+                            ]
+                        )
+                    )
+                    .values(
+                        mint=case(
+                            {
+                                event.event_id: event.mint
+                                for event in events
+                            },
+                            value=RawChainEventRow.event_id,
+                        ),
+                        pool_address=case(
+                            {
+                                event.event_id: event.pool_address
+                                for event in events
+                            },
+                            value=RawChainEventRow.event_id,
+                        ),
                     )
                 )
-                .values(
-                    mint=case(
-                        {
-                            event.event_id: event.mint
-                            for event in events
-                        },
-                        value=RawChainEventRow.event_id,
-                    ),
-                    pool_address=case(
-                        {
-                            event.event_id: event.pool_address
-                            for event in events
-                        },
-                        value=RawChainEventRow.event_id,
-                    ),
-                )
-            )
-            if getattr(result, "rowcount", None) != len(events):
-                raise RuntimeError(
-                    "raw event batch context update affected "
-                    f"{getattr(result, 'rowcount', None)} rows"
-                )
+                if getattr(result, "rowcount", None) != len(events):
+                    raise RuntimeError(
+                        "raw event batch context update affected "
+                        f"{getattr(result, 'rowcount', None)} rows"
+                    )
         for group in batch.upsert_groups.values():
             await self._execute_upsert_rows(
                 session,
@@ -3035,6 +3104,14 @@ class Database:
         )
         for chunk in _bulk_insert_chunks(rows, dialect=dialect):
             if dialect == "postgresql":
+                if model in (WalletProfileRow, WalletRelationRow):
+                    await self._execute_postgresql_json_upsert_rows(
+                        session,
+                        model,
+                        chunk,
+                        keys,
+                    )
+                    continue
                 statement: Any = pg_insert(model).values(chunk)
                 update_values = {
                     column: statement.excluded[column]
@@ -3061,6 +3138,70 @@ class Database:
             else:
                 for values in chunk:
                     await session.merge(model(**values))
+
+    async def _execute_postgresql_json_upsert_rows(
+        self,
+        session: AsyncSession,
+        model: Any,
+        rows: list[dict[str, Any]],
+        keys: tuple[str, ...],
+    ) -> None:
+        bind = session.bind
+        if bind is None or bind.dialect.name != "postgresql":
+            raise RuntimeError(
+                "PostgreSQL JSON upsert requires a PostgreSQL session"
+            )
+        if not rows:
+            return
+        table = model.__table__
+        columns = tuple(rows[0])
+        known_columns = set(table.columns.keys())
+        if (
+            not columns
+            or not keys
+            or not set(keys).issubset(columns)
+            or not set(columns).issubset(known_columns)
+        ):
+            raise RuntimeError("invalid PostgreSQL JSON upsert shape")
+        if any(set(row) != set(columns) for row in rows):
+            raise RuntimeError(
+                "PostgreSQL JSON upsert rows have inconsistent columns"
+            )
+
+        preparer = bind.dialect.identifier_preparer
+        table_name = preparer.format_table(table)
+        quote = preparer.quote
+        column_sql = ", ".join(quote(column) for column in columns)
+        select_sql = ", ".join(
+            f"incoming.{quote(column)}" for column in columns
+        )
+        key_sql = ", ".join(quote(key) for key in keys)
+        update_columns = [column for column in columns if column not in keys]
+        if update_columns:
+            conflict_action = "DO UPDATE SET " + ", ".join(
+                f"{quote(column)} = EXCLUDED.{quote(column)}"
+                for column in update_columns
+            )
+        else:
+            conflict_action = "DO NOTHING"
+        payload = [
+            {column: row[column] for column in columns}
+            for row in rows
+        ]
+        await session.execute(
+            text(
+                f"""
+                INSERT INTO {table_name} ({column_sql})
+                SELECT {select_sql}
+                FROM jsonb_populate_recordset(
+                    CAST(NULL AS {table_name}),
+                    CAST(:upsert_rows AS jsonb)
+                ) AS incoming
+                ON CONFLICT ({key_sql}) {conflict_action}
+                """
+            ),
+            {"upsert_rows": _postgresql_json_rows(payload)},
+        )
     async def _insert_outbox(self, session: AsyncSession, values: dict[str, Any]) -> bool:
         dialect = session.bind.dialect.name if session.bind is not None else ""
         if dialect == "postgresql":
