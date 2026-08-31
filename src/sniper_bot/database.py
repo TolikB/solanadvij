@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -79,6 +80,20 @@ SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
 
 logger = logging.getLogger(__name__)
+
+
+def _json_batch_default(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(
+        f"unsupported PostgreSQL JSON batch value: {type(value).__name__}"
+    )
+
+
+def _postgresql_json_rows(rows: object) -> str:
+    return json.dumps(rows, default=_json_batch_default, separators=(",", ":"))
 
 
 def _parameter_budget(dialect: str) -> int:
@@ -800,17 +815,57 @@ class Database:
                             {str(chunk[0]["event_id"])} if rowcount == 1 else set()
                         )
                     elif dialect == "postgresql":
-                        statement = (
-                            pg_insert(EventDedupRow)
-                            .values(chunk)
-                            .on_conflict_do_nothing(
-                                index_elements=[EventDedupRow.event_id]
+                        statement = text(
+                            """INSERT INTO event_dedup (
+                                event_id,
+                                block_date,
+                                first_seen_at,
+                                processing_status,
+                                processing_attempts,
+                                last_attempt_at,
+                                processed_at,
+                                last_error,
+                                processing_token
                             )
-                            .returning(EventDedupRow.event_id)
+                            SELECT
+                                payload.event_id,
+                                payload.block_date,
+                                payload.first_seen_at,
+                                payload.processing_status,
+                                payload.processing_attempts,
+                                payload.last_attempt_at,
+                                payload.processed_at,
+                                payload.last_error,
+                                payload.processing_token
+                            FROM jsonb_to_recordset(
+                                CAST(:rows_json AS jsonb)
+                            ) AS payload(
+                                event_id text,
+                                block_date date,
+                                first_seen_at timestamptz,
+                                processing_status text,
+                                processing_attempts integer,
+                                last_attempt_at timestamptz,
+                                processed_at timestamptz,
+                                last_error text,
+                                processing_token text
+                            )
+                            ORDER BY payload.event_id
+                            ON CONFLICT (event_id) DO NOTHING
+                            RETURNING event_id"""
                         )
                         returned_ids = {
                             str(event_id)
-                            for event_id in (await session.scalars(statement)).all()
+                            for event_id in (
+                                await session.scalars(
+                                    statement,
+                                    {
+                                        "rows_json": _postgresql_json_rows(
+                                            chunk
+                                        )
+                                    },
+                                )
+                            ).all()
                         }
                     else:
                         statement = (
@@ -967,10 +1022,74 @@ class Database:
                         if len(chunk) == 1:
                             session.add(RawChainEventRow(**chunk[0]))
                         elif dialect == "postgresql":
-                            raw_statement: Any = pg_insert(RawChainEventRow).values(
-                                chunk
+                            raw_statement: Any = text(
+                                """INSERT INTO raw_chain_events (
+                                    id,
+                                    ingest_sequence,
+                                    block_date,
+                                    event_id,
+                                    source,
+                                    protocol,
+                                    event_type,
+                                    slot,
+                                    signature,
+                                    instruction_index,
+                                    inner_instruction_index,
+                                    block_time,
+                                    observed_at,
+                                    commitment,
+                                    mint,
+                                    pool_address,
+                                    payload_json,
+                                    created_at
+                                )
+                                SELECT
+                                    payload.id,
+                                    payload.ingest_sequence,
+                                    payload.block_date,
+                                    payload.event_id,
+                                    payload.source,
+                                    payload.protocol,
+                                    payload.event_type,
+                                    payload.slot,
+                                    payload.signature,
+                                    payload.instruction_index,
+                                    payload.inner_instruction_index,
+                                    payload.block_time,
+                                    payload.observed_at,
+                                    payload.commitment,
+                                    payload.mint,
+                                    payload.pool_address,
+                                    CAST(payload.payload_json AS json),
+                                    payload.created_at
+                                FROM jsonb_to_recordset(
+                                    CAST(:rows_json AS jsonb)
+                                ) AS payload(
+                                    id text,
+                                    ingest_sequence bigint,
+                                    block_date date,
+                                    event_id text,
+                                    source text,
+                                    protocol text,
+                                    event_type text,
+                                    slot bigint,
+                                    signature text,
+                                    instruction_index integer,
+                                    inner_instruction_index integer,
+                                    block_time timestamptz,
+                                    observed_at timestamptz,
+                                    commitment text,
+                                    mint text,
+                                    pool_address text,
+                                    payload_json jsonb,
+                                    created_at timestamptz
+                                )
+                                ORDER BY payload.ingest_sequence"""
                             )
-                            await session.execute(raw_statement)
+                            await session.execute(
+                                raw_statement,
+                                {"rows_json": _postgresql_json_rows(chunk)},
+                            )
                         else:
                             raw_statement = sqlite_insert(RawChainEventRow).values(
                                 chunk
