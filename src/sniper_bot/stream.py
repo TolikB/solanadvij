@@ -1214,10 +1214,14 @@ class HeliusStreamGateway:
         return not stale and baseline_ready
 
     def _sync_queue_depth(self) -> None:
+        processing_depth = self._queue.qsize()
+        notification_depth = self._notification_queue.qsize()
+        dispatch_depth = len(self._log_fetch_tasks)
+        self.metrics.event_processing_queue_depth.set(processing_depth)
+        self.metrics.event_notification_queue_depth.set(notification_depth)
+        self.metrics.event_log_dispatch_tasks.set(dispatch_depth)
         self.metrics.event_queue_depth.set(
-            self._queue.qsize()
-            + self._notification_queue.qsize()
-            + len(self._log_fetch_tasks)
+            processing_depth + notification_depth + dispatch_depth
         )
 
 

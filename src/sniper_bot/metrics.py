@@ -35,6 +35,40 @@ class BotMetrics:
         self.event_queue_depth = Gauge(
             "event_queue_depth", "Pending events in the processing queue", registry=self.registry
         )
+        self.event_notification_queue_depth = Gauge(
+            "event_notification_queue_depth",
+            "Pending WebSocket notifications awaiting ordered dispatch",
+            registry=self.registry,
+        )
+        self.event_log_dispatch_tasks = Gauge(
+            "event_log_dispatch_tasks",
+            "Ordered Solana log dispatch tasks awaiting completion",
+            registry=self.registry,
+        )
+        self.event_processing_queue_depth = Gauge(
+            "event_processing_queue_depth",
+            "Transactions awaiting ordered pipeline processing",
+            registry=self.registry,
+        )
+        self.chain_transaction_batch_size = Histogram(
+            "chain_transaction_batch_size",
+            "Transactions received by one ordered pipeline batch",
+            buckets=(1, 8, 32, 64, 128, 256, 512),
+            registry=self.registry,
+        )
+        self.chain_decoded_event_batch_size = Histogram(
+            "chain_decoded_event_batch_size",
+            "Decoded events in one durable persistence batch",
+            buckets=(1, 8, 32, 64, 128, 256, 512, 1024),
+            registry=self.registry,
+        )
+        self.chain_batch_phase_seconds = Histogram(
+            "chain_batch_phase_seconds",
+            "Wall time for a bounded ordered chain batch phase",
+            labelnames=("phase",),
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
+            registry=self.registry,
+        )
         self.candidate_count = Gauge(
             "candidate_count", "Current candidates", registry=self.registry
         )

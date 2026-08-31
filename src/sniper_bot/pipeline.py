@@ -201,6 +201,9 @@ class ConfirmationPipeline:
         transactions: list[tuple[Protocol, dict[str, Any], EventSource]],
     ) -> None:
         self._require_consistent_state()
+        loop = asyncio.get_running_loop()
+        decode_started = loop.time()
+        self.metrics.chain_transaction_batch_size.observe(len(transactions))
         event_batches: list[list[EventEnvelope]] = []
         current_batch: list[EventEnvelope] = []
         for transaction_index, (protocol, transaction, source) in enumerate(
@@ -231,6 +234,9 @@ class ConfirmationPipeline:
             current_batch.extend(decoded_events)
             if transaction_index % EVENT_LOOP_YIELD_INTERVAL == 0:
                 await asyncio.sleep(0)
+        self.metrics.chain_batch_phase_seconds.labels(phase="decode").observe(
+            loop.time() - decode_started
+        )
         if current_batch:
             event_batches.append(current_batch)
         for events in event_batches:
@@ -240,11 +246,19 @@ class ConfirmationPipeline:
         self,
         events: list[EventEnvelope],
     ) -> None:
-        durable_results = (
-            await self.database.record_events(events, resume_owned=True)
-            if self.database
-            else [True] * len(events)
-        )
+        loop = asyncio.get_running_loop()
+        self.metrics.chain_decoded_event_batch_size.observe(len(events))
+        durable_started = loop.time()
+        try:
+            durable_results = (
+                await self.database.record_events(events, resume_owned=True)
+                if self.database
+                else [True] * len(events)
+            )
+        finally:
+            self.metrics.chain_batch_phase_seconds.labels(
+                phase="durable_claim"
+            ).observe(loop.time() - durable_started)
         claimed_count = sum(1 for accepted in durable_results if accepted)
         if self.database is None or claimed_count < 2:
             for event, durable_accepted in zip(events, durable_results, strict=True):
@@ -267,25 +281,37 @@ class ConfirmationPipeline:
         ]
         try:
             if self.record_raw:
-                await self.recorder.record_many(claimed_events)
-            async with database.event_state_batch_transaction():
-                for event_index, (event, durable_accepted) in enumerate(
-                    zip(events, durable_results, strict=True),
-                    start=1,
-                ):
-                    processed = await self.process_event(
-                        event,
-                        durable_claim=durable_accepted,
-                        _batch_state_transaction=True,
-                        _defer_failure_cleanup=True,
-                        _raw_already_recorded=self.record_raw,
-                    )
-                    if durable_accepted and not processed:
-                        raise RuntimeError(
-                            "durably claimed batch event was rejected by local deduplication"
+                archive_started = asyncio.get_running_loop().time()
+                try:
+                    await self.recorder.record_many(claimed_events)
+                finally:
+                    self.metrics.chain_batch_phase_seconds.labels(
+                        phase="raw_archive"
+                    ).observe(asyncio.get_running_loop().time() - archive_started)
+            state_started = asyncio.get_running_loop().time()
+            try:
+                async with database.event_state_batch_transaction():
+                    for event_index, (event, durable_accepted) in enumerate(
+                        zip(events, durable_results, strict=True),
+                        start=1,
+                    ):
+                        processed = await self.process_event(
+                            event,
+                            durable_claim=durable_accepted,
+                            _batch_state_transaction=True,
+                            _defer_failure_cleanup=True,
+                            _raw_already_recorded=self.record_raw,
                         )
-                    if event_index % EVENT_LOOP_YIELD_INTERVAL == 0:
-                        await asyncio.sleep(0)
+                        if durable_accepted and not processed:
+                            raise RuntimeError(
+                                "durably claimed batch event was rejected by local deduplication"
+                            )
+                        if event_index % EVENT_LOOP_YIELD_INTERVAL == 0:
+                            await asyncio.sleep(0)
+            finally:
+                self.metrics.chain_batch_phase_seconds.labels(
+                    phase="state_commit"
+                ).observe(asyncio.get_running_loop().time() - state_started)
         except BaseException as error:
             self._poison_state()
             try:
