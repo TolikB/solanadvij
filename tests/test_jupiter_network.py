@@ -63,7 +63,9 @@ def _install_client(
             assert isinstance(outcome, _Response)
             return outcome
 
-    factory: Callable[..., _Client] = lambda *_args, **_kwargs: _Client()
+    def factory(*_args: object, **_kwargs: object) -> _Client:
+        return _Client()
+
     monkeypatch.setattr("sniper_bot.jupiter.httpx.AsyncClient", factory)
 
 

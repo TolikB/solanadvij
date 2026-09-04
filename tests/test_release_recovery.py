@@ -40,6 +40,10 @@ def _event(signature: str, *, sequence: int | None = None) -> EventEnvelope:
     )
 
 
+def _glob(root: Path, pattern: str) -> list[Path]:
+    return list(root.rglob(pattern))
+
+
 def _metric(rendered: str, name: str, stage: str) -> float:
     match = re.search(
         rf'^{re.escape(name)}\{{stage="{stage}"\}} ([0-9.eE+-]+)$',
@@ -139,8 +143,12 @@ async def test_atomic_archive_rename_failure_leaves_no_segment(
     with pytest.raises(OSError, match="fault injection"):
         await recorder.write_segments([_event("rename", sequence=1)])
 
-    assert list(tmp_path.rglob("*.ndjson.zst")) == []
-    assert list(tmp_path.rglob("*.tmp")) == []
+    assert await asyncio.to_thread(
+        _glob,
+        tmp_path,
+        "*.ndjson.zst",
+    ) == []
+    assert await asyncio.to_thread(_glob, tmp_path, "*.tmp") == []
 
 
 @pytest.mark.asyncio

@@ -7,11 +7,11 @@ import pytest
 
 from sniper_bot.registry import SUPPORTED_QUOTE_MINTS
 from sniper_bot.security import (
+    SPL_TOKEN_PROGRAM_ID,
     ExecutionChecks,
     HolderMetrics,
     MintInfo,
     RejectReason,
-    SPL_TOKEN_PROGRAM_ID,
     SecurityContext,
     SecurityEngine,
 )
