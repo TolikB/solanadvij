@@ -23,11 +23,15 @@ from sniper_bot.stream import EntryGate, HeliusStreamGateway, TransactionItem
 
 
 def _event(
-    signature: str, instruction_index: int, *, slot: int | None = None
+    signature: str,
+    instruction_index: int,
+    *,
+    slot: int | None = None,
+    source: EventSource = EventSource.REPLAY,
 ) -> EventEnvelope:
     now = datetime(2026, 8, 25, tzinfo=timezone.utc)
     return EventEnvelope(
-        source=EventSource.REPLAY,
+        source=source,
         protocol=Protocol.PUMPSWAP,
         event_type=ChainEventType.SWAP_BUY,
         slot=slot if slot is not None else 100 + instruction_index,
@@ -257,8 +261,18 @@ async def test_checkpoints_stop_before_processing_order_hole(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'prefix-hole.db'}")
     await database.create_schema_for_tests()
     events = [
-        _event("unresolved-first", 0, slot=500),
-        _event("processed-second", 0, slot=500),
+        _event(
+            "unresolved-first",
+            0,
+            slot=500,
+            source=EventSource.HELIUS_WSS,
+        ),
+        _event(
+            "processed-second",
+            0,
+            slot=500,
+            source=EventSource.HELIUS_WSS,
+        ),
     ]
     assert await database.record_events(events) == [True, True]
     async with database.event_state_transaction():
@@ -426,8 +440,12 @@ async def test_record_events_canonical_locking_handles_reversed_overlap(
         timeout=1,
     )
 
-    assert sorted(results) == [[False, False], [True, True]]
-    winner = forward if results[0] == [True, True] else reverse
+    accepted_results = [
+        [bool(item) for item in batch]
+        for batch in results
+    ]
+    assert sorted(accepted_results) == [[False, False], [True, True]]
+    winner = forward if accepted_results[0] == [True, True] else reverse
     async with database.sessions() as session:
         rows = list(
             (

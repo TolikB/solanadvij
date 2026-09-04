@@ -4038,7 +4038,6 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
         capital = report.get("capital") or {}
         signals = report.get("signals") or {}
         trades = report.get("trades") or {}
-        execution = report.get("execution_quality") or {}
         exits = report.get("exit_reasons") or {}
         starting = _report_decimal(
             capital.get("starting_equity_usd")
@@ -4079,18 +4078,6 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
             f"збиткових {_report_int(trades.get('losing'))}\n"
             f"Частка прибуткових: "
             f"{_format_percent(trades.get('win_rate'))}\n"
-            f"Сигнали: нових пулів "
-            f"{_report_int(signals.get('new_pools'))}, "
-            f"перевірено токенів "
-            f"{_report_int(signals.get('tokens_checked'))}, "
-            f"жорстких відмов "
-            f"{_report_int(signals.get('hard_rejects'))}\n"
-            "Якість виконання: середній вплив купівлі "
-            f"{_format_percent(execution.get('average_buy_impact_pct'))}, "
-            "продажу "
-            f"{_format_percent(execution.get('average_sell_impact_pct'))}, "
-            "затримка котирування "
-            f"{_report_int(execution.get('average_quote_latency_ms'))} мс\n"
             f"Причини виходу: {exit_summary}\n"
             f"Відкриті позиції: {open_count}"
         )

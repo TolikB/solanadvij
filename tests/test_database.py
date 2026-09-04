@@ -60,9 +60,11 @@ def test_daily_telegram_report_is_human_readable_and_trade_only() -> None:
         "Результат дня: +$12.34\n"
         "Закритий PnL: +$10.00\n"
         "Відкритий PnL: +$2.34\n"
+        "Економічний результат: $0.00\n"
         "Угоди: відкрито 3, закрито 2\n"
         "Результати: прибуткових 1, збиткових 1\n"
         "Частка прибуткових: 50.0%\n"
+        "Причини виходу: немає\n"
         "Відкриті позиції: 1"
     )
     assert "strategy" not in text
@@ -97,7 +99,7 @@ async def test_database_event_and_outbox_idempotency(tmp_path) -> None:
     await database.upsert_token(token)
     await database.upsert_pool(pool)
     event = EventEnvelope(
-        source=EventSource.REPLAY,
+        source=EventSource.HELIUS_WSS,
         protocol=Protocol.PUMPSWAP,
         event_type=ChainEventType.POOL_CREATED,
         slot=1,

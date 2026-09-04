@@ -105,7 +105,8 @@ async def test_event_deduplication_and_raw_zstd_round_trip(tmp_path) -> None:
     assert await dedupe.accept(event.event_id) is False
     assert dedupe.duplicates_total == 1
     path = await recorder.record(event)
-    assert path.name == "pump-events-12.ndjson.zst"
+    assert path.name.startswith("pump-events-12-legacy-")
+    assert path.name.endswith(".ndjson.zst")
 
     restored = list(RawEventReader(tmp_path).iter_events())
     assert restored == [event]
@@ -147,21 +148,29 @@ async def test_raw_event_batch_writes_once_per_partition_and_round_trips(
         EventEnvelope.model_validate(second_payload),
         EventEnvelope.model_validate(third_payload),
     ]
-    append_calls: list[Path] = []
+    write_calls: list[Path] = []
     thread_calls = 0
-    original_append = events_module._append_bytes
+    original_write = events_module._write_atomic_segment
     original_to_thread = events_module.asyncio.to_thread
 
-    def counted_append(path: Path, payload: bytes) -> None:
-        append_calls.append(path)
-        original_append(path, payload)
+    def counted_write(
+        path: Path,
+        payload: bytes,
+        checksum_sha256: str,
+    ) -> None:
+        write_calls.append(path)
+        original_write(path, payload, checksum_sha256)
 
     async def counted_to_thread(function, *args):
         nonlocal thread_calls
         thread_calls += 1
         return await original_to_thread(function, *args)
 
-    monkeypatch.setattr(events_module, "_append_bytes", counted_append)
+    monkeypatch.setattr(
+        events_module,
+        "_write_atomic_segment",
+        counted_write,
+    )
     monkeypatch.setattr(
         events_module.asyncio,
         "to_thread",
@@ -171,12 +180,12 @@ async def test_raw_event_batch_writes_once_per_partition_and_round_trips(
     paths = await RawEventRecorder(tmp_path).record_many(events)
 
     assert thread_calls == 1
-    assert len(append_calls) == 2
-    assert paths == [
-        tmp_path / "2026-08-24" / "pump-events-12.ndjson.zst",
-        tmp_path / "2026-08-24" / "pump-events-12.ndjson.zst",
-        tmp_path / "2026-08-24" / "pump-events-13.ndjson.zst",
-    ]
+    assert len(write_calls) == 2
+    assert paths == write_calls
+    assert paths[0].parent == tmp_path / "2026-08-24"
+    assert paths[1].parent == tmp_path / "2026-08-24"
+    assert paths[0].name.startswith("pump-events-12-legacy-")
+    assert paths[1].name.startswith("pump-events-13-legacy-")
     assert list(RawEventReader(tmp_path).iter_events()) == events
 
 @pytest.mark.asyncio
@@ -208,7 +217,11 @@ async def test_raw_event_recorder_holds_lock_until_cancelled_write_finishes(
     active_writers = 0
     max_active_writers = 0
 
-    def blocked_append(path: Path, _payload: bytes) -> None:
+    def blocked_write(
+        path: Path,
+        _payload: bytes,
+        _checksum_sha256: str,
+    ) -> None:
         nonlocal active_writers, max_active_writers
         with state_lock:
             calls.append(path)
@@ -224,7 +237,11 @@ async def test_raw_event_recorder_holds_lock_until_cancelled_write_finishes(
             with state_lock:
                 active_writers -= 1
 
-    monkeypatch.setattr(events_module, "_append_bytes", blocked_append)
+    monkeypatch.setattr(
+        events_module,
+        "_write_atomic_segment",
+        blocked_write,
+    )
     recorder = RawEventRecorder(tmp_path)
     first_task = asyncio.create_task(recorder.record_many([raw_event("first")]))
     second_task: asyncio.Task[list[Path]] | None = None
