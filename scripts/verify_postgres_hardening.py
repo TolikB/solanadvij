@@ -350,7 +350,14 @@ async def _probe_event_batch(
             ),
             timeout=5,
         )
-        if sorted(race_results) != [[False, False], [True, True]]:
+        accepted_race_results = [
+            [bool(item) for item in batch]
+            for batch in race_results
+        ]
+        if sorted(accepted_race_results) != [
+            [False, False],
+            [True, True],
+        ]:
             raise RuntimeError(
                 "PostgreSQL reversed-overlap event race was not exactly-once"
             )
