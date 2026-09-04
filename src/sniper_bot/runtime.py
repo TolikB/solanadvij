@@ -469,48 +469,9 @@ class SniperRuntime:
 
     def build_daily_report(self, date: str | None = None) -> dict[str, object]:
         return self.report_builder.daily(date)
-        date = date or self._today_key()
-        snapshot = self.ledger.snapshot()
-        open_positions = self._open_positions_snapshot()
-        reconciled = self._normalize_report_payload(self.ledger.reconcile())
-        report = {
-            "period": "daily",
-            "date": date,
-            "timezone": self.config.time_zone,
-            "config_hash": snapshot["config_hash"],
-            "strategy_version": snapshot["strategy_version"],
-            "equity_usd": self._normalize_value(snapshot["equity_usd"]),
-            "realized_pnl_usd": self._normalize_value(snapshot["realized_pnl_usd"]),
-            "unrealized_pnl_usd": self._normalize_value(snapshot["unrealized_pnl_usd"]),
-            "pnl": self._normalize_value(self.ledger.daily_pnl(date)),
-            "sample_size_warning": self._is_sample_size_low(date),
-            "operational_costs_usd": "0",
-            "reconcile": reconciled,
-            "open_positions": open_positions,
-        }
-        report["report_id"] = self._report_id(report)
-        return report
 
     def build_all_time_report(self) -> dict[str, object]:
         return self.report_builder.all_time()
-        snapshot = self.ledger.snapshot()
-        open_positions = self._open_positions_snapshot()
-        report = {
-            "period": "all_time",
-            "date": "all_time",
-            "timezone": self.config.time_zone,
-            "config_hash": snapshot["config_hash"],
-            "strategy_version": snapshot["strategy_version"],
-            "equity_usd": self._normalize_value(snapshot["equity_usd"]),
-            "realized_pnl_usd": self._normalize_value(snapshot["realized_pnl_usd"]),
-            "unrealized_pnl_usd": self._normalize_value(snapshot["unrealized_pnl_usd"]),
-            "pnl": self._normalize_value(self.ledger.reconcile()["realized_pnl_usd"]),
-            "operational_costs_usd": "0",
-            "reconcile": self._normalize_report_payload(self.ledger.reconcile()),
-            "open_positions": open_positions,
-        }
-        report["report_id"] = self._report_id(report)
-        return report
 
     async def build_all_time_report_with_history(self) -> dict[str, object]:
         maximum = None
@@ -1340,7 +1301,7 @@ class SniperRuntime:
                 self.ledger.set_daily_halt(
                     self.ledger.current_date_key(now), "DAILY_LOSS_LIMIT"
                 )
-            if self.database is not None and (
+            if self.database is not None and self.database_available and (
                 self.drawdown_exceeded() or self.daily_loss_exceeded()
             ):
                 await self.database.persist_risk_state(
