@@ -112,7 +112,7 @@ class SniperRuntime:
                 exit_retry_timeout_seconds=config.paper.exit_retry_timeout_seconds,
             )
         self.notifier: NoopTelegramNotifier | TelegramNotifier
-        if config.replay_mode:
+        if config.replay_mode or not config.telegram.enabled:
             self.notifier = NoopTelegramNotifier()
         else:
             self.notifier = TelegramNotifier(
@@ -122,7 +122,11 @@ class SniperRuntime:
                 user_allowlist=config.telegram_allowlist_user_ids,
             )
         self.outbox_worker: TelegramOutboxWorker | None = None
-        if self.database is not None and not config.replay_mode:
+        if (
+            self.database is not None
+            and not config.replay_mode
+            and config.telegram.enabled
+        ):
             self.outbox_worker = TelegramOutboxWorker(
                 self.database,
                 self.notifier,
@@ -167,6 +171,16 @@ class SniperRuntime:
             handler=self.pipeline.process_transaction,
             batch_handler=self.pipeline.process_transactions,
             fatal_handler=self._request_fatal_restart,
+            gap_handler=(
+                self.database.record_stream_recovery_gap
+                if self.database is not None
+                else None
+            ),
+            gap_resolved_handler=(
+                self.database.resolve_stream_recovery_gaps
+                if self.database is not None
+                else None
+            ),
             entry_gate=self.entry_gate,
             metrics=self.metrics,
             max_processing_lag_seconds=(
@@ -174,6 +188,8 @@ class SniperRuntime:
             ),
         )
         self.report_builder = ReportBuilder(self)
+        self.manages_lifecycle_notifications = True
+        self._lifecycle_start_sent = False
         self.retention = RawRetentionManager(
             self.data_dir / "raw", config.storage.raw_retention_days
         )
@@ -275,10 +291,14 @@ class SniperRuntime:
                         + 60,
                     )
                 )
-                for event in await self.database.load_processed_events_since(recovery_since):
-                    self.stream_gateway.restore_protocol_checkpoint(
-                        event.protocol, event.signature
-                    )
+                for event in await self.database.load_processed_events_since(
+                    recovery_since
+                ):
+                    if event.source != EventSource.REPLAY:
+                        self.stream_gateway.restore_protocol_checkpoint(
+                            event.protocol,
+                            event.signature,
+                        )
                     if event.event_id in bootstrap_event_ids:
                         continue
                     if await self.pipeline.rehydrate_event(event):
@@ -331,8 +351,8 @@ class SniperRuntime:
                     await self.database.release_runtime_lease()
                 except Exception:
                     logger.exception("failed to release runtime lease after startup failure")
-                if isinstance(exc, (ActiveRuntimeError, RecoveryStateError)):
-                    raise
+                raise
+        await self.pipeline.start_background_workers()
         if self.outbox_worker is not None and self.database_available:
             await self.outbox_worker.start()
         if "event_quarantine" not in self.entry_gate.reasons:
@@ -346,11 +366,17 @@ class SniperRuntime:
             asyncio.create_task(self._freshness_loop(), name="freshness-loop"),
             asyncio.create_task(self._quote_asset_loop(), name="quote-asset-loop"),
             asyncio.create_task(self._enrichment_loop(), name="enrichment-loop"),
-            asyncio.create_task(self._daily_report_loop(), name="daily-report-loop"),
             asyncio.create_task(self._maintenance_loop(), name="maintenance-loop"),
             asyncio.create_task(self._heartbeat_loop(), name="heartbeat-loop"),
             asyncio.create_task(self._warmup(), name="warmup"),
         ]
+        if self.config.telegram.enabled:
+            self._background_tasks.append(
+                asyncio.create_task(
+                    self._daily_report_loop(),
+                    name="daily-report-loop",
+                )
+            )
         self._install_signal_controls()
         from sniper_bot.process_identity import write_process_identity_file
 
@@ -413,6 +439,23 @@ class SniperRuntime:
         if not self.entry_gate.enabled:
             return "DEGRADED"
         return "HEALTHY"
+
+    async def wait_until_ready(
+        self,
+        *,
+        timeout_seconds: float = 120.0,
+    ) -> bool:
+        deadline = (
+            asyncio.get_running_loop().time() + timeout_seconds
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            if (
+                self.health_status() == "HEALTHY"
+                and self.config.app_mode != AppMode.LIVE
+            ):
+                return True
+            await asyncio.sleep(0.25)
+        return False
 
     def _sync_paper_metrics(self) -> None:
         snapshot = self.ledger.snapshot()
@@ -554,7 +597,55 @@ class SniperRuntime:
                 },
             )
             return report if inserted else None
-        report = self.report_builder.daily(target, capital_bounds=capital_bounds)
+        report = self.report_builder.daily(
+            target,
+            capital_bounds=capital_bounds,
+        )
+        if (
+            self.database is not None
+            and self.database_available
+            and hasattr(
+                self.database,
+                "load_daily_trading_summary",
+            )
+        ):
+            start_utc = datetime.fromisoformat(
+                str(report["period_start_utc"])
+            )
+            end_utc = datetime.fromisoformat(
+                str(report["period_end_utc"])
+            )
+            summary = (
+                await self.database.load_daily_trading_summary(
+                    start_utc=start_utc,
+                    end_utc=end_utc,
+                )
+            )
+            report["signals"] = summary["signals"]
+            report_trades = dict(report.get("trades") or {})
+            report_trades.update(summary["trades"])
+            report["trades"] = report_trades
+            execution = dict(
+                report.get("execution_quality") or {}
+            )
+            execution.update(summary["execution_quality"])
+            report["execution_quality"] = execution
+            report["exit_reasons"] = summary["exit_reasons"]
+            report["rejections"] = summary["rejections"]
+            report["open_positions"] = summary["open_positions"]
+            capital = dict(report.get("capital") or {})
+            capital["realized_pnl_usd"] = summary[
+                "realized_pnl_usd"
+            ]
+            capital["simulated_costs_usd"] = summary[
+                "simulated_costs_usd"
+            ]
+            report["capital"] = capital
+            report["realized_pnl_usd"] = summary[
+                "realized_pnl_usd"
+            ]
+            report["pnl"] = summary["realized_pnl_usd"]
+            report["report_id"] = self._report_id(report)
         all_time_report = None
         if send and self.database is not None and self.database_available:
             inserted = await self.database.store_daily_report(
@@ -662,6 +753,14 @@ class SniperRuntime:
         self._background_tasks = []
         if not self.config.replay_mode:
             await self.stream_gateway.stop()
+        await self.pipeline.stop_background_workers(
+            timeout_seconds=120.0
+        )
+        if self.config.telegram.enabled:
+            await self._notify_lifecycle_alert(
+                "system_stop",
+                "Бот зупинено.",
+            )
         if self.outbox_worker is not None:
             drained = await self.outbox_worker.drain(timeout_seconds=5.0)
             if not drained:
@@ -1324,6 +1423,8 @@ class SniperRuntime:
     ) -> None:
         if event_type not in {"system_start", "system_stop"}:
             raise ValueError("unsupported Telegram lifecycle event type")
+        if not self.config.telegram.enabled:
+            return
         if self.database is not None and self.database_available:
             run_id = self._system_run_id or "unregistered"
             try:
@@ -1350,6 +1451,8 @@ class SniperRuntime:
             )
 
     async def _notify_daily_report(self, report: dict[str, Any]) -> bool:
+        if not self.config.telegram.enabled:
+            return False
         notifier = getattr(self, "notifier", None)
         if notifier is None or not hasattr(notifier, "send"):
             return False

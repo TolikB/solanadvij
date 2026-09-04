@@ -114,7 +114,7 @@ jobs:
           printf '%s compose_config\n' "$GITHUB_SHA" > ci-gates/compose_config.ok
 
       - name: Docker image build
-        run: docker build --tag solana-sniper-ci .
+        run: docker build --build-arg APP_REVISION="$GITHUB_SHA" --tag solana-sniper-ci .
 
       - name: Docker Compose startup smoke
         shell: bash
@@ -155,6 +155,7 @@ jobs:
             exit 1
           fi
           test "$(docker compose --env-file .env exec -T sniper-bot printenv APP_REVISION)" = "$GITHUB_SHA"
+          test "$(docker compose --env-file .env exec -T sniper-bot cat /app/REVISION)" = "$GITHUB_SHA"
           test "$(docker compose --env-file .env exec -T sniper-bot id -u)" != "0"
           test "$(docker compose --env-file .env port sniper-bot 8080)" = "127.0.0.1:8080"
           printf '%s docker_startup\n' "$GITHUB_SHA" > ci-gates/docker_startup.ok

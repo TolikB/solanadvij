@@ -123,6 +123,36 @@ class BotMetrics:
             buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5),
             registry=self.registry,
         )
+        self.ingestion_backlog_events = Gauge(
+            "ingestion_backlog_events",
+            "Queued events by ordered processing stage",
+            ["stage"],
+            registry=self.registry,
+        )
+        self.ingestion_oldest_event_age_seconds = Gauge(
+            "ingestion_oldest_event_age_seconds",
+            "Age of the oldest queued event by stage",
+            ["stage"],
+            registry=self.registry,
+        )
+        self.stream_recovery_gap_active = Gauge(
+            "stream_recovery_gap_active",
+            "One while a provider stream gap remains unresolved",
+            registry=self.registry,
+        )
+        self.ingestion_events_dropped = Counter(
+            "ingestion_events_dropped_total",
+            "Events rejected before durable persistence",
+            ["stage"],
+            registry=self.registry,
+        )
+        self.shutdown_drain_seconds = Histogram(
+            "shutdown_drain_seconds",
+            "Graceful drain duration by queue stage",
+            ["stage"],
+            buckets=(0.01, 0.1, 0.5, 1, 5, 15, 30, 60, 120),
+            registry=self.registry,
+        )
         self.outbox_pending = Gauge(
             "outbox_pending_total", "Undelivered outbox events", registry=self.registry
         )

@@ -2,6 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ARG APP_REVISION
+RUN case "$APP_REVISION" in *[!0-9a-f]*|'') exit 1 ;; esac; \
+    test "${#APP_REVISION}" -eq 40; \
+    printf '%s\n' "$APP_REVISION" > /app/REVISION
+LABEL org.opencontainers.image.revision=$APP_REVISION
+
 RUN groupadd --system sniper && useradd --system --gid sniper --create-home --home-dir /app sniper
 
 RUN pip install --no-cache-dir uv==0.12.5

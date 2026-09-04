@@ -1,6 +1,9 @@
 services:
   migrate:
-    build: .
+    build:
+      context: .
+      args:
+        APP_REVISION: ${APP_REVISION:?APP_REVISION is required}
     environment:
       MIGRATION_POSTGRES_DSN: ${MIGRATION_POSTGRES_DSN:?MIGRATION_POSTGRES_DSN is required}
       SNIPER_DB_USER: ${SNIPER_DB_USER:?SNIPER_DB_USER is required}
@@ -11,7 +14,11 @@ services:
     restart: "no"
 
   sniper-bot:
-    build: .
+    build:
+      context: .
+      args:
+        APP_REVISION: ${APP_REVISION:?APP_REVISION is required}
+    stop_grace_period: 180s
     environment:
       APP_MODE: ${APP_MODE:?APP_MODE is required}
       APP_REVISION: ${APP_REVISION:?APP_REVISION is required}

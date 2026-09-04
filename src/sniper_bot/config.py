@@ -120,7 +120,7 @@ class ExitConfig(BaseModel):
 
 class TelegramConfig(BaseModel):
     enabled: bool = True
-    daily_report_time: str = "00:05"
+    daily_report_time: str = "00:00"
     include_all_time_with_daily: bool = False
 
     @field_validator("daily_report_time")
@@ -314,6 +314,17 @@ class AppConfig(BaseSettings):
     def validate_mode_and_hash(self) -> "AppConfig":
         if self.app_mode == AppMode.LIVE:
             raise LiveTradingNotImplementedError()
+        revision_file = Path(
+            os.environ.get("APP_REVISION_FILE", "/app/REVISION")
+        )
+        if self.release_revision and revision_file.is_file():
+            image_revision = (
+                revision_file.read_text(encoding="ascii").strip().lower()
+            )
+            if image_revision != self.release_revision:
+                raise ValueError(
+                    "APP_REVISION does not match immutable image revision"
+                )
         if (self.replay_mode or self.quote_journal_record) and not self.quote_journal_path:
             raise ValueError(
                 "JUPITER_QUOTE_JOURNAL_PATH must be set when replay or record is enabled"

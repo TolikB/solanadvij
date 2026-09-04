@@ -24,6 +24,8 @@ TransactionItem = tuple[Protocol, dict[str, Any], EventSource]
 TransactionHandler = Callable[[Protocol, dict[str, Any], EventSource], Awaitable[None]]
 TransactionBatchHandler = Callable[[list[TransactionItem]], Awaitable[None]]
 FatalHandler = Callable[[BaseException], None]
+GapHandler = Callable[[str], Awaitable[None]]
+GapResolvedHandler = Callable[[], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -114,8 +116,9 @@ class HeliusStreamGateway:
     LOG_FETCH_CONCURRENCY = 20
     SLOT_BLOCK_TIME_CACHE_SIZE = 512
     BLOCK_TIME_RETRY_DELAYS = (0.25, 0.5, 1.0)
-    PROCESSING_BATCH_SIZE = 512
-    PROCESSING_BATCH_WINDOW_SECONDS = 0.05
+    PROCESSING_BATCH_SIZE = 1024
+    PROCESSING_BATCH_WINDOW_SECONDS = 0.02
+    SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 120.0
     PROCESSING_RETRY_LIMIT = 3
     PROCESSING_RETRY_DELAYS = (1, 2)
 
@@ -129,6 +132,8 @@ class HeliusStreamGateway:
         metrics: BotMetrics,
         batch_handler: TransactionBatchHandler | None = None,
         fatal_handler: FatalHandler | None = None,
+        gap_handler: GapHandler | None = None,
+        gap_resolved_handler: GapResolvedHandler | None = None,
         queue_size: int = 2000,
         max_processing_lag_seconds: float = 3.0,
         log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
@@ -145,6 +150,8 @@ class HeliusStreamGateway:
         self.handler = handler
         self.batch_handler = batch_handler
         self.fatal_handler = fatal_handler
+        self.gap_handler = gap_handler
+        self.gap_resolved_handler = gap_resolved_handler
         self.entry_gate = entry_gate
         self.metrics = metrics
         self.last_slot = 0
@@ -193,6 +200,7 @@ class HeliusStreamGateway:
         self._last_signatures[protocol] = signature
 
     async def stop(self) -> None:
+        started = asyncio.get_running_loop().time()
         self._stopping.set()
         if self._run_task is not None:
             self._run_task.cancel()
@@ -201,6 +209,28 @@ class HeliusStreamGateway:
             except asyncio.CancelledError:
                 pass
             self._run_task = None
+        try:
+            async with asyncio.timeout(
+                self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+            ):
+                await self._notification_queue.join()
+                if self._log_fetch_tasks:
+                    await asyncio.gather(
+                        *tuple(self._log_fetch_tasks)
+                    )
+        except TimeoutError as exc:
+            self.entry_gate.block("stream_recovery_gap")
+            self.metrics.stream_recovery_gap_active.set(1)
+            raise RuntimeError(
+                "Solana ingress queues did not drain within "
+                f"{self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
+        finally:
+            self.metrics.shutdown_drain_seconds.labels(
+                stage="stream_ingress"
+            ).observe(
+                asyncio.get_running_loop().time() - started
+            )
         await self._cancel_log_fetch_tasks()
         if self._worker_task is not None:
             worker_task = self._worker_task
@@ -256,35 +286,37 @@ class HeliusStreamGateway:
                         pending_handshake_messages.extend(buffered)
                         recovered: list[tuple[Protocol, dict[str, Any], EventSource]] = []
                         if self.last_slot:
-                            if self._checkpoint_is_recent():
-                                try:
-                                    recovered, pending_handshake_messages = (
-                                        await self._recover_gap_with_live_buffer(
-                                            websocket,
-                                            pending_handshake_messages,
-                                        )
+                            try:
+                                recovered, pending_handshake_messages = (
+                                    await self._recover_gap_with_live_buffer(
+                                        websocket,
+                                        pending_handshake_messages,
                                     )
-                                except _GapRecoveryTimeout as exc:
-                                    logger.warning(str(exc))
-                                    pending_handshake_messages.clear()
-                                    self._discard_in_memory_checkpoint()
-                                    self.metrics.websocket_reconnects.inc()
-                                    continue
-                            else:
-                                logger.warning(
-                                    "Solana checkpoint is stale; "
-                                    "starting a new non-tradable live baseline"
                                 )
-                                self._discard_in_memory_checkpoint()
+                            except _GapRecoveryTimeout as exc:
+                                logger.warning(str(exc))
+                                pending_handshake_messages.clear()
+                                self.entry_gate.block(
+                                    "stream_recovery_gap"
+                                )
+                                self.metrics.stream_recovery_gap_active.set(1)
+                                if self.gap_handler is not None:
+                                    await self.gap_handler(
+                                        "recovery_timeout"
+                                    )
+                                self.metrics.websocket_reconnects.inc()
+                                continue
                         if recovered:
-                            if self._commit_recovered_events(recovered):
-                                self.metrics.websocket_gap_recoveries.inc()
-                            else:
-                                logger.warning(
-                                    "Solana recovery batch exceeded queue capacity; "
-                                    "starting a new non-tradable live baseline"
-                                )
-                                self._discard_in_memory_checkpoint()
+                            await self._commit_recovered_events(recovered)
+                            self.metrics.websocket_gap_recoveries.inc()
+                        if self.last_slot:
+                            self._dispatch_recovery_pending = False
+                            self.entry_gate.unblock(
+                                "stream_recovery_gap"
+                            )
+                            self.metrics.stream_recovery_gap_active.set(0)
+                            if self.gap_resolved_handler is not None:
+                                await self.gap_resolved_handler()
                         dispatched_messages = 0
                         try:
                             for message in pending_handshake_messages:
@@ -310,7 +342,8 @@ class HeliusStreamGateway:
                             await self.handle_message(json.loads(raw_message))
                     finally:
                         self.entry_gate.block("stream_disconnected")
-                        await self._cancel_log_fetch_tasks()
+                        if not self._stopping.is_set():
+                            await self._cancel_log_fetch_tasks()
             except _UseLogsFallback as exc:
                 if not self._extend_handshake_buffer(
                     pending_handshake_messages, exc.buffered_messages
@@ -590,6 +623,9 @@ class HeliusStreamGateway:
                 "Solana notification ingress queue overflow"
             )
             self._dispatch_recovery_pending = True
+            self.metrics.ingestion_events_dropped.labels(
+                stage="notification"
+            ).inc()
             self.entry_gate.block("stream_fetch_error")
             self._reconnect_requested.set()
             if self.fatal_handler is not None:
@@ -886,17 +922,13 @@ class HeliusStreamGateway:
             dispatch_task.cancel()
             await asyncio.gather(dispatch_task, return_exceptions=True)
             self._notification_dispatch_task = None
-        while True:
-            try:
-                self._notification_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            else:
-                self._notification_queue.task_done()
-
     async def _cancel_log_fetch_tasks(self) -> None:
         await self._cancel_notification_dispatcher()
         fetch_tasks = tuple(self._log_fetch_tasks)
+        if fetch_tasks or not self._notification_queue.empty():
+            self._dispatch_recovery_pending = True
+            self.entry_gate.block("stream_recovery_gap")
+            self.metrics.stream_recovery_gap_active.set(1)
         for task in fetch_tasks:
             task.cancel()
         if fetch_tasks:
@@ -972,13 +1004,10 @@ class HeliusStreamGateway:
         self._last_signatures.clear()
         self._begin_live_baseline()
 
-    def _commit_recovered_events(
+    async def _commit_recovered_events(
         self,
         recovered: list[tuple[Protocol, dict[str, Any], EventSource]],
-    ) -> bool:
-        available = self._queue.maxsize - self._queue.qsize()
-        if len(recovered) > available:
-            return False
+    ) -> None:
         for protocol, transaction, source in recovered:
             signature = _transaction_signature(transaction)
             slot = int(transaction.get("slot", 0))
@@ -986,9 +1015,8 @@ class HeliusStreamGateway:
             self.last_signature = signature or self.last_signature
             if signature:
                 self._last_signatures[protocol] = signature
-            self._queue.put_nowait((protocol, transaction, source))
+            await self._queue.put((protocol, transaction, source))
         self._sync_queue_depth()
-        return True
 
     async def _recover_gap_with_live_buffer(
         self,
@@ -1015,7 +1043,7 @@ class HeliusStreamGateway:
                 if remaining <= 0:
                     raise _GapRecoveryTimeout(
                         "Solana gap recovery timed out; "
-                        "starting a new non-tradable live baseline",
+                        "checkpoint retained; retrying fail-closed",
                         buffered,
                     )
                 done, _ = await asyncio.wait(
@@ -1026,7 +1054,7 @@ class HeliusStreamGateway:
                 if not done:
                     raise _GapRecoveryTimeout(
                         "Solana gap recovery timed out; "
-                        "starting a new non-tradable live baseline",
+                        "checkpoint retained; retrying fail-closed",
                         buffered,
                     )
                 if receive_task in done:
@@ -1034,7 +1062,7 @@ class HeliusStreamGateway:
                     if len(buffered) > self.SUBSCRIPTION_MESSAGE_BUFFER_LIMIT:
                         raise _GapRecoveryTimeout(
                             "Solana live buffer overflow during gap recovery; "
-                            "starting a new non-tradable live baseline",
+                            "checkpoint retained; retrying fail-closed",
                             buffered,
                         )
                     receive_task = asyncio.create_task(

@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import zstandard
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -44,6 +47,7 @@ class ChainEventType(StrEnum):
 
 class EventEnvelope(BaseModel):
     event_id: str = ""
+    ingest_sequence: int | None = Field(default=None, ge=1)
     source: EventSource
     network: str = "solana-mainnet"
     protocol: Protocol
@@ -119,8 +123,18 @@ class EventDeduplicator:
             self._seen.pop(event_id, None)
 
 
+@dataclass(frozen=True, slots=True)
+class RawArchiveSegment:
+    path: Path
+    start_sequence: int
+    end_sequence: int
+    event_count: int
+    checksum_sha256: str
+    protocol: Protocol
+
+
 class RawEventRecorder:
-    """Append each event as an independent zstd frame in date/hour partitions."""
+    """Write immutable, checksummed zstd segments with atomic publication."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -130,23 +144,32 @@ class RawEventRecorder:
     def path_for(self, event: EventEnvelope) -> Path:
         day = event.block_time.strftime("%Y-%m-%d")
         hour = event.block_time.strftime("%H")
+        if event.ingest_sequence is not None:
+            sequence = f"{event.ingest_sequence:020d}"
+            return (
+                self.root
+                / day
+                / hour
+                / event.protocol.value
+                / f"{sequence}-{sequence}.ndjson.zst"
+            )
         return self.root / day / f"{event.protocol.value}-events-{hour}.ndjson.zst"
 
     async def record(self, event: EventEnvelope) -> Path:
         return (await self.record_many([event]))[0]
 
-    async def record_many(
+    async def record_many(self, events: list[EventEnvelope]) -> list[Path]:
+        return [segment.path for segment in await self.write_segments(events)]
+
+    async def write_segments(
         self,
         events: list[EventEnvelope],
-    ) -> list[Path]:
+    ) -> list[RawArchiveSegment]:
         if not events:
             return []
         async with self._lock:
             operation = asyncio.create_task(
-                asyncio.to_thread(
-                    self._record_many_sync,
-                    tuple(events),
-                )
+                asyncio.to_thread(self._write_segments_sync, tuple(events))
             )
             cancellation: asyncio.CancelledError | None = None
             while not operation.done():
@@ -154,27 +177,81 @@ class RawEventRecorder:
                     await asyncio.shield(operation)
                 except asyncio.CancelledError as error:
                     cancellation = cancellation or error
-            paths = operation.result()
+            segments = operation.result()
             if cancellation is not None:
                 raise cancellation
-            return paths
+            return segments
 
-    def _record_many_sync(
+    def _write_segments_sync(
         self,
         events: tuple[EventEnvelope, ...],
-    ) -> list[Path]:
-        paths: list[Path] = []
-        payloads: dict[Path, bytearray] = {}
+    ) -> list[RawArchiveSegment]:
+        grouped: dict[tuple[str, str, Protocol], list[EventEnvelope]] = {}
         for event in events:
-            target = self.path_for(event)
-            paths.append(target)
-            serialized = event.model_dump_json(exclude_none=True) + "\n"
-            compressed = self._compressor.compress(serialized.encode("utf-8"))
-            payloads.setdefault(target, bytearray()).extend(compressed)
-        for target, archive_payload in payloads.items():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _append_bytes(target, bytes(archive_payload))
-        return paths
+            key = (
+                event.block_time.strftime("%Y-%m-%d"),
+                event.block_time.strftime("%H"),
+                event.protocol,
+            )
+            grouped.setdefault(key, []).append(event)
+
+        segments: list[RawArchiveSegment] = []
+        for (day, hour, protocol), grouped_events in grouped.items():
+            sequenced = all(
+                event.ingest_sequence is not None for event in grouped_events
+            )
+            if sequenced:
+                ordered = sorted(
+                    grouped_events,
+                    key=lambda event: int(event.ingest_sequence or 0),
+                )
+                start_sequence = int(ordered[0].ingest_sequence or 0)
+                end_sequence = int(ordered[-1].ingest_sequence or 0)
+                target = (
+                    self.root
+                    / day
+                    / hour
+                    / protocol.value
+                    / f"{start_sequence:020d}-{end_sequence:020d}.ndjson.zst"
+                )
+            elif any(
+                event.ingest_sequence is not None for event in grouped_events
+            ):
+                raise ValueError(
+                    "raw archive batch cannot mix sequenced and legacy events"
+                )
+            else:
+                ordered = list(grouped_events)
+                start_sequence = 0
+                end_sequence = 0
+                identity = hashlib.sha256(
+                    "".join(event.event_id for event in ordered).encode("ascii")
+                ).hexdigest()[:16]
+                target = (
+                    self.root
+                    / day
+                    / f"{protocol.value}-events-{hour}-legacy-{identity}.ndjson.zst"
+                )
+
+            serialized = "".join(
+                event.model_dump_json(exclude_none=True) + "\n"
+                for event in ordered
+            ).encode("utf-8")
+            compressed = self._compressor.compress(serialized)
+            checksum = hashlib.sha256(compressed).hexdigest()
+            _write_atomic_segment(target, compressed, checksum)
+            segments.append(
+                RawArchiveSegment(
+                    path=target,
+                    start_sequence=start_sequence,
+                    end_sequence=end_sequence,
+                    event_count=len(ordered),
+                    checksum_sha256=checksum,
+                    protocol=protocol,
+                )
+            )
+        return segments
+
 
 class RawEventReader:
     def __init__(self, root: str | Path) -> None:
@@ -183,7 +260,7 @@ class RawEventReader:
     def iter_events(self) -> Iterator[EventEnvelope]:
         if not self.root.exists():
             return
-        for path in sorted(self.root.glob("*/*-events-*.ndjson.zst")):
+        for path in sorted(self.root.rglob("*.ndjson.zst")):
             yield from _read_zstd_events(path)
 
     async def events(self) -> AsyncIterator[EventEnvelope]:
@@ -191,10 +268,33 @@ class RawEventReader:
             yield event
 
 
-def _append_bytes(path: Path, payload: bytes) -> None:
-    with path.open("ab") as stream:
-        stream.write(payload)
-        stream.flush()
+def _write_atomic_segment(
+    path: Path,
+    payload: bytes,
+    checksum_sha256: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        existing_checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+        if existing_checksum != checksum_sha256:
+            raise RuntimeError("raw archive segment identity collision")
+        return
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _read_zstd_events(path: Path) -> Iterator[EventEnvelope]:

@@ -68,7 +68,7 @@ class SystemRunRow(Base):
 class EventDedupRow(Base):
     __tablename__ = "event_dedup"
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    block_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    block_date: Mapped[date] = mapped_column(Date, nullable=False)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     processing_status: Mapped[str] = mapped_column(
         String(16),
@@ -91,8 +91,20 @@ class RawChainEventRow(Base):
         UniqueConstraint("event_id", "block_date", name="uq_raw_event_partition"),
         Index("ix_raw_chain_events_slot", "slot"),
         Index("ix_raw_chain_events_signature", "signature"),
-        Index("ix_raw_chain_events_mint_time", "mint", "block_time"),
-        Index("ix_raw_chain_events_pool_time", "pool_address", "block_time"),
+        Index(
+            "ix_raw_chain_events_mint_sequence",
+            "mint",
+            "ingest_sequence",
+            postgresql_where=text("mint IS NOT NULL"),
+            sqlite_where=text("mint IS NOT NULL"),
+        ),
+        Index(
+            "ix_raw_chain_events_pool_sequence",
+            "pool_address",
+            "ingest_sequence",
+            postgresql_where=text("pool_address IS NOT NULL"),
+            sqlite_where=text("pool_address IS NOT NULL"),
+        ),
         {"postgresql_partition_by": "RANGE (block_date)"},
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -477,6 +489,77 @@ class ReplayRunRow(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class StreamProtocolCheckpointRow(Base):
+    __tablename__ = "stream_protocol_checkpoints"
+    protocol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    durable_ingest_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    durable_signature: Mapped[str | None] = mapped_column(String(128))
+    durable_slot: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    state_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    state_signature: Mapped[str | None] = mapped_column(String(128))
+    state_slot: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class StreamRecoveryGapRow(Base):
+    __tablename__ = "stream_recovery_gaps"
+    __table_args__ = (
+        Index(
+            "ix_stream_recovery_gaps_status_time",
+            "status",
+            "discovered_at",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    protocol: Mapped[str] = mapped_column(String(32), nullable=False)
+    checkpoint_signature: Mapped[str | None] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+
+
+class RawArchiveSegmentRow(Base):
+    __tablename__ = "raw_archive_segments"
+    __table_args__ = (
+        UniqueConstraint(
+            "protocol",
+            "start_sequence",
+            "end_sequence",
+            name="uq_raw_archive_segment_range",
+        ),
+        CheckConstraint(
+            "start_sequence > 0 AND end_sequence >= start_sequence",
+            name="ck_raw_archive_segment_range",
+        ),
+        CheckConstraint("event_count > 0", name="ck_raw_archive_segment_count"),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    protocol: Mapped[str] = mapped_column(String(32), nullable=False)
+    start_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    end_sequence: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, index=True
+    )
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class RuntimeCheckpointRow(Base):

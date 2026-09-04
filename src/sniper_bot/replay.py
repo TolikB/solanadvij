@@ -343,8 +343,13 @@ class RawEventReplayRunner:
         events = sorted(
             list(reader.iter_events()),
             key=lambda item: (
-                item.block_time, item.slot, item.signature,
-                item.instruction_index, item.inner_instruction_index,
+                0 if item.ingest_sequence is not None else 1,
+                item.ingest_sequence if item.ingest_sequence is not None else 0,
+                item.block_time,
+                item.slot,
+                item.signature,
+                item.instruction_index,
+                item.inner_instruction_index,
             ),
         )
         if not events:

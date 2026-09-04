@@ -378,12 +378,16 @@ async def test_gap_recovery_timeout_reconnects_without_partial_publish(
     recovery_cancelled = asyncio.Event()
     live_processed = asyncio.Event()
     processed: list[dict[str, Any]] = []
+    recovery_calls = 0
 
     async def slow_recovery() -> list[tuple[Protocol, dict[str, Any], object]]:
-        try:
-            await asyncio.sleep(60)
-        finally:
-            recovery_cancelled.set()
+        nonlocal recovery_calls
+        recovery_calls += 1
+        if recovery_calls == 1:
+            try:
+                await asyncio.sleep(60)
+            finally:
+                recovery_cancelled.set()
         return []
 
     async def handle_message(message: dict[str, Any]) -> None:
@@ -403,11 +407,15 @@ async def test_gap_recovery_timeout_reconnects_without_partial_publish(
         assert processed == [fresh_notification]
         assert events[:3] == ["open:recovery", "close:recovery", "open:fresh"]
         assert gateway._queue.empty()
-        assert gateway.last_slot == 0
-        assert gateway.last_signature is None
-        assert gateway._last_signatures == {}
+        assert gateway.last_slot == 123
+        assert gateway.last_signature == "recent-signature"
+        assert gateway._last_signatures == {
+            Protocol.PUMP: "recent-signature"
+        }
+        assert recovery_calls >= 2
         assert "startup" not in gateway.entry_gate.reasons
         assert "stream_disconnected" not in gateway.entry_gate.reasons
+        assert "stream_recovery_gap" not in gateway.entry_gate.reasons
         assert "stream_baseline" in gateway.entry_gate.reasons
         assert "stream_stale" in gateway.entry_gate.reasons
     finally:
@@ -417,7 +425,7 @@ async def test_gap_recovery_timeout_reconnects_without_partial_publish(
 
 
 @pytest.mark.asyncio
-async def test_stale_checkpoint_skips_gap_recovery_and_waits_for_live_event(
+async def test_stale_checkpoint_is_recovered_without_discard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = FakeConnection(
@@ -438,36 +446,39 @@ async def test_stale_checkpoint_skips_gap_recovery_and_waits_for_live_event(
         "old-signature",
         datetime.now(tz=timezone.utc) - timedelta(minutes=5),
     )
-    gateway.restore_protocol_checkpoint(Protocol.PUMP, "old-signature")
+    gateway.restore_protocol_checkpoint(
+        Protocol.PUMP,
+        "old-signature",
+    )
+    recovery_started = asyncio.Event()
 
-    async def unexpected_recovery() -> None:
-        pytest.fail("stale checkpoint must not trigger historical gap recovery")
+    async def expected_recovery() -> list[
+        tuple[Protocol, dict[str, Any], object]
+    ]:
+        recovery_started.set()
+        return []
 
-    checkpoint_discarded = asyncio.Event()
-    discard_checkpoint = gateway._discard_in_memory_checkpoint
-
-    def discard_and_notify() -> None:
-        discard_checkpoint()
-        checkpoint_discarded.set()
-
-    monkeypatch.setattr("sniper_bot.stream.websockets.connect", connect)
-    monkeypatch.setattr(gateway, "_recover_gap", unexpected_recovery)
+    monkeypatch.setattr(
+        "sniper_bot.stream.websockets.connect",
+        connect,
+    )
     monkeypatch.setattr(
         gateway,
-        "_discard_in_memory_checkpoint",
-        discard_and_notify,
+        "_recover_gap",
+        expected_recovery,
     )
     run_task = asyncio.create_task(gateway._run())
     try:
         async with asyncio.timeout(1):
-            await checkpoint_discarded.wait()
+            await recovery_started.wait()
 
-        assert gateway.last_slot == 0
-        assert gateway.last_signature is None
-        assert gateway.last_observed_at is None
-        assert gateway._last_signatures == {}
-        assert "stream_disconnected" not in gateway.entry_gate.reasons
-        assert "stream_stale" in gateway.entry_gate.reasons
+        assert gateway.last_slot == 123
+        assert gateway.last_signature == "old-signature"
+        assert gateway.last_observed_at is not None
+        assert gateway._last_signatures == {
+            Protocol.PUMP: "old-signature"
+        }
+        assert "stream_recovery_gap" not in gateway.entry_gate.reasons
     finally:
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):

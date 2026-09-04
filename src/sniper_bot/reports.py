@@ -143,7 +143,10 @@ class ReportBuilder:
                 ),
             },
             "signals": {
-                "new_pools": len(day_candidates), "tokens_checked": len(day_candidates),
+                "new_pools": len(
+                    {item.pool_address for item in day_candidates}
+                ),
+                "tokens_checked": len({item.mint for item in day_candidates}),
                 "hard_rejects": sum(rejections.values()),
                 "score_60_plus": self._score_count(day_candidates, Decimal("60")),
                 "score_80_plus": self._score_count(day_candidates, Decimal("80")),

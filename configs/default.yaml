@@ -90,7 +90,7 @@ exits:
   maximum_holding_seconds: 600
 telegram:
   enabled: true
-  daily_report_time: "00:05"
+  daily_report_time: "00:00"
   include_all_time_with_daily: false
 enrichment:
   enabled: true

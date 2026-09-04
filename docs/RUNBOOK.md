@@ -2,11 +2,18 @@
 
 ## Before startup
 
-1. Confirm host clock synchronization with `timedatectl status` and enable NTP if needed.
-2. Populate `.env` from `.env.example`; do not put secrets in YAML or image layers.
-3. Run `docker compose config --quiet`.
-4. Start with `docker compose up --build -d`.
-5. Confirm `migrate` completed and `/health/ready` becomes healthy after warm-up.
+All VM commands must run from `/opt/solanadvij` and must name the Compose
+project. Never use global Docker stop, prune, down, or container enumeration
+commands on the shared host.
+
+1. Run `cd /opt/solanadvij` and confirm clock synchronization with `timedatectl status`.
+2. Populate `/opt/solanadvij/.env`; require mode `600` and keep secrets out of YAML and image layers.
+3. Set `APP_REVISION` to the exact 40-character checkout commit.
+4. Run `docker compose -p solanadvij --env-file .env config --quiet`.
+5. Run `docker compose -p solanadvij --env-file .env up --build -d postgres migrate`.
+6. Confirm PostgreSQL is healthy and Alembic is at head before starting `sniper-bot`.
+7. Run `docker compose -p solanadvij --env-file .env up --build -d sniper-bot`.
+8. Confirm `/health/ready`, `APP_MODE=paper`, `/app/REVISION`, real Helius ingestion, and Jupiter quote-only capability.
 
 ## Degraded state
 

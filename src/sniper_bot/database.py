@@ -45,19 +45,22 @@ from .db_models import (
     PaperOrderRow,
     PaperPositionRow,
     PoolRow,
+    RawArchiveSegmentRow,
     RawChainEventRow,
     ReplayRunRow,
     RiskEventRow,
     RuntimeCheckpointRow,
     SignalEvaluationRow,
     StrategyVersionRow,
+    StreamProtocolCheckpointRow,
+    StreamRecoveryGapRow,
     SystemRunRow,
     TokenRow,
     TokenSecurityCheckRow,
     WalletProfileRow,
     WalletRelationRow,
 )
-from .events import EventEnvelope
+from .events import EventEnvelope, RawArchiveSegment
 from .features import FeatureSnapshot
 from .metrics import BotMetrics
 from .models import QuoteResponse
@@ -229,18 +232,22 @@ def _event_id_chunks(
 async def _ensure_raw_event_partitions(
     session: AsyncSession,
     block_dates: set[date],
+    known_partitions: set[date],
 ) -> None:
     """Use the narrow DDL capability only for the active UTC ingest window."""
     utc_today = datetime.now(tz=timezone.utc).date()
     earliest = utc_today - timedelta(days=1)
     latest = utc_today + timedelta(days=1)
     for block_date in sorted(
-        value for value in block_dates if earliest <= value <= latest
+        value
+        for value in block_dates
+        if earliest <= value <= latest and value not in known_partitions
     ):
         await session.execute(
             text("SELECT public.ensure_raw_chain_events_partition(:block_date)"),
             {"block_date": block_date},
         )
+        known_partitions.add(block_date)
 
 
 def _processed_prefix_condition() -> Any:
@@ -276,6 +283,27 @@ class _EventStateBatch:
         _PendingUpsertGroup,
     ] = field(default_factory=dict)
 
+@dataclass(frozen=True, slots=True, eq=False)
+class EventRecordResult:
+    accepted: bool
+    event_id: str
+    ingest_sequence: int
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, bool):
+            return self.accepted is other
+        if isinstance(other, EventRecordResult):
+            return (
+                self.accepted == other.accepted
+                and self.event_id == other.event_id
+                and self.ingest_sequence == other.ingest_sequence
+            )
+        return False
+
+
 class Database:
     def __init__(self, dsn: str, *, metrics: BotMetrics | None = None) -> None:
         self.dsn = _async_dsn(dsn)
@@ -287,7 +315,10 @@ class Database:
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
         self.metrics = metrics
         self._event_claim_tokens: dict[str, str] = {}
-        self._event_batch_lock = asyncio.Lock()
+        self._event_ingest_lock = asyncio.Lock()
+        self._event_state_lock = asyncio.Lock()
+        self._event_batch_lock = self._event_ingest_lock
+        self._known_raw_partitions: set[date] = set()
         self._system_run_lock = asyncio.Lock()
         self._runtime_lease_connection: AsyncConnection | None = None
         self._owned_system_run_id: str | None = None
@@ -983,7 +1014,7 @@ class Database:
         *,
         reclaim: bool = False,
         resume_owned: bool = False,
-    ) -> list[bool]:
+    ) -> list[EventRecordResult]:
         """Durably claim an ordered event batch in one synchronous transaction."""
         if not events:
             return []
@@ -992,7 +1023,7 @@ class Database:
                 f"record_events accepts at most {MAX_EVENT_BATCH_SIZE} events"
             )
         started = time.perf_counter()
-        async with self._event_batch_lock:
+        async with self._event_ingest_lock:
             now = datetime.now(tz=timezone.utc)
             unique_events: list[EventEnvelope] = []
             unique_event_ids: set[str] = set()
@@ -1012,6 +1043,7 @@ class Database:
             claimed_event_ids: set[str] = set()
             durably_owned_event_ids: set[str] = set()
             inserted_event_ids: set[str] = set()
+            sequence_by_event_id: dict[str, int] = {}
             async with self._event_claim_transaction(claim_tokens) as session:
                 dialect = session.bind.dialect.name if session.bind is not None else ""
                 if dialect not in {"postgresql", "sqlite"}:
@@ -1028,6 +1060,7 @@ class Database:
                             event.block_time.date()
                             for event in unique_events
                         },
+                        self._known_raw_partitions,
                     )
                     payload_rows = [
                         {
@@ -1178,6 +1211,16 @@ class Database:
                         ]
                         self._observe_event_ingest_phase(
                             "sequence", sequence_started
+                        )
+                        sequence_by_event_id.update(
+                            {
+                                str(row["event_id"]): sequence
+                                for row, sequence in zip(
+                                    inserted_payload_rows,
+                                    ingest_sequences,
+                                    strict=True,
+                                )
+                            }
                         )
                         raw_encode_started = time.perf_counter()
                         raw_records = _postgresql_raw_event_records(
@@ -1363,6 +1406,16 @@ class Database:
                             "database returned an incomplete ingest-sequence "
                             "allocation"
                         )
+                    sequence_by_event_id.update(
+                        {
+                            event.event_id: sequence
+                            for event, sequence in zip(
+                                new_events,
+                                ingest_sequences,
+                                strict=True,
+                            )
+                        }
+                    )
 
                     raw_rows = [
                         {
@@ -1405,6 +1458,33 @@ class Database:
                             ).values(chunk)
                             await session.execute(raw_statement)
 
+                missing_sequences = claimed_event_ids - set(
+                    sequence_by_event_id
+                )
+                if missing_sequences:
+                    sequence_rows = (
+                        await session.execute(
+                            select(
+                                RawChainEventRow.event_id,
+                                RawChainEventRow.ingest_sequence,
+                            ).where(
+                                RawChainEventRow.event_id.in_(
+                                    sorted(missing_sequences)
+                                )
+                            )
+                        )
+                    ).all()
+                    sequence_by_event_id.update(
+                        {
+                            str(event_id): int(sequence)
+                            for event_id, sequence in sequence_rows
+                        }
+                    )
+                if claimed_event_ids - set(sequence_by_event_id):
+                    raise RuntimeError(
+                        "claimed event is missing its canonical ingest sequence"
+                    )
+
             retained_event_ids = claimed_event_ids | durably_owned_event_ids
             for event_id, claim_token in claim_tokens.items():
                 if (
@@ -1412,12 +1492,27 @@ class Database:
                     and self._event_claim_tokens.get(event_id) == claim_token
                 ):
                     self._event_claim_tokens.pop(event_id, None)
-            accepted: list[bool] = []
+            accepted: list[EventRecordResult] = []
             emitted_event_ids: set[str] = set()
             for event in events:
                 first_occurrence = event.event_id not in emitted_event_ids
+                is_accepted = (
+                    first_occurrence
+                    and event.event_id in claimed_event_ids
+                )
+                sequence = (
+                    sequence_by_event_id.get(event.event_id, 0)
+                    if is_accepted
+                    else 0
+                )
+                if is_accepted:
+                    event.ingest_sequence = sequence
                 accepted.append(
-                    first_occurrence and event.event_id in claimed_event_ids
+                    EventRecordResult(
+                        accepted=is_accepted,
+                        event_id=event.event_id,
+                        ingest_sequence=sequence,
+                    )
                 )
                 emitted_event_ids.add(event.event_id)
         self._observe_query(started)
@@ -1425,7 +1520,7 @@ class Database:
 
     async def record_event(self, event: EventEnvelope, *, reclaim: bool = False) -> bool:
         """Claim one event through the ordered batch implementation."""
-        return (await self.record_events([event], reclaim=reclaim))[0]
+        return bool((await self.record_events([event], reclaim=reclaim))[0])
 
     async def mark_event_processed(
         self,
@@ -1507,7 +1602,7 @@ class Database:
                 claims,
             )
             return
-        async with self._event_batch_lock:
+        async with self._event_state_lock:
             async with self.sessions.begin() as session:
                 await self._execute_mark_events_processed(
                     session,
@@ -1768,6 +1863,7 @@ class Database:
                 .join(EventDedupRow, EventDedupRow.event_id == RawChainEventRow.event_id)
                 .where(
                     EventDedupRow.processing_status == "PROCESSED",
+                    RawChainEventRow.source != "replay",
                     _processed_prefix_condition(),
                 )
                 .order_by(RawChainEventRow.ingest_sequence.desc())
@@ -1781,7 +1877,13 @@ class Database:
         checkpoints: dict[str, str] = {}
         async with self.sessions() as session:
             protocols = list(
-                (await session.scalars(select(RawChainEventRow.protocol).distinct())).all()
+                (
+                    await session.scalars(
+                        select(RawChainEventRow.protocol)
+                        .where(RawChainEventRow.source != "replay")
+                        .distinct()
+                    )
+                ).all()
             )
             for protocol in protocols:
                 signature = await session.scalar(
@@ -1793,6 +1895,7 @@ class Database:
                     .where(
                         RawChainEventRow.protocol == protocol,
                         EventDedupRow.processing_status == "PROCESSED",
+                        RawChainEventRow.source != "replay",
                         _processed_prefix_condition(),
                     )
                     .order_by(RawChainEventRow.ingest_sequence.desc())
@@ -1801,6 +1904,168 @@ class Database:
                 if signature:
                     checkpoints[str(protocol)] = str(signature)
         return checkpoints
+
+    async def save_stream_protocol_checkpoints(
+        self,
+        events: list[EventEnvelope],
+        *,
+        stage: str,
+    ) -> None:
+        if stage not in {"durable", "state"}:
+            raise ValueError(
+                "stream checkpoint stage must be durable or state"
+            )
+        latest: dict[str, EventEnvelope] = {}
+        for event in events:
+            if event.ingest_sequence is None:
+                raise ValueError(
+                    "stream checkpoints require ingest_sequence"
+                )
+            current = latest.get(event.protocol.value)
+            if (
+                current is None
+                or int(event.ingest_sequence)
+                > int(current.ingest_sequence or 0)
+            ):
+                latest[event.protocol.value] = event
+        if not latest:
+            return
+        now = datetime.now(tz=timezone.utc)
+        async with self.sessions.begin() as session:
+            for protocol, event in latest.items():
+                row = await session.scalar(
+                    select(StreamProtocolCheckpointRow)
+                    .where(
+                        StreamProtocolCheckpointRow.protocol == protocol
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    row = StreamProtocolCheckpointRow(
+                        protocol=protocol,
+                        durable_ingest_sequence=0,
+                        durable_signature=None,
+                        durable_slot=0,
+                        state_sequence=0,
+                        state_signature=None,
+                        state_slot=0,
+                        updated_at=now,
+                    )
+                    session.add(row)
+                sequence = int(event.ingest_sequence or 0)
+                if (
+                    stage == "durable"
+                    and sequence > row.durable_ingest_sequence
+                ):
+                    row.durable_ingest_sequence = sequence
+                    row.durable_signature = event.signature
+                    row.durable_slot = event.slot
+                if stage == "state" and sequence > row.state_sequence:
+                    row.state_sequence = sequence
+                    row.state_signature = event.signature
+                    row.state_slot = event.slot
+                row.updated_at = now
+
+    async def last_archived_sequence(self) -> int:
+        async with self.sessions() as session:
+            value = await session.scalar(
+                select(func.max(RawArchiveSegmentRow.end_sequence))
+            )
+        return int(value or 0)
+
+    async def load_events_for_archive(
+        self,
+        *,
+        after_sequence: int,
+        limit: int = MAX_EVENT_BATCH_SIZE,
+    ) -> list[EventEnvelope]:
+        if after_sequence < 0 or not 1 <= limit <= MAX_EVENT_BATCH_SIZE:
+            raise ValueError("invalid raw archive recovery bounds")
+        async with self.sessions() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(RawChainEventRow)
+                        .where(
+                            RawChainEventRow.ingest_sequence
+                            > after_sequence
+                        )
+                        .order_by(RawChainEventRow.ingest_sequence)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+        return [_event_from_row(row) for row in rows]
+
+    async def record_raw_archive_segments(
+        self,
+        segments: list[RawArchiveSegment],
+    ) -> None:
+        if not segments:
+            return
+        now = datetime.now(tz=timezone.utc)
+        async with self.sessions.begin() as session:
+            for segment in segments:
+                if segment.start_sequence <= 0:
+                    continue
+                existing = await session.scalar(
+                    select(RawArchiveSegmentRow).where(
+                        RawArchiveSegmentRow.path == str(segment.path)
+                    )
+                )
+                if existing is not None:
+                    if (
+                        existing.checksum_sha256
+                        != segment.checksum_sha256
+                    ):
+                        raise RuntimeError(
+                            "raw archive segment checksum changed"
+                        )
+                    continue
+                session.add(
+                    RawArchiveSegmentRow(
+                        id=str(uuid4()),
+                        protocol=segment.protocol.value,
+                        start_sequence=segment.start_sequence,
+                        end_sequence=segment.end_sequence,
+                        event_count=segment.event_count,
+                        path=str(segment.path),
+                        checksum_sha256=segment.checksum_sha256,
+                        created_at=now,
+                    )
+                )
+
+    async def record_stream_recovery_gap(self, reason: str) -> None:
+        now = datetime.now(tz=timezone.utc)
+        checkpoints = await self.load_protocol_checkpoints()
+        async with self.sessions.begin() as session:
+            for protocol in ("pump", "pumpswap"):
+                session.add(
+                    StreamRecoveryGapRow(
+                        id=str(uuid4()),
+                        protocol=protocol,
+                        checkpoint_signature=checkpoints.get(protocol),
+                        reason=reason[:64],
+                        status="PENDING",
+                        attempts=1,
+                        discovered_at=now,
+                        last_attempt_at=now,
+                        completed_at=None,
+                    )
+                )
+
+    async def resolve_stream_recovery_gaps(self) -> None:
+        now = datetime.now(tz=timezone.utc)
+        async with self.sessions.begin() as session:
+            await session.execute(
+                update(StreamRecoveryGapRow)
+                .where(StreamRecoveryGapRow.status == "PENDING")
+                .values(
+                    status="RESOLVED",
+                    completed_at=now,
+                    last_attempt_at=now,
+                )
+            )
 
     async def upsert_token(self, token: TokenRecord) -> None:
         values = {
@@ -3063,18 +3328,6 @@ class Database:
                     created_at=filled_at, resolved_at=filled_at,
                 )
             )
-            await self._insert_outbox(
-                session,
-                {
-                    "id": str(uuid4()),
-                    "idempotency_key": f"telegram:entry:{fill_id}",
-                    "event_type": "paper_position_opened",
-                    "payload_json": {"text": outbox_text},
-                    "created_at": filled_at,
-                    "available_at": filled_at,
-                    "attempts": 0,
-                },
-            )
             return {
                 "position_id": position_id,
                 "fill_id": fill_id,
@@ -3222,22 +3475,335 @@ class Database:
                         created_at=filled_at, resolved_at=None,
                     )
                 )
-            await self._insert_outbox(
-                session,
-                {
-                    "id": str(uuid4()),
-                    "idempotency_key": f"telegram:exit:{fill_id}",
-                    "event_type": "paper_position_closed" if final else "paper_position_reduced",
-                    "payload_json": {"text": outbox_text},
-                    "created_at": filled_at, "available_at": filled_at, "attempts": 0,
-                },
-            )
             return {
                 "position_id": position.id,
                 "fill_id": fill_id,
                 "quote_id": quote_id or "unrecoverable",
                 "filled_at": filled_at,
             }
+
+    async def load_daily_trading_summary(
+        self,
+        *,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> dict[str, Any]:
+        if start_utc.tzinfo is None or end_utc.tzinfo is None:
+            raise ValueError("daily summary bounds must be timezone-aware")
+        if end_utc <= start_utc:
+            raise ValueError("daily summary end must follow start")
+
+        async with self.sessions() as session:
+            candidate_filter = (
+                CandidateRow.detected_at >= start_utc,
+                CandidateRow.detected_at < end_utc,
+            )
+            fill_filter = (
+                PaperFillRow.filled_at >= start_utc,
+                PaperFillRow.filled_at < end_utc,
+            )
+            new_pools = int(
+                await session.scalar(
+                    select(
+                        func.count(
+                            func.distinct(PoolRow.pool_address)
+                        )
+                    ).where(
+                        PoolRow.creation_time >= start_utc,
+                        PoolRow.creation_time < end_utc,
+                    )
+                )
+                or 0
+            )
+            tokens_checked = int(
+                await session.scalar(
+                    select(
+                        func.count(
+                            func.distinct(
+                                TokenSecurityCheckRow.mint
+                            )
+                        )
+                    ).where(
+                        TokenSecurityCheckRow.checked_at >= start_utc,
+                        TokenSecurityCheckRow.checked_at < end_utc,
+                    )
+                )
+                or 0
+            )
+            hard_rejects = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CandidateRow)
+                    .where(
+                        *candidate_filter,
+                        CandidateRow.reject_reason.is_not(None),
+                    )
+                )
+                or 0
+            )
+            score_60_plus = int(
+                await session.scalar(
+                    select(
+                        func.count(
+                            func.distinct(
+                                SignalEvaluationRow.candidate_id
+                            )
+                        )
+                    ).where(
+                        SignalEvaluationRow.evaluated_at >= start_utc,
+                        SignalEvaluationRow.evaluated_at < end_utc,
+                        SignalEvaluationRow.score >= Decimal("60"),
+                    )
+                )
+                or 0
+            )
+            score_80_plus = int(
+                await session.scalar(
+                    select(
+                        func.count(
+                            func.distinct(
+                                SignalEvaluationRow.candidate_id
+                            )
+                        )
+                    ).where(
+                        SignalEvaluationRow.evaluated_at >= start_utc,
+                        SignalEvaluationRow.evaluated_at < end_utc,
+                        SignalEvaluationRow.score >= Decimal("80"),
+                    )
+                )
+                or 0
+            )
+            paper_entries = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(PaperFillRow)
+                    .where(*fill_filter, PaperFillRow.side == "BUY")
+                )
+                or 0
+            )
+            risk_limit_skips = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(CandidateRow)
+                    .where(
+                        *candidate_filter,
+                        CandidateRow.reject_reason.in_(
+                            (
+                                "DAILY_RISK_LIMIT",
+                                "MAX_OPEN_POSITIONS",
+                                "RISK_MANAGER_BLOCKED",
+                            )
+                        ),
+                    )
+                )
+                or 0
+            )
+            closed_pnl = list(
+                (
+                    await session.scalars(
+                        select(PaperPositionRow.realized_pnl)
+                        .where(
+                            PaperPositionRow.closed_at >= start_utc,
+                            PaperPositionRow.closed_at < end_utc,
+                            PaperPositionRow.status == "CLOSED",
+                        )
+                        .order_by(PaperPositionRow.closed_at)
+                    )
+                ).all()
+            )
+            realized_pnl = Decimal(
+                str(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.sum(
+                                    PaperFillRow.realized_pnl_usd
+                                ),
+                                0,
+                            )
+                        ).where(
+                            *fill_filter,
+                            PaperFillRow.side == "SELL",
+                        )
+                    )
+                    or 0
+                )
+            )
+            simulated_costs = Decimal(
+                str(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.sum(
+                                    PaperFillRow.platform_fee_usd
+                                    + PaperFillRow.network_fee_usd
+                                    + PaperFillRow.other_cost_usd
+                                ),
+                                0,
+                            )
+                        ).where(*fill_filter)
+                    )
+                    or 0
+                )
+            )
+            average_buy_impact = Decimal(
+                str(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.avg(
+                                    PaperFillRow.price_impact_pct
+                                ),
+                                0,
+                            )
+                        ).where(
+                            *fill_filter,
+                            PaperFillRow.side == "BUY",
+                        )
+                    )
+                    or 0
+                )
+            )
+            average_sell_impact = Decimal(
+                str(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.avg(
+                                    PaperFillRow.price_impact_pct
+                                ),
+                                0,
+                            )
+                        ).where(
+                            *fill_filter,
+                            PaperFillRow.side == "SELL",
+                        )
+                    )
+                    or 0
+                )
+            )
+            average_adverse_fill = Decimal(
+                str(
+                    await session.scalar(
+                        select(
+                            func.coalesce(
+                                func.avg(
+                                    PaperFillRow.adverse_fill_bps
+                                ),
+                                0,
+                            )
+                        ).where(*fill_filter)
+                    )
+                    or 0
+                )
+            )
+            exit_rows = (
+                await session.execute(
+                    select(
+                        PaperFillRow.exit_reason,
+                        func.count(),
+                    )
+                    .where(
+                        *fill_filter,
+                        PaperFillRow.side == "SELL",
+                        PaperFillRow.exit_reason.is_not(None),
+                    )
+                    .group_by(PaperFillRow.exit_reason)
+                )
+            ).all()
+            rejection_rows = (
+                await session.execute(
+                    select(
+                        CandidateRow.reject_reason,
+                        func.count(),
+                    )
+                    .where(
+                        *candidate_filter,
+                        CandidateRow.reject_reason.is_not(None),
+                    )
+                    .group_by(CandidateRow.reject_reason)
+                )
+            ).all()
+            open_rows = list(
+                (
+                    await session.scalars(
+                        select(PaperPositionRow)
+                        .where(
+                            PaperPositionRow.entry_time < end_utc,
+                            or_(
+                                PaperPositionRow.closed_at.is_(None),
+                                PaperPositionRow.closed_at >= end_utc,
+                            ),
+                        )
+                        .order_by(PaperPositionRow.entry_time)
+                    )
+                ).all()
+            )
+
+        wins = sum(Decimal(str(value)) > 0 for value in closed_pnl)
+        losses = sum(Decimal(str(value)) < 0 for value in closed_pnl)
+        closed = len(closed_pnl)
+        return {
+            "signals": {
+                "new_pools": new_pools,
+                "tokens_checked": tokens_checked,
+                "hard_rejects": hard_rejects,
+                "score_60_plus": score_60_plus,
+                "score_80_plus": score_80_plus,
+                "paper_entries": paper_entries,
+                "risk_limit_skips": risk_limit_skips,
+            },
+            "trades": {
+                "closed": closed,
+                "profitable": wins,
+                "losing": losses,
+                "win_rate": str(
+                    Decimal(wins) / Decimal(closed)
+                    if closed
+                    else Decimal("0")
+                ),
+            },
+            "realized_pnl_usd": str(realized_pnl),
+            "simulated_costs_usd": str(simulated_costs),
+            "execution_quality": {
+                "average_buy_impact_pct": str(
+                    average_buy_impact
+                ),
+                "average_sell_impact_pct": str(
+                    average_sell_impact
+                ),
+                "average_adverse_fill_bps": str(
+                    average_adverse_fill
+                ),
+            },
+            "exit_reasons": {
+                str(reason): int(count)
+                for reason, count in exit_rows
+                if reason is not None
+            },
+            "rejections": {
+                str(reason): int(count)
+                for reason, count in rejection_rows
+                if reason is not None
+            },
+            "open_positions": [
+                {
+                    "position_id": row.id,
+                    "token_mint": row.mint,
+                    "remaining_token_amount": str(
+                        row.token_amount_raw
+                    ),
+                    "remaining_cost_usd": str(
+                        row.remaining_cost_usd
+                    ),
+                    "opened_at": _as_utc(
+                        row.entry_time
+                    ).isoformat(),
+                    "status": row.status,
+                }
+                for row in open_rows
+            ],
+        }
 
     async def _upsert(
         self,
@@ -3423,6 +3989,7 @@ def _event_from_row(row: RawChainEventRow) -> EventEnvelope:
     return EventEnvelope.model_validate(
         {
             "event_id": row.event_id,
+            "ingest_sequence": row.ingest_sequence,
             "source": row.source,
             "protocol": row.protocol,
             "event_type": row.event_type,
@@ -3471,35 +4038,76 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
         capital = report.get("capital") or {}
         signals = report.get("signals") or {}
         trades = report.get("trades") or {}
-        starting = _report_decimal(capital.get("starting_equity_usd"))
+        execution = report.get("execution_quality") or {}
+        exits = report.get("exit_reasons") or {}
+        starting = _report_decimal(
+            capital.get("starting_equity_usd")
+        )
         ending = _report_decimal(capital.get("ending_equity_usd"))
         day_result = ending - starting
         open_positions = report.get("open_positions")
-        open_count = len(open_positions) if isinstance(open_positions, list) else 0
+        open_count = (
+            len(open_positions)
+            if isinstance(open_positions, list)
+            else 0
+        )
+        exit_summary = (
+            ", ".join(
+                f"{reason}: {_report_int(count)}"
+                for reason, count in sorted(exits.items())
+            )
+            or "немає"
+        )
         return (
             "Щоденний звіт про тестову торгівлю\n"
             f"Дата: {report.get('date')}\n"
-            f"Баланс: {_format_usd(starting)} -> {_format_usd(ending)}\n"
-            f"Результат дня: {_format_usd(day_result, signed=True)}\n"
+            f"Баланс: {_format_usd(starting)} -> "
+            f"{_format_usd(ending)}\n"
+            f"Результат дня: "
+            f"{_format_usd(day_result, signed=True)}\n"
             "Закритий PnL: "
             f"{_format_usd(capital.get('realized_pnl_usd'), signed=True)}\n"
             "Відкритий PnL: "
             f"{_format_usd(capital.get('unrealized_pnl_usd'), signed=True)}\n"
-            f"Угоди: відкрито {_report_int(signals.get('paper_entries'))}, "
+            "Економічний результат: "
+            f"{_format_usd(capital.get('economic_pnl_usd'), signed=True)}\n"
+            f"Угоди: відкрито "
+            f"{_report_int(signals.get('paper_entries'))}, "
             f"закрито {_report_int(trades.get('closed'))}\n"
-            f"Результати: прибуткових {_report_int(trades.get('profitable'))}, "
+            f"Результати: прибуткових "
+            f"{_report_int(trades.get('profitable'))}, "
             f"збиткових {_report_int(trades.get('losing'))}\n"
-            f"Частка прибуткових: {_format_percent(trades.get('win_rate'))}\n"
+            f"Частка прибуткових: "
+            f"{_format_percent(trades.get('win_rate'))}\n"
+            f"Сигнали: нових пулів "
+            f"{_report_int(signals.get('new_pools'))}, "
+            f"перевірено токенів "
+            f"{_report_int(signals.get('tokens_checked'))}, "
+            f"жорстких відмов "
+            f"{_report_int(signals.get('hard_rejects'))}\n"
+            "Якість виконання: середній вплив купівлі "
+            f"{_format_percent(execution.get('average_buy_impact_pct'))}, "
+            "продажу "
+            f"{_format_percent(execution.get('average_sell_impact_pct'))}, "
+            "затримка котирування "
+            f"{_report_int(execution.get('average_quote_latency_ms'))} мс\n"
+            f"Причини виходу: {exit_summary}\n"
             f"Відкриті позиції: {open_count}"
         )
     stats = report.get("trade_statistics") or {}
     return (
-        "ALL-TIME PAPER REPORT\n"
-        f"equity={report.get('current_equity_usd')} pnl={report.get('net_pnl_usd')} "
-        f"return={report.get('return_pct')} drawdown={report.get('max_drawdown_pct')}\n"
-        f"entries={report.get('paper_entries')} closed={stats.get('closed')} "
-        f"win_rate={stats.get('win_rate')} profit_factor={stats.get('profit_factor')}\n"
-        f"report_id={report.get('report_id')}"
+        "Звіт про тестову торгівлю за весь час\n"
+        f"Капітал: "
+        f"{_format_usd(report.get('current_equity_usd'))}\n"
+        f"Чистий результат: "
+        f"{_format_usd(report.get('net_pnl_usd'), signed=True)}\n"
+        f"Доходність: {_format_percent(report.get('return_pct'))}\n"
+        f"Максимальна просадка: "
+        f"{_format_percent(report.get('max_drawdown_pct'))}\n"
+        f"Входів: {_report_int(report.get('paper_entries'))}, "
+        f"закритих угод: {_report_int(stats.get('closed'))}\n"
+        f"Частка прибуткових: "
+        f"{_format_percent(stats.get('win_rate'))}"
     )
 
 

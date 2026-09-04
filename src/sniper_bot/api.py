@@ -173,13 +173,28 @@ def build_api(runtime: Any) -> FastAPI:
         if getattr(runtime.config, "replay_mode", False):
             return
         notifier = getattr(runtime, "notifier", None)
-        if notifier is not None:
+        telegram_enabled = getattr(
+            getattr(runtime.config, "telegram", None),
+            "enabled",
+            True,
+        )
+        if notifier is not None and telegram_enabled:
             try:
                 await notifier.start(start_polling=True, command_handler=handle_command)
             except Exception:
                 logging.getLogger(__name__).exception("Telegram startup failed")
         if hasattr(runtime, "start"):
             await runtime.start()
+        ready = True
+        if hasattr(runtime, "wait_until_ready"):
+            ready = await runtime.wait_until_ready(
+                timeout_seconds=120.0
+            )
+        if not ready:
+            raise RuntimeError(
+                "paper runtime did not become ready; "
+                "lifecycle start suppressed"
+            )
         if hasattr(runtime, "_notify_lifecycle_alert"):
             await runtime._notify_lifecycle_alert(
                 "system_start", "Бот запущено."
@@ -194,11 +209,21 @@ def build_api(runtime: Any) -> FastAPI:
         if getattr(runtime.config, "replay_mode", False):
             return
         notifier = getattr(runtime, "notifier", None)
-        if hasattr(runtime, "_notify_lifecycle_alert"):
+        manages_lifecycle = bool(
+            getattr(
+                runtime,
+                "manages_lifecycle_notifications",
+                False,
+            )
+        )
+        if (
+            not manages_lifecycle
+            and hasattr(runtime, "_notify_lifecycle_alert")
+        ):
             await runtime._notify_lifecycle_alert(
                 "system_stop", "Бот зупинено."
             )
-        elif notifier is not None:
+        elif not manages_lifecycle and notifier is not None:
             try:
                 await notifier.send("Бот зупинено.")
             except Exception:
