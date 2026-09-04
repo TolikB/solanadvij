@@ -174,6 +174,7 @@ class HeliusStreamGateway:
         self._stream_generation = 0
         self._log_fetch_sequence = 0
         self._log_fetch_semaphore = asyncio.Semaphore(log_fetch_concurrency)
+        self._gap_recovery_semaphore = asyncio.Semaphore(log_fetch_concurrency)
         self._log_fetch_tasks: set[asyncio.Task[None]] = set()
         self._log_fetch_tail: asyncio.Task[None] | None = None
         self._fetch_error_sequences: set[int] = set()
@@ -1098,17 +1099,32 @@ class HeliusStreamGateway:
                     before=before,
                     limit=1000,
                 )
-                for item in signatures:
+                async def fetch_transaction(
+                    item: dict[str, Any],
+                ) -> tuple[str, dict[str, Any]] | None:
                     if item.get("err") is not None:
-                        continue
+                        return None
                     signature = str(item.get("signature") or "")
                     if not signature:
-                        continue
-                    transaction = await self.rpc.get_transaction(signature)
+                        return None
+                    async with self._gap_recovery_semaphore:
+                        transaction = await self.rpc.get_transaction(signature)
                     if transaction is None:
-                        continue
+                        return None
                     transaction.setdefault("slot", item.get("slot", 0))
-                    recovered[f"{protocol.value}:{signature}"] = (protocol, transaction)
+                    return signature, transaction
+
+                fetched = await asyncio.gather(
+                    *(fetch_transaction(item) for item in signatures)
+                )
+                for result in fetched:
+                    if result is None:
+                        continue
+                    signature, transaction = result
+                    recovered[f"{protocol.value}:{signature}"] = (
+                        protocol,
+                        transaction,
+                    )
                 if checkpoint is None or len(signatures) < 1000:
                     break
                 next_before = str(signatures[-1].get("signature") or "")

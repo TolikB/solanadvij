@@ -125,13 +125,13 @@ class BotMetrics:
         )
         self.ingestion_backlog_events = Gauge(
             "ingestion_backlog_events",
-            "Queued events by ordered processing stage",
+            "Events pending completion by ordered processing stage",
             ["stage"],
             registry=self.registry,
         )
         self.ingestion_oldest_event_age_seconds = Gauge(
             "ingestion_oldest_event_age_seconds",
-            "Age of the oldest queued event by stage",
+            "Age of the oldest event pending stage completion",
             ["stage"],
             registry=self.registry,
         )

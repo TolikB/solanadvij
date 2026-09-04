@@ -38,8 +38,8 @@ class QuoteResponse(BaseModel):
     out_amount_usd: Decimal | None = None
     route: dict[str, Any] = Field(default_factory=dict)
     price_impact_pct: Decimal = Decimal("0")
-    platform_fee_usd: Decimal = Decimal("0")
-    estimated_network_fee_usd: Decimal = Decimal("0")
+    platform_fee_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    estimated_network_fee_usd: Decimal = Field(default=Decimal("0"), ge=0)
     expires_at: datetime | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
@@ -69,11 +69,11 @@ class FillRecord(BaseModel):
     created_at: datetime
     exit_reason: str | None = None
     price_impact_pct: Decimal = Decimal("0")
-    platform_fee_usd: Decimal = Decimal("0")
-    network_fee_usd: Decimal = Decimal("0")
-    other_cost_usd: Decimal = Decimal("0")
-    adverse_fill_bps: int = 0
-    quote_latency_ms: int = 0
+    platform_fee_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    network_fee_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    other_cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    adverse_fill_bps: int = Field(default=0, ge=0, lt=10_000)
+    quote_latency_ms: int = Field(default=0, ge=0)
     round_trip_cost_pct: Decimal | None = None
 
 

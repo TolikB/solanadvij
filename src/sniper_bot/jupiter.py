@@ -166,22 +166,42 @@ class JupiterQuoteProvider:
         if not response.get("outAmount"):
             raise QuoteUnavailableError("no executable route returned")
 
-        in_amount = Decimal(str(response["inAmount"]))
-        out_amount = Decimal(str(response["outAmount"]))
-        in_usdc = self._pick_amount_usd(
+        try:
+            in_amount = Decimal(str(response["inAmount"]))
+            out_amount = Decimal(str(response["outAmount"]))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise QuoteUnavailableError(
+                "invalid amount format from Jupiter"
+            ) from exc
+        if (
+            not in_amount.is_finite()
+            or not out_amount.is_finite()
+            or in_amount <= 0
+            or out_amount <= 0
+        ):
+            raise QuoteUnavailableError(
+                "Jupiter returned non-positive or non-finite amounts"
+            )
+        in_usdc = max(
+            Decimal("0"),
+            self._pick_amount_usd(
             response,
             "inUsdValue",
             "inAmountUsd",
             "inAmountUSD",
             "inAmountPriceUsd",
-            "inAmountValueUsd",
+                "inAmountValueUsd",
+            ),
         )
-        out_usdc = self._pick_amount_usd(
+        out_usdc = max(
+            Decimal("0"),
+            self._pick_amount_usd(
             response,
             "outUsdValue",
             "outAmountUsd",
             "outAmountUSD",
-            "outAmountValueUsd",
+                "outAmountValueUsd",
+            ),
         )
         expires_at = received_at + timedelta(seconds=1.5)
         expire_at = response.get("expireAt")
@@ -193,10 +213,17 @@ class JupiterQuoteProvider:
                 pass
         price_impact = self._price_impact_fraction(response)
         platform_fee = response.get("platformFee") or {}
-        platform_fee_usd = self._pick_amount_usd(platform_fee, "usdValue", "amountUsd")
+        platform_fee_usd = max(
+            Decimal("0"),
+            self._pick_amount_usd(platform_fee, "usdValue", "amountUsd"),
+        )
         network_fee_lamports = sum(
-            Decimal(str(response.get(key) or 0))
-            for key in ("signatureFeeLamports", "prioritizationFeeLamports", "rentFeeLamports")
+            max(Decimal("0"), Decimal(str(response.get(key) or 0)))
+            for key in (
+                "signatureFeeLamports",
+                "prioritizationFeeLamports",
+                "rentFeeLamports",
+            )
         )
 
         quote = QuoteResponse(
@@ -404,9 +431,36 @@ class JupiterQuoteProvider:
                     raise QuoteUnavailableError(
                         f"Jupiter quote rejected status={response.status_code}"
                     )
-                data = response.json()
+                try:
+                    data = response.json()
+                except (TypeError, ValueError) as exc:
+                    await self._record_call(
+                        path,
+                        payload,
+                        None,
+                        requested_at,
+                        received_at,
+                        latency_ms,
+                        response.status_code,
+                        "INVALID_RESPONSE",
+                    )
+                    raise QuoteUnavailableError(
+                        "invalid response format from Jupiter"
+                    ) from exc
                 if not isinstance(data, dict):
-                    raise QuoteUnavailableError("invalid response format from Jupiter")
+                    await self._record_call(
+                        path,
+                        payload,
+                        None,
+                        requested_at,
+                        received_at,
+                        latency_ms,
+                        response.status_code,
+                        "INVALID_RESPONSE",
+                    )
+                    raise QuoteUnavailableError(
+                        "invalid response format from Jupiter"
+                    )
                 if data.get("error") and not data.get("outAmount"):
                     await self._record_call(
                         path, payload, data, requested_at, received_at,
@@ -420,6 +474,18 @@ class JupiterQuoteProvider:
                 return data, received_at, latency_ms
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = exc
+                received_at = self._clock()
+                latency_ms = int((time.perf_counter() - started) * 1000)
+                await self._record_call(
+                    path,
+                    payload,
+                    None,
+                    requested_at,
+                    received_at,
+                    latency_ms,
+                    0,
+                    type(exc).__name__.upper(),
+                )
                 if attempt < self._max_retries:
                     await self._sleep_with_backoff(attempt)
                     continue

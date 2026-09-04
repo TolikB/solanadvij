@@ -246,3 +246,20 @@ async def test_transient_mark_quote_failure_does_not_close_position(tmp_path: Pa
     assert snapshot["positions"][0]["final_exit_reason"] is None
     position_id = snapshot["positions"][0]["position_id"]
     assert runtime._mark_quote_failures[position_id][1] == 1
+@pytest.mark.asyncio
+async def test_daily_loss_limit_liquidates_open_position(
+    tmp_path: Path,
+) -> None:
+    runtime = _build_runtime(tmp_path, {"TOKEN": Decimal("10")})
+    runtime.config.risk.daily_loss_limit_usdc = Decimal("5")
+    await _open(runtime, "TOKEN", Decimal("10"))
+    _set_runtime_quote_provider(runtime, {"TOKEN": Decimal("1")})
+
+    decisions = await runtime.evaluate_and_close_exits()
+
+    assert len(decisions) == 1
+    assert decisions[0].reason.value == "EMERGENCY"
+    position = runtime.ledger.snapshot()["positions"][0]
+    assert position["status"] == "closed"
+    assert runtime.ledger.state.daily_halt_date is not None
+    assert runtime.notifier.sent == []

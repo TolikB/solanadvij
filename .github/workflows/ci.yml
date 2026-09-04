@@ -65,7 +65,7 @@ jobs:
 
       - name: Tests and coverage
         run: |
-          uv run python -m pytest -q --junitxml=junit.xml --cov=sniper_bot --cov-fail-under=70 --cov-report=term-missing --cov-report=xml:coverage.xml
+          uv run python -m pytest -q --junitxml=junit.xml --cov=sniper_bot --cov-fail-under=80 --cov-report=term-missing --cov-report=xml:coverage.xml
           printf '%s tests\n' "$GITHUB_SHA" > ci-gates/tests.ok
 
       - name: Deterministic golden replay
@@ -102,6 +102,43 @@ jobs:
           uv run python scripts/verify_data.py
           printf '%s data_integrity\n' "$GITHUB_SHA" > ci-gates/data_integrity.ok
 
+      - name: Backup restore into isolated PostgreSQL database
+        shell: bash
+        run: |
+          set -euo pipefail
+          restore_dir="$RUNNER_TEMP/solanadvij-restore"
+          admin_dsn="${MIGRATION_POSTGRES_DSN%/*}/postgres"
+          restore_dsn="${MIGRATION_POSTGRES_DSN%/*}/sniper_restore_ci"
+          mkdir -p "$restore_dir"
+          cleanup() {
+            docker run --rm --network host postgres:16 \
+              psql "$admin_dsn" -v ON_ERROR_STOP=1 \
+              -c 'DROP DATABASE IF EXISTS sniper_restore_ci' >/dev/null || true
+          }
+          trap cleanup EXIT
+          cleanup
+          docker run --rm --network host postgres:16 \
+            psql "$admin_dsn" -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE sniper_restore_ci'
+          docker run --rm --network host \
+            -e MIGRATION_POSTGRES_DSN="$MIGRATION_POSTGRES_DSN" \
+            -e BACKUP_DIR=/backups \
+            -v "$restore_dir:/backups" \
+            -v "$PWD/scripts:/scripts:ro" \
+            postgres:16 /bin/sh /scripts/backup.sh
+          backup_file="$(find "$restore_dir" -maxdepth 1 -name 'sniper-*.dump' -print -quit)"
+          test -n "$backup_file"
+          docker run --rm --network host \
+            -v "$restore_dir:/backups:ro" \
+            -v "$PWD/scripts:/scripts:ro" \
+            postgres:16 /bin/sh /scripts/restore.sh \
+            "/backups/$(basename "$backup_file")" "$restore_dsn"
+          test "$(docker run --rm --network host postgres:16 \
+            psql "$restore_dsn" -Atc 'SELECT version_num FROM alembic_version')" \
+            = "20260901_0010"
+          POSTGRES_DSN="$restore_dsn" MIGRATION_POSTGRES_DSN="$restore_dsn" \
+            uv run python scripts/verify_data.py
+          printf '%s isolated_restore\n' "$GITHUB_SHA" > ci-gates/isolated_restore.ok
       - name: No-live audit
         run: |
           uv run python scripts/audit_no_live.py

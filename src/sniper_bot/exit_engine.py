@@ -67,14 +67,28 @@ def evaluate_exit(
         return ExitDecision(True, ExitReason.STOP_LOSS, executable_pnl, executable_return, Decimal("1"))
 
     if not position.tp1_taken and executable_return >= policy.tp1_return:
-        return ExitDecision(True, ExitReason.TP1, executable_pnl, executable_return, policy.tp1_size)
+        fraction = min(Decimal("1"), max(Decimal("0"), policy.tp1_size))
+        return ExitDecision(
+            True,
+            ExitReason.TP1,
+            executable_pnl,
+            executable_return,
+            fraction,
+        )
     if position.tp1_taken and not position.tp2_taken and executable_return >= policy.tp2_return:
         remaining_of_initial = (
             position.remaining_token_amount / position.entry_token_amount
             if position.entry_token_amount > 0
             else Decimal("1")
         )
-        fraction = min(Decimal("1"), policy.tp2_size_of_initial / max(remaining_of_initial, Decimal("0.00000001")))
+        fraction = min(
+            Decimal("1"),
+            max(
+                Decimal("0"),
+                policy.tp2_size_of_initial
+                / max(remaining_of_initial, Decimal("0.00000001")),
+            ),
+        )
         return ExitDecision(True, ExitReason.TP2, executable_pnl, executable_return, fraction)
 
     if position.tp1_taken and (

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -65,6 +67,7 @@ FatalHandler = Callable[[BaseException], None]
 @dataclass(slots=True)
 class _StageBatch:
     events: list[EventEnvelope]
+    enqueued_at: float
 
 
 class ConfirmationPipeline:
@@ -195,6 +198,12 @@ class ConfirmationPipeline:
             asyncio.Queue(maxsize=128)
         )
         self._stage_tasks: list[asyncio.Task[None]] = []
+        self._stage_metrics_task: asyncio.Task[None] | None = None
+        self._stage_pending: dict[str, deque[_StageBatch]] = {
+            "durable": deque(),
+            "state": deque(),
+            "archive": deque(),
+        }
         self._background_workers_started = False
 
     def _require_consistent_state(self) -> None:
@@ -249,6 +258,10 @@ class ConfirmationPipeline:
                     name="raw-archive-worker",
                 )
             )
+        self._stage_metrics_task = asyncio.create_task(
+            self._stage_metrics_worker(),
+            name="ordered-stage-metrics",
+        )
         self._sync_stage_metrics()
 
     async def stop_background_workers(
@@ -277,6 +290,14 @@ class ConfirmationPipeline:
                 f"{timeout_seconds:g} seconds"
             ) from exc
         finally:
+            metrics_task = self._stage_metrics_task
+            if metrics_task is not None:
+                metrics_task.cancel()
+                try:
+                    await metrics_task
+                except asyncio.CancelledError:
+                    pass
+                self._stage_metrics_task = None
             self.metrics.shutdown_drain_seconds.labels(
                 stage="pipeline"
             ).observe(
@@ -286,16 +307,58 @@ class ConfirmationPipeline:
         self._stage_tasks = []
         self._background_workers_started = False
 
+    async def _stage_metrics_worker(self) -> None:
+        while True:
+            self._sync_stage_metrics()
+            await asyncio.sleep(1)
+
+    async def _enqueue_stage(
+        self,
+        stage: str,
+        queue: asyncio.Queue[_StageBatch | None],
+        events: list[EventEnvelope],
+    ) -> None:
+        item = _StageBatch(
+            events=list(events),
+            enqueued_at=time.monotonic(),
+        )
+        pending = self._stage_pending[stage]
+        pending.append(item)
+        self._sync_stage_metrics()
+        try:
+            await queue.put(item)
+        except BaseException:
+            pending.remove(item)
+            self._sync_stage_metrics()
+            raise
+
+    def _complete_stage(self, stage: str, item: _StageBatch) -> None:
+        pending = self._stage_pending[stage]
+        if pending and pending[0] is item:
+            pending.popleft()
+        else:
+            self.entry_gate.block("stage_tracking_error")
+            logger.error("ordered stage tracking lost FIFO identity stage=%s", stage)
+            try:
+                pending.remove(item)
+            except ValueError:
+                pass
+        self._sync_stage_metrics()
+
     def _sync_stage_metrics(self) -> None:
-        self.metrics.ingestion_backlog_events.labels(
-            stage="durable"
-        ).set(self._durable_queue.qsize())
-        self.metrics.ingestion_backlog_events.labels(
-            stage="state"
-        ).set(self._state_queue.qsize())
-        self.metrics.ingestion_backlog_events.labels(
-            stage="archive"
-        ).set(self._archive_queue.qsize())
+        now = time.monotonic()
+        for stage, pending in self._stage_pending.items():
+            self.metrics.ingestion_backlog_events.labels(
+                stage=stage
+            ).set(sum(len(item.events) for item in pending))
+            oldest_age = (
+                max(0.0, now - pending[0].enqueued_at)
+                if pending
+                else 0.0
+            )
+            self.metrics.ingestion_oldest_event_age_seconds.labels(
+                stage=stage
+            ).set(oldest_age)
 
     async def _durable_worker(self) -> None:
         while True:
@@ -328,12 +391,16 @@ class ConfirmationPipeline:
                                 claimed,
                                 stage="durable",
                             )
-                            await self._state_queue.put(
-                                _StageBatch(claimed)
+                            await self._enqueue_stage(
+                                "state",
+                                self._state_queue,
+                                claimed,
                             )
                             if self.record_raw:
-                                await self._archive_queue.put(
-                                    _StageBatch(claimed)
+                                await self._enqueue_stage(
+                                    "archive",
+                                    self._archive_queue,
+                                    claimed,
                                 )
                         self.entry_gate.unblock(
                             "durable_ingest_error"
@@ -352,7 +419,7 @@ class ConfirmationPipeline:
                         await asyncio.sleep(1)
             finally:
                 self._durable_queue.task_done()
-                self._sync_stage_metrics()
+                self._complete_stage("durable", item)
 
     async def _state_worker(self) -> None:
         while True:
@@ -387,7 +454,7 @@ class ConfirmationPipeline:
                 raise
             finally:
                 self._state_queue.task_done()
-                self._sync_stage_metrics()
+                self._complete_stage("state", item)
 
     async def _archive_worker(self) -> None:
         while True:
@@ -422,7 +489,7 @@ class ConfirmationPipeline:
                         await asyncio.sleep(1)
             finally:
                 self._archive_queue.task_done()
-                self._sync_stage_metrics()
+                self._complete_stage("archive", item)
 
     async def process_transaction(
         self,
@@ -483,10 +550,11 @@ class ConfirmationPipeline:
         events: list[EventEnvelope],
     ) -> None:
         if self._background_workers_started:
-            await self._durable_queue.put(
-                _StageBatch(list(events))
+            await self._enqueue_stage(
+                "durable",
+                self._durable_queue,
+                events,
             )
-            self._sync_stage_metrics()
             return
         await self._process_decoded_event_batch_inline(events)
 

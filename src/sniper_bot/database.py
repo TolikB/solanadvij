@@ -2040,19 +2040,46 @@ class Database:
         checkpoints = await self.load_protocol_checkpoints()
         async with self.sessions.begin() as session:
             for protocol in ("pump", "pumpswap"):
-                session.add(
-                    StreamRecoveryGapRow(
-                        id=str(uuid4()),
-                        protocol=protocol,
-                        checkpoint_signature=checkpoints.get(protocol),
-                        reason=reason[:64],
-                        status="PENDING",
-                        attempts=1,
-                        discovered_at=now,
-                        last_attempt_at=now,
-                        completed_at=None,
-                    )
+                pending = list(
+                    (
+                        await session.scalars(
+                            select(StreamRecoveryGapRow)
+                            .where(
+                                StreamRecoveryGapRow.protocol == protocol,
+                                StreamRecoveryGapRow.status == "PENDING",
+                            )
+                            .order_by(
+                                StreamRecoveryGapRow.discovered_at,
+                                StreamRecoveryGapRow.id,
+                            )
+                            .with_for_update()
+                        )
+                    ).all()
                 )
+                if not pending:
+                    session.add(
+                        StreamRecoveryGapRow(
+                            id=str(uuid4()),
+                            protocol=protocol,
+                            checkpoint_signature=checkpoints.get(protocol),
+                            reason=reason[:64],
+                            status="PENDING",
+                            attempts=1,
+                            discovered_at=now,
+                            last_attempt_at=now,
+                            completed_at=None,
+                        )
+                    )
+                    continue
+                primary = pending[0]
+                primary.checkpoint_signature = checkpoints.get(protocol)
+                primary.reason = reason[:64]
+                primary.attempts = sum(row.attempts for row in pending) + 1
+                primary.last_attempt_at = now
+                for duplicate in pending[1:]:
+                    duplicate.status = "RESOLVED"
+                    duplicate.last_attempt_at = now
+                    duplicate.completed_at = now
 
     async def resolve_stream_recovery_gaps(self) -> None:
         now = datetime.now(tz=timezone.utc)

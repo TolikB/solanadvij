@@ -102,7 +102,8 @@ async def _must_reject(
         raise RuntimeError("PostgreSQL append-only trigger accepted a mutation")
 
 
-POSTGRES_EVENT_BATCH_SIZE = 512
+POSTGRES_EVENT_BATCH_SIZE = 1024
+POSTGRES_EVENT_MIN_EVENTS_PER_SECOND = 800.0
 POSTGRES_EVENT_BATCH_MAX_SECONDS = 1.0
 POSTGRES_EVENT_FAILURE_BATCH_MAX_SECONDS = 1.0
 POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS = 1.0
@@ -111,9 +112,21 @@ POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS = 1.0
 def _event_batch(prefix: str, now: datetime, *, count: int) -> list[EventEnvelope]:
     return [
         EventEnvelope(
-            source=EventSource.REPLAY,
-            protocol=EventProtocol.PUMPSWAP,
-            event_type=ChainEventType.SWAP_BUY,
+            source=(
+                EventSource.HELIUS_WSS
+                if index % 2 == 0
+                else EventSource.SOLANA_WSS
+            ),
+            protocol=(
+                EventProtocol.PUMP
+                if index % 2 == 0
+                else EventProtocol.PUMPSWAP
+            ),
+            event_type=(
+                ChainEventType.SWAP_BUY
+                if index % 3
+                else ChainEventType.SWAP_SELL
+            ),
             slot=10_000 + index,
             signature=f"{prefix}-{index:04d}",
             instruction_index=0,
@@ -288,9 +301,14 @@ async def _probe_event_batch(
             raise RuntimeError(
                 "PostgreSQL event staging is not transaction-local"
             )
-        if elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS:
+        event_rate = len(batch) / max(elapsed, 1e-9)
+        if (
+            elapsed > POSTGRES_EVENT_BATCH_MAX_SECONDS
+            or event_rate < POSTGRES_EVENT_MIN_EVENTS_PER_SECOND
+        ):
             raise RuntimeError(
-                "PostgreSQL event batch exceeded the one-second performance budget"
+                "PostgreSQL durable event batch failed the 800 events/s "
+                "performance gate"
             )
 
         async with database.sessions() as session:
@@ -383,7 +401,9 @@ async def _probe_event_batch(
         print(
             "POSTGRES_EVENT_BATCH_OK "
             f"rows={len(batch)} statements={len(statements)} "
-            f"elapsed_ms={elapsed * 1000:.3f} partition={expected_partition}"
+            f"elapsed_ms={elapsed * 1000:.3f} "
+            f"events_per_second={event_rate:.1f} "
+            f"partition={expected_partition}"
         )
     finally:
         if listener_attached:
@@ -823,10 +843,14 @@ async def _probe_event_state_batch(
             raise RuntimeError(
                 "PostgreSQL event-state batch unexpectedly used executemany"
             )
-        if elapsed > POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS:
+        event_rate = len(batch) / max(elapsed, 1e-9)
+        if (
+            elapsed > POSTGRES_EVENT_STATE_BATCH_MAX_SECONDS
+            or event_rate < POSTGRES_EVENT_MIN_EVENTS_PER_SECOND
+        ):
             raise RuntimeError(
-                "PostgreSQL event-state batch exceeded the one-second "
-                "performance budget"
+                "PostgreSQL event-state batch failed the 800 events/s "
+                "performance gate"
             )
 
         async with database.sessions() as session:
@@ -923,7 +947,8 @@ async def _probe_event_state_batch(
         print(
             "POSTGRES_EVENT_STATE_BATCH_OK "
             f"rows={len(batch)} statements={len(statements)} "
-            f"elapsed_ms={elapsed * 1000:.3f}"
+            f"elapsed_ms={elapsed * 1000:.3f} "
+            f"events_per_second={event_rate:.1f}"
         )
     finally:
         if listener_attached:
