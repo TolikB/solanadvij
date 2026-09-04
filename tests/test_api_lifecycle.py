@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -58,6 +59,23 @@ class _Runtime:
         return {"period": "all_time", "drawdown_source": "equity_marks"}
 
 
+class _UnreadyRuntime(_Runtime):
+    manages_lifecycle_notifications = True
+
+    def health_status(self) -> str:
+        return "DEGRADED"
+
+    async def wait_until_ready(
+        self,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        del timeout_seconds
+        self.events.append("readiness-wait")
+        await asyncio.Future()
+        return False
+
+
 def test_api_lifespan_sends_only_lifecycle_alerts() -> None:
     runtime = _Runtime()
     with TestClient(build_api(runtime)) as client:
@@ -78,3 +96,20 @@ def test_api_lifespan_sends_only_lifecycle_alerts() -> None:
         "alert-stop",
         "runtime-shutdown",
     ]
+
+def test_api_liveness_does_not_wait_for_runtime_readiness() -> None:
+    runtime = _UnreadyRuntime()
+
+    with TestClient(build_api(runtime)) as client:
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+
+        assert live.status_code == 200
+        assert live.json()["ok"] is True
+        assert ready.status_code == 503
+        assert "alert-start" not in runtime.events
+
+    assert "runtime-start" in runtime.events
+    assert "runtime-shutdown" in runtime.events
+    assert "alert-start" not in runtime.events
+    assert "alert-stop" not in runtime.events

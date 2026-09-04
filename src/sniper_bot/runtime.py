@@ -1440,6 +1440,8 @@ class SniperRuntime:
             raise ValueError("unsupported Telegram lifecycle event type")
         if not self.config.telegram.enabled:
             return
+        if event_type == "system_stop" and not self._lifecycle_start_sent:
+            return
         if self.database is not None and self.database_available:
             run_id = self._system_run_id or "unregistered"
             try:
@@ -1448,12 +1450,14 @@ class SniperRuntime:
                     event_type=event_type,
                     payload={"text": message},
                 )
-                return
             except Exception as exc:
                 logger.error(
                     "lifecycle alert outbox enqueue failed error_type=%s",
                     type(exc).__name__,
                 )
+            else:
+                self._lifecycle_start_sent = event_type == "system_start"
+                return
         notifier = getattr(self, "notifier", None)
         if notifier is None or not hasattr(notifier, "send"):
             return
@@ -1464,6 +1468,8 @@ class SniperRuntime:
                 "lifecycle alert delivery failed error_type=%s",
                 type(exc).__name__,
             )
+        else:
+            self._lifecycle_start_sent = event_type == "system_start"
 
     async def _notify_daily_report(self, report: dict[str, Any]) -> bool:
         if not self.config.telegram.enabled:

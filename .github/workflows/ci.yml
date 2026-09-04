@@ -122,6 +122,7 @@ jobs:
           set -euo pipefail
           export POSTGRES_DSN="$(sed -n 's/^POSTGRES_DSN=//p' .env)"
           export MIGRATION_POSTGRES_DSN="$(sed -n 's/^MIGRATION_POSTGRES_DSN=//p' .env)"
+          export TELEGRAM='{"enabled":false,"daily_report_time":"00:00","include_all_time_with_daily":false}'
           trap 'docker compose --env-file .env down -v --remove-orphans' EXIT
           docker compose --env-file .env up --build -d postgres migrate
           migrate_id="$(docker compose --env-file .env ps --all -q migrate)"

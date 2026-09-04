@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -17,6 +18,7 @@ from prometheus_client import CONTENT_TYPE_LATEST
 
 def build_api(runtime: Any) -> FastAPI:
     router = APIRouter()
+    readiness_task: asyncio.Task[None] | None = None
 
     def mode_value() -> str:
         return str(getattr(runtime.config.app_mode, "value", runtime.config.app_mode))
@@ -169,7 +171,41 @@ def build_api(runtime: Any) -> FastAPI:
             "now": datetime.now(tz=timezone.utc).isoformat(),
         }
 
+    async def notify_start_when_ready() -> None:
+        try:
+            while True:
+                ready = True
+                if hasattr(runtime, "wait_until_ready"):
+                    ready = await runtime.wait_until_ready(
+                        timeout_seconds=120.0
+                    )
+                if ready:
+                    break
+                logging.getLogger(__name__).error(
+                    "paper runtime is not ready; "
+                    "lifecycle start remains suppressed"
+                )
+            notifier = getattr(runtime, "notifier", None)
+            if hasattr(runtime, "_notify_lifecycle_alert"):
+                await runtime._notify_lifecycle_alert(
+                    "system_start", "Бот запущено."
+                )
+            elif notifier is not None:
+                try:
+                    await notifier.send("Бот запущено.")
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Telegram startup alert failed"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "readiness lifecycle task failed"
+            )
+
     async def on_startup() -> None:
+        nonlocal readiness_task
         if getattr(runtime.config, "replay_mode", False):
             return
         notifier = getattr(runtime, "notifier", None)
@@ -180,34 +216,36 @@ def build_api(runtime: Any) -> FastAPI:
         )
         if notifier is not None and telegram_enabled:
             try:
-                await notifier.start(start_polling=True, command_handler=handle_command)
+                await notifier.start(
+                    start_polling=True,
+                    command_handler=handle_command,
+                )
             except Exception:
-                logging.getLogger(__name__).exception("Telegram startup failed")
+                logging.getLogger(__name__).exception(
+                    "Telegram startup failed"
+                )
         if hasattr(runtime, "start"):
             await runtime.start()
-        ready = True
         if hasattr(runtime, "wait_until_ready"):
-            ready = await runtime.wait_until_ready(
-                timeout_seconds=120.0
+            readiness_task = asyncio.create_task(
+                notify_start_when_ready(),
+                name="lifecycle-readiness",
             )
-        if not ready:
-            raise RuntimeError(
-                "paper runtime did not become ready; "
-                "lifecycle start suppressed"
-            )
-        if hasattr(runtime, "_notify_lifecycle_alert"):
-            await runtime._notify_lifecycle_alert(
-                "system_start", "Бот запущено."
-            )
-        elif notifier is not None:
-            try:
-                await notifier.send("Бот запущено.")
-            except Exception:
-                logging.getLogger(__name__).exception("Telegram startup alert failed")
+        else:
+            await notify_start_when_ready()
 
     async def on_shutdown() -> None:
+        nonlocal readiness_task
         if getattr(runtime.config, "replay_mode", False):
             return
+        if readiness_task is not None:
+            if not readiness_task.done():
+                readiness_task.cancel()
+            try:
+                await readiness_task
+            except asyncio.CancelledError:
+                pass
+            readiness_task = None
         notifier = getattr(runtime, "notifier", None)
         manages_lifecycle = bool(
             getattr(
