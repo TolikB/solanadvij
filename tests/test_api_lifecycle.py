@@ -62,6 +62,12 @@ class _Runtime:
 class _UnreadyRuntime(_Runtime):
     manages_lifecycle_notifications = True
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.ledger = SimpleNamespace(
+            state=SimpleNamespace(is_halted=False)
+        )
+
     def health_status(self) -> str:
         return "DEGRADED"
 
