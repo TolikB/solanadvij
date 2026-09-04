@@ -622,18 +622,33 @@ class SniperRuntime:
                 )
             )
             report["signals"] = summary["signals"]
-            report_trades = dict(report.get("trades") or {})
+            report_trades_value = report.get("trades")
+            report_trades: dict[str, Any] = (
+                dict(report_trades_value)
+                if isinstance(report_trades_value, dict)
+                else {}
+            )
             report_trades.update(summary["trades"])
             report["trades"] = report_trades
-            execution = dict(
-                report.get("execution_quality") or {}
+            execution_value = report.get(
+                "execution_quality"
+            )
+            execution: dict[str, Any] = (
+                dict(execution_value)
+                if isinstance(execution_value, dict)
+                else {}
             )
             execution.update(summary["execution_quality"])
             report["execution_quality"] = execution
             report["exit_reasons"] = summary["exit_reasons"]
             report["rejections"] = summary["rejections"]
             report["open_positions"] = summary["open_positions"]
-            capital = dict(report.get("capital") or {})
+            capital_value = report.get("capital")
+            capital: dict[str, Any] = (
+                dict(capital_value)
+                if isinstance(capital_value, dict)
+                else {}
+            )
             capital["realized_pnl_usd"] = summary[
                 "realized_pnl_usd"
             ]

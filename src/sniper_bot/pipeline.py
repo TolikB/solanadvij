@@ -510,7 +510,7 @@ class ConfirmationPipeline:
         claimed_count = sum(1 for accepted in durable_results if accepted)
         if self.database is None or claimed_count < 2:
             for event, durable_accepted in zip(events, durable_results, strict=True):
-                await self.process_event(event, durable_claim=durable_accepted)
+                await self.process_event(event, durable_claim=bool(durable_accepted))
             return
         await self._process_claimed_event_batch(events, durable_results)
 
@@ -547,7 +547,7 @@ class ConfirmationPipeline:
                     ):
                         processed = await self.process_event(
                             event,
-                            durable_claim=durable_accepted,
+                            durable_claim=bool(durable_accepted),
                             _batch_state_transaction=True,
                             _defer_failure_cleanup=True,
                             _raw_already_recorded=self.record_raw,
