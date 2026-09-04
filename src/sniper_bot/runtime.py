@@ -15,6 +15,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
+from .events import EventSource
 from .broker import PaperBroker
 from .candidates import Candidate, CandidateState
 from .config import AppConfig, AppMode
@@ -333,7 +334,7 @@ class SniperRuntime:
                 if self.broker is not None:
                     self.broker._database = self.database
                 self.entry_gate.unblock("database_unavailable")
-            except Exception as exc:
+            except Exception:
                 run_id = self._system_run_id
                 self._system_run_id = None
                 if run_id is not None:
