@@ -15,13 +15,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
-from .events import EventSource
 from .broker import PaperBroker
 from .candidates import Candidate, CandidateState
 from .config import AppConfig, AppMode
 from .database import ActiveRuntimeError, Database, _telegram_report_text
 from .enrichment import DexscreenerClient
-from .events import ChainEventType, EventEnvelope, Protocol
+from .events import ChainEventType, EventEnvelope, EventSource, Protocol
 from .exit_engine import ExitDecision, ExitPolicy, ExitReason, evaluate_exit
 from .external_journal import ExternalJournal
 from .features import FeatureSnapshot, HolderObservation
