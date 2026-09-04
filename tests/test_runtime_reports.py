@@ -161,6 +161,10 @@ async def test_missing_historical_snapshot_notifies_once_and_allows_backfill(tmp
     }
     assert second is None
     assert len(database.outbox_calls) == 2
+    assert all(
+        call["event_type"] == "daily_report"
+        for call in database.outbox_calls
+    )
     assert database.outbox_calls[0]["payload"] == {
         "text": (
             "Щоденний звіт про тестову торгівлю\n"

@@ -314,6 +314,15 @@ class AppConfig(BaseSettings):
     def validate_mode_and_hash(self) -> "AppConfig":
         if self.app_mode == AppMode.LIVE:
             raise LiveTradingNotImplementedError()
+        if self.telegram.enabled and not self.replay_mode:
+            if self.time_zone != "Europe/Kyiv":
+                raise ValueError(
+                    "TIME_ZONE must be Europe/Kyiv when Telegram is enabled"
+                )
+            if self.telegram.daily_report_time != "00:00":
+                raise ValueError(
+                    "telegram.daily_report_time must be 00:00 when Telegram is enabled"
+                )
         revision_file = Path(
             os.environ.get("APP_REVISION_FILE", "/app/REVISION")
         )

@@ -7,7 +7,6 @@ from decimal import Decimal
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
-from solders.pubkey import Pubkey
 
 from .registry import SUPPORTED_QUOTE_MINTS
 
@@ -20,6 +19,11 @@ BURN_AND_SERVICE_ADDRESSES = frozenset(
         "SysvarRent111111111111111111111111111111111",
     }
 )
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BASE58_VALUES = {character: index for index, character in enumerate(_BASE58_ALPHABET)}
+_ED25519_P = 2**255 - 19
+_ED25519_D = (-121665 * pow(121666, _ED25519_P - 2, _ED25519_P)) % _ED25519_P
+_ED25519_SQRT_M1 = pow(2, (_ED25519_P - 1) // 4, _ED25519_P)
 
 
 class RejectReason(StrEnum):
@@ -182,15 +186,54 @@ def aggregate_holders(
     )
 
 
+def _decode_solana_address(value: str) -> bytes | None:
+    if not value:
+        return None
+    number = 0
+    try:
+        for character in value:
+            number = number * 58 + _BASE58_VALUES[character]
+    except KeyError:
+        return None
+    encoded = (
+        number.to_bytes((number.bit_length() + 7) // 8, "big")
+        if number
+        else b""
+    )
+    leading_zeroes = len(value) - len(value.lstrip("1"))
+    decoded = bytes(leading_zeroes) + encoded
+    return decoded if len(decoded) == 32 else None
+
+
+def _is_ed25519_curve_point(value: bytes) -> bool:
+    y = int.from_bytes(value, "little") & ((1 << 255) - 1)
+    sign = value[31] >> 7
+    if y >= _ED25519_P:
+        return False
+    y_squared = y * y % _ED25519_P
+    denominator = (_ED25519_D * y_squared + 1) % _ED25519_P
+    if denominator == 0:
+        return False
+    x_squared = (
+        (y_squared - 1)
+        * pow(denominator, _ED25519_P - 2, _ED25519_P)
+        % _ED25519_P
+    )
+    x = pow(x_squared, (_ED25519_P + 3) // 8, _ED25519_P)
+    if x * x % _ED25519_P != x_squared:
+        x = x * _ED25519_SQRT_M1 % _ED25519_P
+    if x * x % _ED25519_P != x_squared:
+        return False
+    return not (x == 0 and sign == 1)
+
+
 def _is_program_or_burn_owner(owner: str | None) -> bool:
     if owner is None:
         return False
     if owner in BURN_AND_SERVICE_ADDRESSES:
         return True
-    try:
-        return not Pubkey.from_string(owner).is_on_curve()
-    except ValueError:
-        return False
+    decoded = _decode_solana_address(owner)
+    return decoded is not None and not _is_ed25519_curve_point(decoded)
 
 
 class SecurityEngine:

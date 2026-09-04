@@ -139,10 +139,8 @@ jobs:
           POSTGRES_DSN="$restore_dsn" MIGRATION_POSTGRES_DSN="$restore_dsn" \
             uv run python scripts/verify_data.py
           printf '%s isolated_restore\n' "$GITHUB_SHA" > ci-gates/isolated_restore.ok
-      - name: No-live audit
-        run: |
-          uv run python scripts/audit_no_live.py
-          printf '%s no_live_audit\n' "$GITHUB_SHA" > ci-gates/no_live_audit.ok
+      - name: No-live source and manifest audit
+        run: uv run python scripts/audit_no_live.py
 
       - name: Compose configuration
         run: |
@@ -150,8 +148,16 @@ jobs:
           docker compose --env-file .env.example config --quiet
           printf '%s compose_config\n' "$GITHUB_SHA" > ci-gates/compose_config.ok
 
-      - name: Docker image build
-        run: docker build --build-arg APP_REVISION="$GITHUB_SHA" --tag solana-sniper-ci .
+      - name: Docker image build and no-live dependency audit
+        run: |
+          docker build --build-arg APP_REVISION="$GITHUB_SHA" --tag solana-sniper-ci .
+          docker run --rm --entrypoint python solana-sniper-ci -c "
+          import importlib.util as util
+          blocked = ('anchorpy', 'eth_account', 'solana', 'solders', 'web3')
+          present = [name for name in blocked if util.find_spec(name) is not None]
+          assert not present, f'signer-capable modules in production image: {present}'
+          "
+          printf '%s no_live_audit\n' "$GITHUB_SHA" > ci-gates/no_live_audit.ok
 
       - name: Docker Compose startup smoke
         shell: bash

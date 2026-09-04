@@ -548,7 +548,7 @@ class SniperRuntime:
                     f"telegram:daily-report-unavailable:{target}:"
                     f"{self.config.strategy_version}"
                 ),
-                event_type="daily_report_unavailable",
+                event_type="daily_report",
                 payload={
                     "text": (
                         "Щоденний звіт про тестову торгівлю\n"

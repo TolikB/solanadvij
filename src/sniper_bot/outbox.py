@@ -12,7 +12,7 @@ from .metrics import BotMetrics
 logger = logging.getLogger(__name__)
 
 PROACTIVE_TELEGRAM_EVENT_TYPES = frozenset(
-    {"system_start", "system_stop", "daily_report", "daily_report_unavailable"}
+    {"system_start", "system_stop", "daily_report"}
 )
 
 

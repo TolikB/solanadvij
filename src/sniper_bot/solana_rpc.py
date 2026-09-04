@@ -399,7 +399,7 @@ class SolanaRpcClient:
                     if not future.done()
                 ]
                 if batch:
-                    await self._send_transaction_batch(batch)
+                    await self._send_rpc_batch(batch)
         except asyncio.CancelledError:
             cancelled = True
             raise
@@ -419,7 +419,7 @@ class SolanaRpcClient:
             for _body, future in pending_to_cancel:
                 future.cancel()
 
-    async def _send_transaction_batch(
+    async def _send_rpc_batch(
         self,
         batch: list[tuple[dict[str, Any], asyncio.Future[_RpcResponse]]],
     ) -> None:
