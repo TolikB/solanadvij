@@ -425,7 +425,7 @@ async def test_gap_recovery_timeout_reconnects_without_partial_publish(
 
 
 @pytest.mark.asyncio
-async def test_stale_checkpoint_is_recovered_without_discard(
+async def test_stale_checkpoint_starts_audited_non_tradable_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = FakeConnection(
@@ -450,13 +450,24 @@ async def test_stale_checkpoint_is_recovered_without_discard(
         Protocol.PUMP,
         "old-signature",
     )
-    recovery_started = asyncio.Event()
+    gap_reasons: list[str] = []
+    gap_resolved = asyncio.Event()
 
-    async def expected_recovery() -> list[
-        tuple[Protocol, dict[str, Any], object]
-    ]:
-        recovery_started.set()
-        return []
+    async def unexpected_recovery() -> None:
+        pytest.fail("stale checkpoint must not trigger historical gap recovery")
+
+    async def record_gap(reason: str) -> None:
+        gap_reasons.append(reason)
+
+    async def resolve_gap() -> None:
+        gap_resolved.set()
+
+    checkpoint_discarded = asyncio.Event()
+    discard_checkpoint = gateway._discard_in_memory_checkpoint
+
+    def discard_and_notify() -> None:
+        discard_checkpoint()
+        checkpoint_discarded.set()
 
     monkeypatch.setattr(
         "sniper_bot.stream.websockets.connect",
@@ -465,25 +476,43 @@ async def test_stale_checkpoint_is_recovered_without_discard(
     monkeypatch.setattr(
         gateway,
         "_recover_gap",
-        expected_recovery,
+        unexpected_recovery,
     )
+    monkeypatch.setattr(
+        gateway,
+        "_discard_in_memory_checkpoint",
+        discard_and_notify,
+    )
+    gateway.gap_handler = record_gap
+    gateway.gap_resolved_handler = resolve_gap
+    recovery_gap_unblocked = asyncio.Event()
+    unblock = gateway.entry_gate.unblock
+
+    def unblock_and_notify(reason: str) -> None:
+        unblock(reason)
+        if reason == "stream_recovery_gap":
+            recovery_gap_unblocked.set()
+
+    monkeypatch.setattr(gateway.entry_gate, "unblock", unblock_and_notify)
     run_task = asyncio.create_task(gateway._run())
     try:
         async with asyncio.timeout(1):
-            await recovery_started.wait()
+            await checkpoint_discarded.wait()
+            await gap_resolved.wait()
+            await recovery_gap_unblocked.wait()
 
-        assert gateway.last_slot == 123
-        assert gateway.last_signature == "old-signature"
-        assert gateway.last_observed_at is not None
-        assert gateway._last_signatures == {
-            Protocol.PUMP: "old-signature"
-        }
+        assert gap_reasons == ["checkpoint_stale"]
+        assert gateway.last_slot == 0
+        assert gateway.last_signature is None
+        assert gateway.last_observed_at is None
+        assert gateway._last_signatures == {}
         assert "stream_recovery_gap" not in gateway.entry_gate.reasons
+        assert "stream_baseline" in gateway.entry_gate.reasons
+        assert "stream_stale" in gateway.entry_gate.reasons
     finally:
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await run_task
-
 
 @pytest.mark.asyncio
 async def test_triggering_overflow_message_forces_fail_closed_buffer() -> None:

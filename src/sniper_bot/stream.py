@@ -287,26 +287,41 @@ class HeliusStreamGateway:
                         pending_handshake_messages.extend(buffered)
                         recovered: list[tuple[Protocol, dict[str, Any], EventSource]] = []
                         if self.last_slot:
-                            try:
-                                recovered, pending_handshake_messages = (
-                                    await self._recover_gap_with_live_buffer(
-                                        websocket,
-                                        pending_handshake_messages,
-                                    )
+                            if not self._checkpoint_is_recent():
+                                logger.warning(
+                                    "Solana checkpoint exceeds the bounded recovery window; "
+                                    "recording the gap and starting a new non-tradable live baseline"
                                 )
-                            except _GapRecoveryTimeout as exc:
-                                logger.warning(str(exc))
-                                pending_handshake_messages.clear()
-                                self.entry_gate.block(
-                                    "stream_recovery_gap"
-                                )
+                                self.entry_gate.block("stream_recovery_gap")
                                 self.metrics.stream_recovery_gap_active.set(1)
                                 if self.gap_handler is not None:
-                                    await self.gap_handler(
-                                        "recovery_timeout"
+                                    await self.gap_handler("checkpoint_stale")
+                                if self.gap_resolved_handler is not None:
+                                    await self.gap_resolved_handler()
+                                self._discard_in_memory_checkpoint()
+                                self.entry_gate.unblock("stream_recovery_gap")
+                                self.metrics.stream_recovery_gap_active.set(0)
+                            else:
+                                try:
+                                    recovered, pending_handshake_messages = (
+                                        await self._recover_gap_with_live_buffer(
+                                            websocket,
+                                            pending_handshake_messages,
+                                        )
                                     )
-                                self.metrics.websocket_reconnects.inc()
-                                continue
+                                except _GapRecoveryTimeout as exc:
+                                    logger.warning(str(exc))
+                                    pending_handshake_messages.clear()
+                                    self.entry_gate.block(
+                                        "stream_recovery_gap"
+                                    )
+                                    self.metrics.stream_recovery_gap_active.set(1)
+                                    if self.gap_handler is not None:
+                                        await self.gap_handler(
+                                            "recovery_timeout"
+                                        )
+                                    self.metrics.websocket_reconnects.inc()
+                                    continue
                         if recovered:
                             await self._commit_recovered_events(recovered)
                             self.metrics.websocket_gap_recoveries.inc()
