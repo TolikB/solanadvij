@@ -15,19 +15,19 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_DB: sniper_durability
+          POSTGRES_DB: sniper_durability_ci
           POSTGRES_USER: sniper
           POSTGRES_PASSWORD: sniper-ci-password
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U sniper -d sniper_durability"
+          --health-cmd "pg_isready -U sniper -d sniper_durability_ci"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
     env:
-      POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_durability
-      MIGRATION_POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_durability
+      POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_durability_ci
+      MIGRATION_POSTGRES_DSN: postgresql://sniper:sniper-ci-password@127.0.0.1:5432/sniper_durability_ci
       POSTGRES_HARDENING_PROBE_CONFIRM: EPHEMERAL_CI_ONLY
       APP_MODE: paper
       APP_REVISION: ${{ github.sha }}
