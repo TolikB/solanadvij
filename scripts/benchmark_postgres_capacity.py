@@ -24,7 +24,14 @@ from typing import Any
 from sqlalchemy import delete, func, select
 
 from sniper_bot.database import Database
-from sniper_bot.db_models import EventDedupRow, RawChainEventRow
+from sniper_bot.db_models import (
+    CandidateRow,
+    EventDedupRow,
+    PoolRow,
+    RawChainEventRow,
+    StrategyVersionRow,
+    TokenRow,
+)
 from sniper_bot.events import EventEnvelope, EventSource, Protocol
 from sniper_bot.features import LiquidityObservation, TradeObservation
 from sniper_bot.metrics import BotMetrics
@@ -45,6 +52,7 @@ MAX_DRAIN_SECONDS = 60.0
 BACKLOG_SAMPLE_INTERVAL_SECONDS = 0.25
 DISTINCT_POOLS = 64
 BENCHMARK_SIGNATURE_PREFIX = "capacity-"
+BENCHMARK_STRATEGY = "capacity"
 
 # Roughly the observed mainnet mix: mostly PumpSwap swaps, a steady trickle of
 # new pools, and Pump bonding-curve trades alongside them.
@@ -347,8 +355,34 @@ def _benchmark_event_ids() -> Any:
     )
 
 
+def _synthetic_mints() -> list[str]:
+    return [_address(11, index) for index in range(DISTINCT_POOLS)]
+
+
+def _synthetic_pools() -> list[str]:
+    return [_address(7, index) for index in range(DISTINCT_POOLS)]
+
+
+async def _register_benchmark_strategy(database: Database) -> None:
+    # The runtime registers its strategy version before ingestion starts, and
+    # candidates reference it, so the gate has to do the same.
+    await database.register_strategy(
+        strategy_id=BENCHMARK_STRATEGY,
+        version=BENCHMARK_STRATEGY,
+        config_hash=BENCHMARK_STRATEGY,
+        config_json={},
+        now=datetime.now(tz=timezone.utc),
+    )
+
+
 async def _clear_benchmark_rows(database: Database) -> None:
     async with database.sessions.begin() as session:
+        # Children first: candidates reference tokens, pools and the strategy.
+        await session.execute(
+            delete(CandidateRow).where(
+                CandidateRow.strategy_version_id == BENCHMARK_STRATEGY
+            )
+        )
         await session.execute(
             delete(EventDedupRow).where(
                 EventDedupRow.event_id.in_(_benchmark_event_ids())
@@ -359,6 +393,19 @@ async def _clear_benchmark_rows(database: Database) -> None:
                 RawChainEventRow.signature.like(
                     f"{BENCHMARK_SIGNATURE_PREFIX}%"
                 )
+            )
+        )
+        await session.execute(
+            delete(PoolRow).where(
+                PoolRow.pool_address.in_(_synthetic_pools())
+            )
+        )
+        await session.execute(
+            delete(TokenRow).where(TokenRow.mint.in_(_synthetic_mints()))
+        )
+        await session.execute(
+            delete(StrategyVersionRow).where(
+                StrategyVersionRow.id == BENCHMARK_STRATEGY
             )
         )
 
@@ -413,8 +460,8 @@ async def _run_capacity_gate(dsn: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="sniper-capacity-") as temp_dir:
         pipeline = ConfirmationPipeline(
             data_dir=temp_dir,
-            strategy_version="capacity",
-            config_hash="capacity",
+            strategy_version=BENCHMARK_STRATEGY,
+            config_hash=BENCHMARK_STRATEGY,
             entry_gate=EntryGate(metrics),
             metrics=metrics,
             database=database,
@@ -428,6 +475,7 @@ async def _run_capacity_gate(dsn: str) -> dict[str, Any]:
         )
         try:
             await _clear_benchmark_rows(database)
+            await _register_benchmark_strategy(database)
             await pipeline.start_background_workers()
 
             per_tick = max(
