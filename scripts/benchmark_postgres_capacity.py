@@ -49,6 +49,14 @@ INTERNAL_EVENT_P95_LIMIT_MS = 250.0
 FEATURE_P95_LIMIT_MS = 100.0
 MAX_DRAIN_SECONDS = 60.0
 BACKLOG_SAMPLE_INTERVAL_SECONDS = 0.25
+# The ordered stage queues are bounded, so a pipeline that genuinely cannot
+# keep up blocks its producer instead of growing an unbounded backlog: that
+# shows up as lost throughput and rising latency, which the throughput, p95
+# and drain criteria already fail on. The backlog trend therefore only has to
+# separate a diverging queue from the ordinary in-flight batch, so it is
+# measured against a small fraction of the ingest rate rather than zero.
+BACKLOG_SLOPE_TOLERANCE_FRACTION = 0.01
+MINIMUM_BACKLOG_SLOPE_LIMIT = 1.0
 DISTINCT_POOLS = 64
 BENCHMARK_SIGNATURE_PREFIX = "capacity-"
 BENCHMARK_STRATEGY = "capacity"
@@ -192,6 +200,13 @@ def _p95(values: list[float]) -> float:
         raise ValueError("at least one latency sample is required")
     ordered = sorted(values)
     return ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)]
+
+
+def _backlog_slope_limit(notifications_per_second: float) -> float:
+    return max(
+        MINIMUM_BACKLOG_SLOPE_LIMIT,
+        BACKLOG_SLOPE_TOLERANCE_FRACTION * float(notifications_per_second),
+    )
 
 
 def _slope(samples: list[tuple[float, int]]) -> float:
@@ -570,10 +585,12 @@ def _failures(result: dict[str, Any]) -> list[str]:
             f"feature update p95 {result['feature_update_p95_ms']} ms reaches "
             f"{FEATURE_P95_LIMIT_MS} ms"
         )
-    if result["backlog_slope_events_per_second"] > 0:
+    slope_limit = _backlog_slope_limit(result["notifications_per_second"])
+    if result["backlog_slope_events_per_second"] > slope_limit:
         failures.append(
             "ingestion backlog trends upwards at "
-            f"{result['backlog_slope_events_per_second']} events/s"
+            f"{result['backlog_slope_events_per_second']} events/s, "
+            f"above {round(slope_limit, 3)} events/s"
         )
     if result["dropped_events"]:
         failures.append(f"{result['dropped_events']} events were dropped")

@@ -38,8 +38,11 @@ from this internal-processing NFR.
 notification mix, encoded from the same vendored Anchor IDLs the decoders use, through the ordered
 durable, state, and archive workers. It exits nonzero unless the run sustains at least 800
 notifications/s, keeps internal event p95 under 250 ms and feature-update p95 under 100 ms, drops no
-events, reconciles every persisted event to applied state, keeps the ingestion backlog from trending
-upwards, and drains within 60 seconds. `CAPACITY_WARMUP_SECONDS` and `CAPACITY_MEASURED_SECONDS`
+events, reconciles every persisted event to applied state, keeps the ingestion backlog from
+diverging, and drains within 60 seconds. Because the ordered stage queues are bounded, a pipeline
+that cannot keep up blocks its producer rather than growing an unbounded backlog, so real divergence
+appears as lost throughput and rising latency; the backlog trend is therefore compared against one
+percent of the ingest rate, which separates a diverging queue from the ordinary in-flight batch. `CAPACITY_WARMUP_SECONDS` and `CAPACITY_MEASURED_SECONDS`
 tune only the window, never the targets. It runs in its own `durability` CI job together with the
 fresh and previous-revision migrations, the downgrade guard, concurrent canonical locking, and the
 archive-rebuild tests; that job publishes its gate receipts to the release evidence bundle.

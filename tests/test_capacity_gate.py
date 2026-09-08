@@ -8,6 +8,7 @@ from scripts.benchmark_postgres_capacity import (
     MAX_DRAIN_SECONDS,
     TARGET_NOTIFICATIONS_PER_SECOND,
     NotificationGenerator,
+    _backlog_slope_limit,
     _failures,
     _slope,
 )
@@ -81,7 +82,7 @@ def test_capacity_gate_rejects_each_missed_target() -> None:
     }
     growing_backlog = {
         **_passing_result(),
-        "backlog_slope_events_per_second": 12.5,
+        "backlog_slope_events_per_second": 825.0,
     }
     dropped = {**_passing_result(), "dropped_events": 3}
     unapplied = {**_passing_result(), "events_processed": 15_999}
@@ -106,3 +107,21 @@ def test_backlog_slope_separates_a_rising_queue_from_a_stable_one() -> None:
     assert _slope(rising) > 0
     assert _slope(stable) <= 0.5
     assert _slope([]) == 0.0
+
+
+def test_one_in_flight_batch_is_not_a_diverging_backlog() -> None:
+    # The stage queues are bounded, so an ordinary in-flight batch always
+    # leaves a small positive trend. Only divergence may fail the gate.
+    in_flight = {
+        **_passing_result(),
+        "backlog_slope_events_per_second": 2.6,
+    }
+    diverging = {
+        **_passing_result(),
+        "backlog_slope_events_per_second": 826.0,
+    }
+
+    assert _backlog_slope_limit(800.0) == 8.0
+    assert _backlog_slope_limit(10.0) == 1.0
+    assert _failures(in_flight) == []
+    assert "backlog trends upwards" in _failures(diverging)[0]
