@@ -29,7 +29,6 @@ from sniper_bot.db_models import (
     EventDedupRow,
     PoolRow,
     RawChainEventRow,
-    StrategyVersionRow,
     TokenRow,
 )
 from sniper_bot.events import EventEnvelope, EventSource, Protocol
@@ -403,11 +402,8 @@ async def _clear_benchmark_rows(database: Database) -> None:
         await session.execute(
             delete(TokenRow).where(TokenRow.mint.in_(_synthetic_mints()))
         )
-        await session.execute(
-            delete(StrategyVersionRow).where(
-                StrategyVersionRow.id == BENCHMARK_STRATEGY
-            )
-        )
+        # strategy_versions is append-only by database trigger, and registering
+        # the same row again is a no-op, so the gate leaves its row in place.
 
 
 async def _count_benchmark_events(database: Database) -> tuple[int, int]:
