@@ -37,12 +37,14 @@ MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
 MAX_STATISTICAL_EQUITY_MARKS = 100_000
 REQUIRED_CI_GATES = frozenset(
     {
+        "archive_rebuild",
         "compose_config",
         "data_integrity",
         "deterministic_replay",
         "docker_startup",
         "internal_latency",
         "no_live_audit",
+        "postgres_capacity",
         "postgres_previous_migration",
         "postgres_hardening",
         "ruff",

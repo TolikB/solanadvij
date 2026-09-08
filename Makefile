@@ -1,4 +1,4 @@
-.PHONY: install test lint typecheck migrate run replay verify-data audit-no-live
+.PHONY: install test lint typecheck migrate run replay verify-data audit-no-live capacity
 
 install:
 	python -m pip install -e ".[dev]"
@@ -26,3 +26,6 @@ verify-data:
 
 audit-no-live:
 	python scripts/audit_no_live.py
+
+capacity:
+	python scripts/benchmark_postgres_capacity.py
