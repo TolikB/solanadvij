@@ -442,6 +442,7 @@ async def test_stale_checkpoint_stays_fail_closed_until_backfill(
 
     gateway = _gateway()
     gateway.GAP_RECOVERY_TIMEOUT_SECONDS = 0.01
+    gateway.BACKOFF_SECONDS = (0.01,)
     gateway.restore_checkpoint(
         123,
         "old-signature",

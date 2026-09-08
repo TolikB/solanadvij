@@ -352,6 +352,18 @@ class HeliusStreamGateway:
                                             "recovery_timeout"
                                         )
                                     self.metrics.websocket_reconnects.inc()
+                                    if stale_checkpoint:
+                                        # A stale checkpoint keeps retrying the
+                                        # backfill fail-closed, so back off to
+                                        # avoid an unbounded RPC hot loop.
+                                        delay = self.BACKOFF_SECONDS[
+                                            min(
+                                                attempt,
+                                                len(self.BACKOFF_SECONDS) - 1,
+                                            )
+                                        ]
+                                        attempt += 1
+                                        await asyncio.sleep(delay)
                                     continue
                         if recovered:
                             await self._commit_recovered_events(recovered)

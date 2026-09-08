@@ -20,7 +20,8 @@ This matrix separates implemented behavior from environment-dependent acceptance
 | Reports | Stored historical daily snapshots and all-time reports, scheduled idempotency, operational costs | Runtime report, database, API, and replay tests; examples under `docs/examples` |
 | Record and replay | Raw reader, virtual clock, ordered external journals, seed, golden hashes | Offline, deterministic, golden, and no-network tests |
 | API, metrics, and logging | Localhost read-only API, Prometheus metrics, JSON redaction | API/config/logging tests and no-live audit |
-| Performance NFR | Internal feature and event processing benchmark with warm-up | CI and local p95 benchmark gate |
+| Performance NFR | Internal feature and event processing benchmark with warm-up; ordered durable/state/archive workers with bounded batches | CI and local p95 benchmark gate plus the PostgreSQL capacity gate at 800 notifications/s |
+| Durability and fault tolerance | Durable ingest checkpoints, immutable archive segments, recovery-gap audit rows, fail-closed stale checkpoints | Fault-injection tests at each ordered boundary and archive rebuild from PostgreSQL |
 | PostgreSQL and migrations | SQLAlchemy schema, Alembic, period-bounded operational-cost ledger, app-role grants, backup/restore/integrity scripts | Fresh and previous-revision migration smoke; integrity and acceptance-loader queries |
 | Deployment package | Non-root image, Compose health checks, restart policy, volumes, rotation, backup | Compose config plus image build and startup/liveness/non-root smoke in CI |
 
@@ -29,7 +30,10 @@ This matrix separates implemented behavior from environment-dependent acceptance
 Local automated gates include the full pytest suite with coverage XML, Ruff, strict mypy,
 fresh-schema migration, previous-revision migration, integrity queries, golden replay, and the
 no-live source audit. GitHub Actions repeats these gates against PostgreSQL 16 and validates the
-Compose configuration.
+Compose configuration. A separate `durability` job carries the fresh and previous-revision
+migrations, the downgrade guard, concurrent canonical locking, the archive-rebuild and
+fault-injection tests, and the PostgreSQL capacity gate; its receipts join the release evidence
+bundle.
 
 ## External operating gates
 
