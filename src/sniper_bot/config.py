@@ -45,6 +45,11 @@ class ChainConfig(BaseModel):
     primary_commitment: str = "confirmed"
     max_stream_lag_ms: int = 3000
     warmup_seconds: int = 60
+    # Fail-closed by default: a checkpoint older than the bounded recovery
+    # window keeps the recovery gap open and entries blocked. Operators may
+    # accept the archive hole explicitly, which is recorded as an ACCEPTED
+    # recovery gap before a fresh non-tradable baseline starts.
+    allow_stale_checkpoint_reset: bool = False
 
 
 class PaperConfig(BaseModel):

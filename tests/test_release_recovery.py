@@ -130,6 +130,34 @@ async def test_recovery_gap_retries_update_one_pending_row_per_protocol(
 
 
 @pytest.mark.asyncio
+async def test_operator_accepted_gap_is_terminal_and_survives_resolution(
+    tmp_path: Path,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'accepted_gaps.db'}")
+    await database.create_schema_for_tests()
+    try:
+        await database.record_stream_recovery_gap("operator_baseline_reset")
+        await database.resolve_stream_recovery_gaps()
+
+        async with database.sessions() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(StreamRecoveryGapRow).order_by(
+                            StreamRecoveryGapRow.protocol
+                        )
+                    )
+                ).all()
+            )
+        assert len(rows) == 2
+        assert all(row.status == "ACCEPTED" for row in rows)
+        assert all(row.completed_at is not None for row in rows)
+        assert all(row.reason == "operator_baseline_reset" for row in rows)
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_atomic_archive_rename_failure_leaves_no_segment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

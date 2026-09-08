@@ -79,6 +79,7 @@ RUNTIME_ADVISORY_LOCK_CLASS_ID = 21326
 RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
 MAX_EVENT_PROCESSING_ATTEMPTS = 3
 MAX_EVENT_BATCH_SIZE = 1024
+ACCEPTED_RECOVERY_GAP_REASONS = frozenset({"operator_baseline_reset"})
 SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
 POSTGRES_EVENT_STAGE_TABLE = "sniper_event_ingest_stage"
@@ -2059,6 +2060,12 @@ class Database:
 
     async def record_stream_recovery_gap(self, reason: str) -> None:
         now = datetime.now(tz=timezone.utc)
+        # Operator-accepted baseline resets are terminal audit rows: they must
+        # never be closed by a later successful recovery, because the archive
+        # hole they record is permanent.
+        accepted = reason in ACCEPTED_RECOVERY_GAP_REASONS
+        status = "ACCEPTED" if accepted else "PENDING"
+        completed_at = now if accepted else None
         checkpoints = await self.load_protocol_checkpoints()
         async with self.sessions.begin() as session:
             for protocol in ("pump", "pumpswap"):
@@ -2085,17 +2092,19 @@ class Database:
                             protocol=protocol,
                             checkpoint_signature=checkpoints.get(protocol),
                             reason=reason[:64],
-                            status="PENDING",
+                            status=status,
                             attempts=1,
                             discovered_at=now,
                             last_attempt_at=now,
-                            completed_at=None,
+                            completed_at=completed_at,
                         )
                     )
                     continue
                 primary = pending[0]
                 primary.checkpoint_signature = checkpoints.get(protocol)
                 primary.reason = reason[:64]
+                primary.status = status
+                primary.completed_at = completed_at
                 primary.attempts = sum(row.attempts for row in pending) + 1
                 primary.last_attempt_at = now
                 for duplicate in pending[1:]:

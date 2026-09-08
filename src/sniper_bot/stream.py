@@ -138,6 +138,7 @@ class HeliusStreamGateway:
         max_processing_lag_seconds: float = 3.0,
         log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
         notification_queue_size: int = NOTIFICATION_QUEUE_SIZE,
+        allow_stale_checkpoint_reset: bool = False,
     ) -> None:
         if max_processing_lag_seconds <= 0:
             raise ValueError("max_processing_lag_seconds must be greater than zero")
@@ -152,6 +153,7 @@ class HeliusStreamGateway:
         self.fatal_handler = fatal_handler
         self.gap_handler = gap_handler
         self.gap_resolved_handler = gap_resolved_handler
+        self.allow_stale_checkpoint_reset = allow_stale_checkpoint_reset
         self.entry_gate = entry_gate
         self.metrics = metrics
         self.last_slot = 0
@@ -299,21 +301,38 @@ class HeliusStreamGateway:
                         pending_handshake_messages.extend(buffered)
                         recovered: list[tuple[Protocol, dict[str, Any], EventSource]] = []
                         if self.last_slot:
-                            if not self._checkpoint_is_recent():
+                            stale_checkpoint = not self._checkpoint_is_recent()
+                            if (
+                                stale_checkpoint
+                                and self.allow_stale_checkpoint_reset
+                            ):
                                 logger.warning(
-                                    "Solana checkpoint exceeds the bounded recovery window; "
-                                    "recording the gap and starting a new non-tradable live baseline"
+                                    "Solana checkpoint exceeds the bounded recovery window and "
+                                    "operators accepted the archive gap; starting a new "
+                                    "non-tradable live baseline"
                                 )
                                 self.entry_gate.block("stream_recovery_gap")
                                 self.metrics.stream_recovery_gap_active.set(1)
                                 if self.gap_handler is not None:
-                                    await self.gap_handler("checkpoint_stale")
-                                if self.gap_resolved_handler is not None:
-                                    await self.gap_resolved_handler()
+                                    await self.gap_handler(
+                                        "operator_baseline_reset"
+                                    )
                                 self._discard_in_memory_checkpoint()
                                 self.entry_gate.unblock("stream_recovery_gap")
                                 self.metrics.stream_recovery_gap_active.set(0)
                             else:
+                                if stale_checkpoint:
+                                    logger.error(
+                                        "Solana checkpoint exceeds the bounded recovery window; "
+                                        "entries stay blocked until the paginated backfill "
+                                        "completes"
+                                    )
+                                    self.entry_gate.block("stream_recovery_gap")
+                                    self.metrics.stream_recovery_gap_active.set(1)
+                                    if self.gap_handler is not None:
+                                        await self.gap_handler(
+                                            "checkpoint_stale"
+                                        )
                                 try:
                                     recovered, pending_handshake_messages = (
                                         await self._recover_gap_with_live_buffer(

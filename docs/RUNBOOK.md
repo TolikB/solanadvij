@@ -31,6 +31,28 @@ python scripts/control.py resume
 These commands use Linux pidfds and the PID plus process start time stored in `data/sniper.pid`.
 They fail closed if the file is stale, malformed, or no longer identifies the running bot.
 
+## Stale stream checkpoint
+
+When the durable stream checkpoint is older than the bounded recovery window, the gateway keeps
+resuming from that checkpoint, records an `OPEN` row in `stream_recovery_gaps`, blocks entries with
+`stream_recovery_gap`, and serves `/health/ready` as `503`. It never starts a tradable baseline over
+an archive hole, so a bot that was down longer than the recovery window will not trade until the
+paginated backfill completes.
+
+If the backfill cannot complete, accepting the archive hole is an explicit operator decision, never
+an automatic one:
+
+1. Confirm from `/api/v1/status` and `stream_recovery_gaps` that the backfill is genuinely
+   unreachable, and record why.
+2. Stop only this project's bot:
+   `docker compose -p solanadvij --env-file .env stop sniper-bot`.
+3. Set `chain.allow_stale_checkpoint_reset: true` in `configs/default.yaml`, restart `sniper-bot`,
+   and wait for the `ACCEPTED` `stream_recovery_gaps` rows that permanently record the hole.
+4. Set the flag back to `false` and restart again, so the next stale checkpoint fails closed.
+
+`ACCEPTED` gap rows are terminal. A later successful recovery never resolves them, and the affected
+range must be excluded from canonical replay acceptance evidence.
+
 ## Database recovery
 
 Daily dumps and checksums are written to the `backups` volume. Test restore on a separate empty

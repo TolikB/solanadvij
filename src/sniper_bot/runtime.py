@@ -186,6 +186,9 @@ class SniperRuntime:
             max_processing_lag_seconds=(
                 float(config.chain.max_stream_lag_ms) / 1000.0
             ),
+            allow_stale_checkpoint_reset=(
+                config.chain.allow_stale_checkpoint_reset
+            ),
         )
         self.report_builder = ReportBuilder(self)
         self.manages_lifecycle_notifications = True
