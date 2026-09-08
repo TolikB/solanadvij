@@ -397,29 +397,40 @@ class ConfirmationPipeline:
     ) -> None:
         carried: _StageBatch | None = None
         stopping = False
-        while True:
-            if carried is not None:
-                first = carried
-                carried = None
-            else:
-                received = await queue.get()
-                if received is None:
-                    queue.task_done()
+        try:
+            while True:
+                if carried is not None:
+                    first = carried
+                    carried = None
+                else:
+                    received = await queue.get()
+                    if received is None:
+                        queue.task_done()
+                        return
+                    first = received
+                if stopping:
+                    items = [first]
+                else:
+                    items, carried, stopping = self._collect_stage_batch(
+                        queue, first
+                    )
+                combined_events = [
+                    event for item in items for event in item.events
+                ]
+                try:
+                    await handler(combined_events)
+                finally:
+                    for item in items:
+                        queue.task_done()
+                        self._complete_stage(stage, item)
+                if stopping and carried is None:
                     return
-                first = received
-            if stopping:
-                items = [first]
-            else:
-                items, carried, stopping = self._collect_stage_batch(queue, first)
-            combined_events = [event for item in items for event in item.events]
-            try:
-                await handler(combined_events)
-            finally:
-                for item in items:
-                    queue.task_done()
-                    self._complete_stage(stage, item)
-            if stopping and carried is None:
-                return
+        finally:
+            # A batch pulled ahead of a failure still has to be released, or a
+            # shutdown drain would wait on it until the fail-closed timeout.
+            if carried is not None:
+                queue.task_done()
+                self._complete_stage(stage, carried)
 
     async def _durable_worker(self) -> None:
         await self._run_stage_worker(

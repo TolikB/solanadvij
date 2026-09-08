@@ -7,6 +7,7 @@ without a gap and without duplicate effects.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -350,4 +351,47 @@ async def test_unfinished_archive_segment_is_rebuilt_on_restart(
         assert rebuilt.dedup_rows == len(events)
         assert rebuilt.processed_rows == len(events)
     finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_state_failure_releases_a_batch_pulled_ahead_of_the_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sniper_bot.pipeline.MAX_EVENT_BATCH_SIZE", 3)
+    database = await _database(tmp_path, "carried_state.db")
+    pipeline = _pipeline(database, tmp_path, record_raw=False)
+    first_batch = [_event(index) for index in range(2)]
+    second_batch = [_event(index) for index in range(2, 4)]
+
+    async def failing_state_batch(*_args: Any, **_kwargs: Any) -> None:
+        raise InjectedFailure("state commit failed mid-backlog")
+
+    try:
+        await database.record_events(first_batch)
+        await database.record_events(second_batch)
+        await pipeline.start_background_workers()
+        monkeypatch.setattr(
+            pipeline, "_process_claimed_event_batch", failing_state_batch
+        )
+        await pipeline._enqueue_stage(
+            "state", pipeline._state_queue, first_batch
+        )
+        await pipeline._enqueue_stage(
+            "state", pipeline._state_queue, second_batch
+        )
+
+        with pytest.raises(InjectedFailure):
+            await pipeline.stop_background_workers(timeout_seconds=5)
+
+        assert pipeline._stage_pending["state"] == deque()
+        assert "stage_tracking_error" not in pipeline.entry_gate.reasons
+        assert "state_apply_error" in pipeline.entry_gate.reasons
+
+        crashed = await _reconcile(database)
+        assert crashed.processed_rows == 0
+        assert crashed.raw_rows == len(first_batch) + len(second_batch)
+    finally:
+        for event in first_batch + second_batch:
+            database.release_event_claim(event.event_id)
         await database.close()
