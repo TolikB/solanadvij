@@ -80,6 +80,25 @@ RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
 MAX_EVENT_PROCESSING_ATTEMPTS = 3
 MAX_EVENT_BATCH_SIZE = 1024
 ACCEPTED_RECOVERY_GAP_REASONS = frozenset({"operator_baseline_reset"})
+# Staged upserts must be applied parents-first: a candidate references its
+# token and pool, so an alphabetical order would violate those foreign keys.
+# The schema's own dependency order stays deterministic as the schema grows.
+TABLE_DEPENDENCY_ORDER: dict[str, int] = {
+    table.name: index
+    for index, table in enumerate(Base.metadata.sorted_tables)
+}
+
+
+def _upsert_group_order(
+    group_key: tuple[Any, tuple[str, ...]],
+) -> tuple[int, str, tuple[str, ...]]:
+    model, keys = group_key
+    table_name = getattr(model, "__tablename__", "")
+    return (
+        TABLE_DEPENDENCY_ORDER.get(table_name, len(TABLE_DEPENDENCY_ORDER)),
+        model.__name__,
+        keys,
+    )
 TELEGRAM_OPEN_POSITION_LINES = 10
 SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
@@ -532,7 +551,7 @@ class Database:
                     )
         for group_key in sorted(
             batch.upsert_groups.keys(),
-            key=lambda k: (k[0].__name__, k[1]),
+            key=_upsert_group_order,
         ):
             group = batch.upsert_groups[group_key]
             sorted_rows = sorted(
