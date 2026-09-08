@@ -327,3 +327,59 @@ async def test_runtime_warmup_and_enrichment_success(
 
     queue.task_done.assert_called_once()
     runtime.enrichment.get_token.assert_awaited_once_with("mint")
+
+
+@pytest.mark.asyncio
+async def test_shutdown_completes_every_step_when_one_fails(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    database = _startup_database()
+    runtime.database = database
+    runtime.pipeline.start_background_workers = AsyncMock()
+    runtime.pipeline.stop_background_workers = AsyncMock()
+    runtime.stream_gateway.start = AsyncMock()
+    runtime.stream_gateway.stop = AsyncMock(
+        side_effect=RuntimeError("stream gateway stop failed")
+    )
+    runtime._install_signal_controls = MagicMock()
+
+    await runtime.start()
+
+    with pytest.raises(RuntimeError, match="stream gateway stop failed"):
+        await runtime.shutdown()
+
+    runtime.pipeline.stop_background_workers.assert_awaited_once_with(
+        timeout_seconds=120.0
+    )
+    database.stop_system_run.assert_awaited_once()
+    database.close.assert_awaited_once()
+    runtime.notifier.stop.assert_awaited_once()
+    assert runtime._started is False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reports_every_failure_together(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    database = _startup_database()
+    database.close.side_effect = RuntimeError("database close failed")
+    runtime.database = database
+    runtime.pipeline.start_background_workers = AsyncMock()
+    runtime.pipeline.stop_background_workers = AsyncMock(
+        side_effect=RuntimeError("ordered queues did not drain")
+    )
+    runtime.stream_gateway.start = AsyncMock()
+    runtime.stream_gateway.stop = AsyncMock()
+    runtime._install_signal_controls = MagicMock()
+
+    await runtime.start()
+
+    with pytest.raises(BaseExceptionGroup) as caught:
+        await runtime.shutdown()
+
+    messages = {str(error) for error in caught.value.exceptions}
+    assert messages == {
+        "ordered queues did not drain",
+        "database close failed",
+    }
+    database.stop_system_run.assert_awaited_once()
+    runtime.notifier.stop.assert_awaited_once()
+    assert runtime._started is False
