@@ -727,26 +727,50 @@ class SniperRuntime:
             except asyncio.CancelledError:
                 pass
         self._background_tasks = []
-        if not self.config.replay_mode:
-            await self.stream_gateway.stop()
-        await self.pipeline.stop_background_workers(
-            timeout_seconds=120.0
-        )
-        if self.config.telegram.enabled:
-            await self._notify_lifecycle_alert(
-                "system_stop",
-                "Бот зупинено.",
+        errors: list[BaseException] = []
+        try:
+            if not self.config.replay_mode:
+                await self.stream_gateway.stop()
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("stream gateway stop failed")
+
+        try:
+            await self.pipeline.stop_background_workers(
+                timeout_seconds=120.0
             )
-        if self.outbox_worker is not None:
-            drained = await self.outbox_worker.drain(timeout_seconds=5.0)
-            if not drained:
-                logger.warning(
-                    "telegram outbox drain did not complete; undelivered events remain durable"
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("pipeline stop_background_workers failed")
+
+        if self.config.telegram.enabled:
+            try:
+                await self._notify_lifecycle_alert(
+                    "system_stop",
+                    "Бот зупинено.",
                 )
-            await self.outbox_worker.stop()
+            except BaseException as exc:
+                errors.append(exc)
+                logger.exception("lifecycle stop notification failed")
+
+        if self.outbox_worker is not None:
+            try:
+                drained = await self.outbox_worker.drain(timeout_seconds=5.0)
+                if not drained:
+                    logger.warning(
+                        "telegram outbox drain did not complete; undelivered events remain durable"
+                    )
+                await self.outbox_worker.stop()
+            except BaseException as exc:
+                errors.append(exc)
+                logger.exception("outbox worker stop failed")
+
         if self._persistence_tasks:
-            await asyncio.gather(*self._persistence_tasks, return_exceptions=True)
-            self._persistence_tasks.clear()
+            try:
+                await asyncio.gather(*self._persistence_tasks, return_exceptions=True)
+            finally:
+                self._persistence_tasks.clear()
+
         if self.database is not None:
             try:
                 if self._system_run_id is not None:
@@ -755,10 +779,27 @@ class SniperRuntime:
                         reason="graceful_shutdown",
                         now=datetime.now(tz=timezone.utc),
                     )
+            except BaseException as exc:
+                errors.append(exc)
+                logger.exception("database stop_system_run failed")
             finally:
-                await self.database.close()
-        await self.notifier.stop()
+                try:
+                    await self.database.close()
+                except BaseException as exc:
+                    errors.append(exc)
+                    logger.exception("database close failed")
+
+        try:
+            await self.notifier.stop()
+        except BaseException as exc:
+            errors.append(exc)
+            logger.exception("notifier stop failed")
+
         self._started = False
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise BaseExceptionGroup("multiple errors during runtime shutdown", errors)
 
     def _install_signal_controls(self) -> None:
         if os.name == "nt":

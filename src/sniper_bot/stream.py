@@ -210,6 +210,7 @@ class HeliusStreamGateway:
             except asyncio.CancelledError:
                 pass
             self._run_task = None
+        drain_error: BaseException | None = None
         try:
             async with asyncio.timeout(
                 self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS
@@ -222,43 +223,54 @@ class HeliusStreamGateway:
         except TimeoutError as exc:
             self.entry_gate.block("stream_recovery_gap")
             self.metrics.stream_recovery_gap_active.set(1)
-            raise RuntimeError(
+            drain_error = RuntimeError(
                 "Solana ingress queues did not drain within "
                 f"{self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS:g} seconds"
-            ) from exc
+            )
+            drain_error.__cause__ = exc
         finally:
             self.metrics.shutdown_drain_seconds.labels(
                 stage="stream_ingress"
             ).observe(
                 asyncio.get_running_loop().time() - started
             )
-        await self._cancel_log_fetch_tasks()
-        if self._worker_task is not None:
-            worker_task = self._worker_task
-            drain_task: asyncio.Task[None] | None = None
-            if not worker_task.done():
-                drain_task = asyncio.create_task(
-                    self._queue.join(), name="chain-event-queue-drain"
-                )
-                completed, _ = await asyncio.wait(
-                    {worker_task, drain_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if worker_task in completed:
-                    drain_task.cancel()
+            await self._cancel_log_fetch_tasks()
+            if self._notification_dispatch_task is not None:
+                if not self._notification_dispatch_task.done():
+                    self._notification_dispatch_task.cancel()
                     try:
-                        await drain_task
+                        await self._notification_dispatch_task
                     except asyncio.CancelledError:
                         pass
-                else:
-                    worker_task.cancel()
-            try:
-                await worker_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("chain event worker had already failed during shutdown")
-            self._worker_task = None
+                self._notification_dispatch_task = None
+            if self._worker_task is not None:
+                worker_task = self._worker_task
+                drain_task: asyncio.Task[None] | None = None
+                if not worker_task.done():
+                    drain_task = asyncio.create_task(
+                        self._queue.join(), name="chain-event-queue-drain"
+                    )
+                    completed, _ = await asyncio.wait(
+                        {worker_task, drain_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if worker_task in completed:
+                        drain_task.cancel()
+                        try:
+                            await drain_task
+                        except asyncio.CancelledError:
+                            pass
+                    else:
+                        worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("chain event worker had already failed during shutdown")
+                self._worker_task = None
+        if drain_error is not None:
+            raise drain_error
 
     async def _run(self) -> None:
         attempt = 0

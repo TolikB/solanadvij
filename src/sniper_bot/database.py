@@ -528,11 +528,19 @@ class Database:
                         "raw event batch context update affected "
                         f"{getattr(result, 'rowcount', None)} rows"
                     )
-        for group in batch.upsert_groups.values():
+        for group_key in sorted(
+            batch.upsert_groups.keys(),
+            key=lambda k: (k[0].__name__, k[1]),
+        ):
+            group = batch.upsert_groups[group_key]
+            sorted_rows = sorted(
+                group.rows.values(),
+                key=lambda row: tuple(str(row.get(k)) for k in group.keys),
+            )
             await self._execute_upsert_rows(
                 session,
                 group.model,
-                list(group.rows.values()),
+                sorted_rows,
                 group.keys,
             )
         await self._execute_mark_events_processed(
@@ -1931,15 +1939,28 @@ class Database:
         if not latest:
             return
         now = datetime.now(tz=timezone.utc)
-        async with self.sessions.begin() as session:
-            for protocol, event in latest.items():
-                row = await session.scalar(
+        sorted_protocols = sorted(latest)
+        async with self._write_session() as session:
+            if (
+                self._event_write_session.get() is None
+                and session.bind is not None
+                and session.bind.dialect.name == "postgresql"
+            ):
+                await session.execute(text("SET LOCAL synchronous_commit TO OFF"))
+            rows = (
+                await session.scalars(
                     select(StreamProtocolCheckpointRow)
                     .where(
-                        StreamProtocolCheckpointRow.protocol == protocol
+                        StreamProtocolCheckpointRow.protocol.in_(sorted_protocols)
                     )
+                    .order_by(StreamProtocolCheckpointRow.protocol)
                     .with_for_update()
                 )
+            ).all()
+            existing_rows = {row.protocol: row for row in rows}
+            for protocol in sorted_protocols:
+                event = latest[protocol]
+                row = existing_rows.get(protocol)
                 if row is None:
                     row = StreamProtocolCheckpointRow(
                         protocol=protocol,
@@ -1952,6 +1973,7 @@ class Database:
                         updated_at=now,
                     )
                     session.add(row)
+                    existing_rows[protocol] = row
                 sequence = int(event.ingest_sequence or 0)
                 if (
                     stage == "durable"

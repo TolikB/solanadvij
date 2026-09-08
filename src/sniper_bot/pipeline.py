@@ -285,11 +285,16 @@ class ConfirmationPipeline:
                 await asyncio.gather(*self._stage_tasks)
         except TimeoutError as exc:
             self.entry_gate.block("shutdown_drain_timeout")
+            for task in self._stage_tasks:
+                task.cancel()
+            await asyncio.gather(*self._stage_tasks, return_exceptions=True)
             raise RuntimeError(
                 "ordered ingestion queues did not drain within "
                 f"{timeout_seconds:g} seconds"
             ) from exc
         finally:
+            self._stage_tasks = []
+            self._background_workers_started = False
             metrics_task = self._stage_metrics_task
             if metrics_task is not None:
                 metrics_task.cancel()
@@ -304,8 +309,6 @@ class ConfirmationPipeline:
                 asyncio.get_running_loop().time() - started
             )
             self._sync_stage_metrics()
-        self._stage_tasks = []
-        self._background_workers_started = False
 
     async def _stage_metrics_worker(self) -> None:
         while True:
@@ -360,136 +363,193 @@ class ConfirmationPipeline:
                 stage=stage
             ).set(oldest_age)
 
-    async def _durable_worker(self) -> None:
+    def _collect_stage_batch(
+        self,
+        queue: asyncio.Queue[_StageBatch | None],
+        first: _StageBatch,
+    ) -> tuple[list[_StageBatch], _StageBatch | None, bool]:
+        """Coalesce queued FIFO batches without exceeding the bounded batch size."""
+        items = [first]
+        total_events = len(first.events)
+        carried: _StageBatch | None = None
+        stopping = False
         while True:
-            item = await self._durable_queue.get()
-            if item is None:
-                self._durable_queue.task_done()
-                return
             try:
-                while True:
-                    try:
-                        if self.database is None:
-                            raise RuntimeError(
-                                "durable worker requires a database"
-                            )
-                        results = await self.database.record_events(
-                            item.events,
-                            resume_owned=True,
-                        )
-                        claimed = [
-                            event
-                            for event, result in zip(
-                                item.events,
-                                results,
-                                strict=True,
-                            )
-                            if result
-                        ]
-                        if claimed:
-                            await self.database.save_stream_protocol_checkpoints(
-                                claimed,
-                                stage="durable",
-                            )
-                            await self._enqueue_stage(
-                                "state",
-                                self._state_queue,
-                                claimed,
-                            )
-                            if self.record_raw:
-                                await self._enqueue_stage(
-                                    "archive",
-                                    self._archive_queue,
-                                    claimed,
-                                )
-                        self.entry_gate.unblock(
-                            "durable_ingest_error"
-                        )
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        self.entry_gate.block(
-                            "durable_ingest_error"
-                        )
-                        logger.exception(
-                            "durable ingest failed; "
-                            "retrying ordered batch"
-                        )
-                        await asyncio.sleep(1)
-            finally:
-                self._durable_queue.task_done()
-                self._complete_stage("durable", item)
+                candidate = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if candidate is None:
+                queue.task_done()
+                stopping = True
+                break
+            if total_events + len(candidate.events) > MAX_EVENT_BATCH_SIZE:
+                carried = candidate
+                break
+            items.append(candidate)
+            total_events += len(candidate.events)
+        return items, carried, stopping
 
-    async def _state_worker(self) -> None:
+    async def _run_stage_worker(
+        self,
+        stage: str,
+        queue: asyncio.Queue[_StageBatch | None],
+        handler: Callable[[list[EventEnvelope]], Awaitable[None]],
+    ) -> None:
+        carried: _StageBatch | None = None
+        stopping = False
         while True:
-            item = await self._state_queue.get()
-            if item is None:
-                self._state_queue.task_done()
-                return
+            if carried is not None:
+                first = carried
+                carried = None
+            else:
+                received = await queue.get()
+                if received is None:
+                    queue.task_done()
+                    return
+                first = received
+            if stopping:
+                items = [first]
+            else:
+                items, carried, stopping = self._collect_stage_batch(queue, first)
+            combined_events = [event for item in items for event in item.events]
             try:
-                results = [
-                    EventRecordResult(
-                        True,
-                        event.event_id,
-                        int(event.ingest_sequence or 0),
+                await handler(combined_events)
+            finally:
+                for item in items:
+                    queue.task_done()
+                    self._complete_stage(stage, item)
+            if stopping and carried is None:
+                return
+
+    async def _durable_worker(self) -> None:
+        await self._run_stage_worker(
+            "durable",
+            self._durable_queue,
+            self._apply_durable_batch,
+        )
+
+    async def _apply_durable_batch(
+        self,
+        events: list[EventEnvelope],
+    ) -> None:
+        while True:
+            try:
+                if self.database is None:
+                    raise RuntimeError(
+                        "durable worker requires a database"
                     )
-                    for event in item.events
-                ]
-                await self._process_claimed_event_batch(
-                    item.events,
-                    results,
-                    archive_raw=False,
+                results = await self.database.record_events(
+                    events,
+                    resume_owned=True,
                 )
-                if self.database is not None:
-                    await self.database.save_stream_protocol_checkpoints(
-                        item.events,
-                        stage="state",
+                claimed = [
+                    event
+                    for event, result in zip(
+                        events,
+                        results,
+                        strict=True,
                     )
-                self.entry_gate.unblock("state_apply_error")
+                    if result
+                ]
+                if claimed:
+                    await self.database.save_stream_protocol_checkpoints(
+                        claimed,
+                        stage="durable",
+                    )
+                    await self._enqueue_stage(
+                        "state",
+                        self._state_queue,
+                        claimed,
+                    )
+                    if self.record_raw:
+                        await self._enqueue_stage(
+                            "archive",
+                            self._archive_queue,
+                            claimed,
+                        )
+                self.entry_gate.unblock(
+                    "durable_ingest_error"
+                )
+                return
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self.entry_gate.block("state_apply_error")
-                raise
-            finally:
-                self._state_queue.task_done()
-                self._complete_stage("state", item)
+                self.entry_gate.block(
+                    "durable_ingest_error"
+                )
+                logger.exception(
+                    "durable ingest failed; "
+                    "retrying ordered batch"
+                )
+                await asyncio.sleep(1)
+
+    async def _state_worker(self) -> None:
+        await self._run_stage_worker(
+            "state",
+            self._state_queue,
+            self._apply_state_batch,
+        )
+
+    async def _apply_state_batch(
+        self,
+        events: list[EventEnvelope],
+    ) -> None:
+        try:
+            results = [
+                EventRecordResult(
+                    True,
+                    event.event_id,
+                    int(event.ingest_sequence or 0),
+                )
+                for event in events
+            ]
+            await self._process_claimed_event_batch(
+                events,
+                results,
+                archive_raw=False,
+            )
+            self.entry_gate.unblock("state_apply_error")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.entry_gate.block("state_apply_error")
+            raise
 
     async def _archive_worker(self) -> None:
+        await self._run_stage_worker(
+            "archive",
+            self._archive_queue,
+            self._apply_archive_batch,
+        )
+
+    async def _apply_archive_batch(
+        self,
+        events: list[EventEnvelope],
+    ) -> None:
         while True:
-            item = await self._archive_queue.get()
-            if item is None:
-                self._archive_queue.task_done()
-                return
             try:
-                while True:
-                    try:
-                        segments = await self.recorder.write_segments(
-                            item.events
-                        )
-                        if self.database is not None:
-                            await self.database.record_raw_archive_segments(
-                                segments
-                            )
-                        self.entry_gate.unblock(
-                            "raw_archive_error"
-                        )
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        self.entry_gate.block(
-                            "raw_archive_error"
-                        )
-                        logger.exception(
-                            "raw archive segment failed; "
-                            "retrying ordered batch"
-                        )
-                        await asyncio.sleep(1)
-            finally:
-                self._archive_queue.task_done()
-                self._complete_stage("archive", item)
+                segments = await self.recorder.write_segments(
+                    events
+                )
+                if self.database is not None:
+                    await self.database.record_raw_archive_segments(
+                        segments
+                    )
+                self.entry_gate.unblock(
+                    "raw_archive_error"
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.entry_gate.block(
+                    "raw_archive_error"
+                )
+                logger.exception(
+                    "raw archive segment failed; "
+                    "retrying ordered batch"
+                )
+                await asyncio.sleep(1)
 
     async def process_transaction(
         self,
@@ -626,6 +686,11 @@ class ConfirmationPipeline:
                             )
                         if event_index % EVENT_LOOP_YIELD_INTERVAL == 0:
                             await asyncio.sleep(0)
+                    if not archive_raw and database is not None and claimed_events:
+                        await database.save_stream_protocol_checkpoints(
+                            claimed_events,
+                            stage="state",
+                        )
             finally:
                 self.metrics.chain_batch_phase_seconds.labels(
                     phase="state_commit"
