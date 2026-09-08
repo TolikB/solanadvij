@@ -38,15 +38,52 @@ def test_daily_telegram_report_is_human_readable_and_trade_only() -> None:
                 "ending_equity_usd": "512.34",
                 "realized_pnl_usd": "10",
                 "unrealized_pnl_usd": "2.34",
+                "simulated_costs_usd": "1.20",
+                "operational_costs_usd": "2.00",
+                "economic_pnl_usd": "10.34",
             },
-            "signals": {"paper_entries": 3},
+            "max_intraday_drawdown_pct": "0.032",
+            "signals": {
+                "new_pools": 120,
+                "tokens_checked": 96,
+                "hard_rejects": 90,
+                "score_60_plus": 12,
+                "score_80_plus": 4,
+                "paper_entries": 3,
+                "risk_limit_skips": 2,
+            },
             "trades": {
                 "closed": 2,
                 "profitable": 1,
                 "losing": 1,
                 "win_rate": "0.5",
+                "profit_factor": "1.8",
+                "expectancy_usd": "5",
+                "average_win_usd": "12",
+                "average_loss_usd": "-7",
+                "largest_win_usd": "12",
+                "largest_loss_usd": "-7",
+                "average_holding_seconds": 252,
+                "max_consecutive_losses": 1,
             },
-            "open_positions": [{}],
+            "execution_quality": {
+                "average_buy_impact_pct": "0.012",
+                "average_sell_impact_pct": "0.014",
+                "average_round_trip_cost_pct": "0.026",
+                "average_adverse_fill_bps": "50",
+                "average_quote_latency_ms": 321,
+                "no_route_rejects": 0,
+                "exit_route_failures": 0,
+            },
+            "exit_reasons": {"TAKE_PROFIT": 1, "STOP_LOSS": 1},
+            "open_positions": [
+                {
+                    "position_id": "must-not-be-shown",
+                    "token_mint": "So11111111111111111111111111111111111111112",
+                    "remaining_cost_usd": "50",
+                }
+            ],
+            "system": {"health": "HEALTHY", "websocket_reconnects": 4},
             "strategy_version": "must-not-be-shown",
             "config_hash": "must-not-be-shown",
             "report_id": "must-not-be-shown",
@@ -56,20 +93,91 @@ def test_daily_telegram_report_is_human_readable_and_trade_only() -> None:
     assert text == (
         "Щоденний звіт про тестову торгівлю\n"
         "Дата: 2026-08-25\n"
+        "\n"
+        "Капітал\n"
         "Баланс: $500.00 -> $512.34\n"
         "Результат дня: +$12.34\n"
         "Закритий PnL: +$10.00\n"
         "Відкритий PnL: +$2.34\n"
-        "Економічний результат: $0.00\n"
-        "Угоди: відкрито 3, закрито 2\n"
-        "Результати: прибуткових 1, збиткових 1\n"
+        "Витрати на угоди: $1.20\n"
+        "Витрати на інфраструктуру: $2.00\n"
+        "Економічний результат: +$10.34\n"
+        "Максимальна просадка за день: 3.2%\n"
+        "\n"
+        "Сигнали\n"
+        "Нових пулів: 120\n"
+        "Перевірено токенів: 96\n"
+        "Відсіяно на перевірках: 90\n"
+        "Оцінка 60+: 12, оцінка 80+: 4\n"
+        "Пропущено через ліміти ризику: 2\n"
+        "\n"
+        "Угоди\n"
+        "Відкрито: 3, закрито: 2\n"
+        "Прибуткових: 1, збиткових: 1\n"
         "Частка прибуткових: 50.0%\n"
-        "Причини виходу: немає\n"
-        "Відкриті позиції: 1"
+        "Профіт-фактор: 1.80\n"
+        "Очікуваний результат на угоду: +$5.00\n"
+        "Середній прибуток: +$12.00, середній збиток: -$7.00\n"
+        "Найкраща угода: +$12.00, найгірша: -$7.00\n"
+        "Середня тривалість угоди: 4 хв 12 с\n"
+        "Найдовша серія збитків: 1\n"
+        "\n"
+        "Якість виконання\n"
+        "Середній вплив на ціну: купівля 1.2%, продаж 1.4%\n"
+        "Середня вартість повного циклу: 2.6%\n"
+        "Середнє прослизання: 50 б.п.\n"
+        "Без маршруту: 0, невдалих виходів: 0\n"
+        "\n"
+        "Причини виходу: STOP_LOSS: 1, TAKE_PROFIT: 1\n"
+        "\n"
+        "Відкриті позиції: 1\n"
+        "- So11…1112: $50.00"
     )
+    assert "must-not-be-shown" not in text
     assert "strategy" not in text
     assert "config" not in text
     assert "report_id" not in text
+    assert "HEALTHY" not in text
+    assert "websocket" not in text
+    assert "321" not in text
+
+
+def test_unavailable_daily_report_stays_short_and_human() -> None:
+    text = _telegram_report_text(
+        {
+            "period": "daily",
+            "date": "2026-08-24",
+            "data_status": "unavailable",
+            "data_status_reason": "historical_equity_snapshot_unavailable",
+            "report_id": "must-not-be-shown",
+        }
+    )
+
+    assert text == (
+        "Щоденний звіт про тестову торгівлю\n"
+        "Дата: 2026-08-24\n"
+        "Дані за цей день недоступні."
+    )
+
+
+def test_daily_report_truncates_long_open_position_lists() -> None:
+    text = _telegram_report_text(
+        {
+            "period": "daily",
+            "date": "2026-08-25",
+            "open_positions": [
+                {
+                    "token_mint": f"mint-{index:039d}",
+                    "remaining_cost_usd": "10",
+                }
+                for index in range(13)
+            ],
+        }
+    )
+
+    assert "Відкриті позиції: 13" in text
+    assert text.endswith("- та ще 3")
+    assert text.count("\n- ") == 11
 
 
 @pytest.mark.asyncio

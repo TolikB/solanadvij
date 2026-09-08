@@ -80,6 +80,7 @@ RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
 MAX_EVENT_PROCESSING_ATTEMPTS = 3
 MAX_EVENT_BATCH_SIZE = 1024
 ACCEPTED_RECOVERY_GAP_REASONS = frozenset({"operator_baseline_reset"})
+TELEGRAM_OPEN_POSITION_LINES = 10
 SQLITE_SAFE_BOUND_PARAMETER_BUDGET = 900
 POSTGRES_SAFE_BOUND_PARAMETER_BUDGET = 30_000
 POSTGRES_EVENT_STAGE_TABLE = "sniper_event_ingest_stage"
@@ -4093,52 +4094,7 @@ def _external_quote_row(row_id: str, quote: QuoteResponse) -> ExternalApiCallRow
 
 def _telegram_report_text(report: dict[str, Any]) -> str:
     if report.get("period") == "daily":
-        capital = report.get("capital") or {}
-        signals = report.get("signals") or {}
-        trades = report.get("trades") or {}
-        exits = report.get("exit_reasons") or {}
-        starting = _report_decimal(
-            capital.get("starting_equity_usd")
-        )
-        ending = _report_decimal(capital.get("ending_equity_usd"))
-        day_result = ending - starting
-        open_positions = report.get("open_positions")
-        open_count = (
-            len(open_positions)
-            if isinstance(open_positions, list)
-            else 0
-        )
-        exit_summary = (
-            ", ".join(
-                f"{reason}: {_report_int(count)}"
-                for reason, count in sorted(exits.items())
-            )
-            or "немає"
-        )
-        return (
-            "Щоденний звіт про тестову торгівлю\n"
-            f"Дата: {report.get('date')}\n"
-            f"Баланс: {_format_usd(starting)} -> "
-            f"{_format_usd(ending)}\n"
-            f"Результат дня: "
-            f"{_format_usd(day_result, signed=True)}\n"
-            "Закритий PnL: "
-            f"{_format_usd(capital.get('realized_pnl_usd'), signed=True)}\n"
-            "Відкритий PnL: "
-            f"{_format_usd(capital.get('unrealized_pnl_usd'), signed=True)}\n"
-            "Економічний результат: "
-            f"{_format_usd(capital.get('economic_pnl_usd'), signed=True)}\n"
-            f"Угоди: відкрито "
-            f"{_report_int(signals.get('paper_entries'))}, "
-            f"закрито {_report_int(trades.get('closed'))}\n"
-            f"Результати: прибуткових "
-            f"{_report_int(trades.get('profitable'))}, "
-            f"збиткових {_report_int(trades.get('losing'))}\n"
-            f"Частка прибуткових: "
-            f"{_format_percent(trades.get('win_rate'))}\n"
-            f"Причини виходу: {exit_summary}\n"
-            f"Відкриті позиції: {open_count}"
-        )
+        return _daily_telegram_report_text(report)
     stats = report.get("trade_statistics") or {}
     return (
         "Звіт про тестову торгівлю за весь час\n"
@@ -4154,6 +4110,119 @@ def _telegram_report_text(report: dict[str, Any]) -> str:
         f"Частка прибуткових: "
         f"{_format_percent(stats.get('win_rate'))}"
     )
+
+
+def _daily_telegram_report_text(report: dict[str, Any]) -> str:
+    if report.get("data_status") == "unavailable":
+        return (
+            "Щоденний звіт про тестову торгівлю\n"
+            f"Дата: {report.get('date')}\n"
+            "Дані за цей день недоступні."
+        )
+    capital = report.get("capital") or {}
+    signals = report.get("signals") or {}
+    trades = report.get("trades") or {}
+    execution = report.get("execution_quality") or {}
+    exits = report.get("exit_reasons") or {}
+    starting = _report_decimal(capital.get("starting_equity_usd"))
+    ending = _report_decimal(capital.get("ending_equity_usd"))
+    day_result = ending - starting
+    exit_summary = (
+        ", ".join(
+            f"{reason}: {_report_int(count)}"
+            for reason, count in sorted(exits.items())
+        )
+        or "немає"
+    )
+    lines = [
+        "Щоденний звіт про тестову торгівлю",
+        f"Дата: {report.get('date')}",
+        "",
+        "Капітал",
+        f"Баланс: {_format_usd(starting)} -> {_format_usd(ending)}",
+        f"Результат дня: {_format_usd(day_result, signed=True)}",
+        "Закритий PnL: "
+        f"{_format_usd(capital.get('realized_pnl_usd'), signed=True)}",
+        "Відкритий PnL: "
+        f"{_format_usd(capital.get('unrealized_pnl_usd'), signed=True)}",
+        "Витрати на угоди: "
+        f"{_format_usd(capital.get('simulated_costs_usd'))}",
+        "Витрати на інфраструктуру: "
+        f"{_format_usd(capital.get('operational_costs_usd'))}",
+        "Економічний результат: "
+        f"{_format_usd(capital.get('economic_pnl_usd'), signed=True)}",
+        "Максимальна просадка за день: "
+        f"{_format_percent(report.get('max_intraday_drawdown_pct'))}",
+        "",
+        "Сигнали",
+        f"Нових пулів: {_report_int(signals.get('new_pools'))}",
+        f"Перевірено токенів: {_report_int(signals.get('tokens_checked'))}",
+        f"Відсіяно на перевірках: {_report_int(signals.get('hard_rejects'))}",
+        f"Оцінка 60+: {_report_int(signals.get('score_60_plus'))}, "
+        f"оцінка 80+: {_report_int(signals.get('score_80_plus'))}",
+        "Пропущено через ліміти ризику: "
+        f"{_report_int(signals.get('risk_limit_skips'))}",
+        "",
+        "Угоди",
+        f"Відкрито: {_report_int(signals.get('paper_entries'))}, "
+        f"закрито: {_report_int(trades.get('closed'))}",
+        f"Прибуткових: {_report_int(trades.get('profitable'))}, "
+        f"збиткових: {_report_int(trades.get('losing'))}",
+        f"Частка прибуткових: {_format_percent(trades.get('win_rate'))}",
+        f"Профіт-фактор: {_format_ratio(trades.get('profit_factor'))}",
+        "Очікуваний результат на угоду: "
+        f"{_format_usd(trades.get('expectancy_usd'), signed=True)}",
+        "Середній прибуток: "
+        f"{_format_usd(trades.get('average_win_usd'), signed=True)}, "
+        "середній збиток: "
+        f"{_format_usd(trades.get('average_loss_usd'), signed=True)}",
+        "Найкраща угода: "
+        f"{_format_usd(trades.get('largest_win_usd'), signed=True)}, "
+        "найгірша: "
+        f"{_format_usd(trades.get('largest_loss_usd'), signed=True)}",
+        "Середня тривалість угоди: "
+        f"{_format_duration(trades.get('average_holding_seconds'))}",
+        "Найдовша серія збитків: "
+        f"{_report_int(trades.get('max_consecutive_losses'))}",
+        "",
+        "Якість виконання",
+        "Середній вплив на ціну: купівля "
+        f"{_format_percent(execution.get('average_buy_impact_pct'))}, "
+        "продаж "
+        f"{_format_percent(execution.get('average_sell_impact_pct'))}",
+        "Середня вартість повного циклу: "
+        f"{_format_percent(execution.get('average_round_trip_cost_pct'))}",
+        "Середнє прослизання: "
+        f"{_report_int(execution.get('average_adverse_fill_bps'))} б.п.",
+        "Без маршруту: "
+        f"{_report_int(execution.get('no_route_rejects'))}, "
+        "невдалих виходів: "
+        f"{_report_int(execution.get('exit_route_failures'))}",
+        "",
+        f"Причини виходу: {exit_summary}",
+        "",
+    ]
+    lines.extend(_open_positions_lines(report.get("open_positions")))
+    return "\n".join(lines)
+
+
+def _open_positions_lines(open_positions: object) -> list[str]:
+    if not isinstance(open_positions, list):
+        return ["Відкриті позиції: 0"]
+    lines = [f"Відкриті позиції: {len(open_positions)}"]
+    for position in open_positions[:TELEGRAM_OPEN_POSITION_LINES]:
+        if not isinstance(position, dict):
+            continue
+        mint = str(position.get("token_mint") or "")
+        label = f"{mint[:4]}…{mint[-4:]}" if len(mint) > 12 else mint or "—"
+        lines.append(
+            f"- {label}: "
+            f"{_format_usd(position.get('remaining_cost_usd'))}"
+        )
+    remaining = len(open_positions) - TELEGRAM_OPEN_POSITION_LINES
+    if remaining > 0:
+        lines.append(f"- та ще {remaining}")
+    return lines
 
 
 def _report_decimal(value: object) -> Decimal:
@@ -4180,3 +4249,18 @@ def _format_usd(value: object, *, signed: bool = False) -> str:
 
 def _format_percent(value: object) -> str:
     return f"{_report_decimal(value) * Decimal('100'):.1f}%"
+
+
+def _format_ratio(value: object) -> str:
+    return f"{_report_decimal(value):.2f}"
+
+
+def _format_duration(value: object) -> str:
+    total = max(0, _report_int(value))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} год {minutes} хв"
+    if minutes:
+        return f"{minutes} хв {seconds} с"
+    return f"{seconds} с"

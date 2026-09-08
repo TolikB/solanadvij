@@ -552,13 +552,7 @@ class SniperRuntime:
                     f"{self.config.strategy_version}"
                 ),
                 event_type="daily_report",
-                payload={
-                    "text": (
-                        "Щоденний звіт про тестову торгівлю\n"
-                        f"Дата: {target}\n"
-                        "Дані за цей день недоступні."
-                    )
-                },
+                payload={"text": _telegram_report_text(report)},
             )
             return report if inserted else None
         report = self.report_builder.daily(

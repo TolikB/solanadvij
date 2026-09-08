@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,8 @@ from .runtime import SniperRuntime
 
 if TYPE_CHECKING:
     from .service import PaperService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -123,6 +126,10 @@ class ReplaySpeed(StrEnum):
         return None
 
 
+CANONICAL_REPLAY_ORDER = "canonical_ingest_sequence"
+LEGACY_REPLAY_ORDER = "legacy_order"
+
+
 @dataclass
 class RawReplayResult:
     run_id: str
@@ -133,6 +140,12 @@ class RawReplayResult:
     finished_at: datetime
     candidate_states: dict[str, str]
     final_reconcile: dict[str, object]
+    ordering: str = CANONICAL_REPLAY_ORDER
+
+    @property
+    def is_canonical(self) -> bool:
+        """Only sequence-ordered archives are exact acceptance evidence."""
+        return self.ordering == CANONICAL_REPLAY_ORDER
 
 
 class ReplayRunStore:
@@ -354,6 +367,18 @@ class RawEventReplayRunner:
         )
         if not events:
             raise ValueError("raw replay input contains no events")
+        ordering = (
+            CANONICAL_REPLAY_ORDER
+            if all(event.ingest_sequence is not None for event in events)
+            else LEGACY_REPLAY_ORDER
+        )
+        if ordering == LEGACY_REPLAY_ORDER:
+            logger.warning(
+                "raw replay input contains archives without a durable ingest "
+                "sequence; the run is ordered as %s and is not exact canonical "
+                "acceptance evidence",
+                LEGACY_REPLAY_ORDER,
+            )
         clock = self.clock or VirtualClock(events[0].block_time)
         self.runtime.quote_provider.set_clock(lambda: clock.now)
         self.runtime.rpc.set_clock(lambda: clock.now)
@@ -416,6 +441,7 @@ class RawEventReplayRunner:
             run_id=run_id, input_hash=input_hash, output_hash=output_hash,
             events_executed=len(events), started_at=started_at, finished_at=finished_at,
             candidate_states=candidate_states, final_reconcile=reconcile,
+            ordering=ordering,
         )
         if self.store is not None:
             self.store.upsert(
@@ -448,6 +474,7 @@ class RawEventReplayRunner:
                     "events_executed": len(events),
                     "candidate_states": candidate_states,
                     "reconcile": reconcile,
+                    "ordering": ordering,
                 },
             )
         return result

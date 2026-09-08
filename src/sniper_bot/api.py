@@ -15,6 +15,10 @@ from fastapi import APIRouter, FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 from prometheus_client import CONTENT_TYPE_LATEST
 
+from .database import _telegram_report_text
+
+HUMAN_REPORT_COMMANDS = frozenset({"today", "day", "all"})
+
 
 def build_api(runtime: Any) -> FastAPI:
     router = APIRouter()
@@ -299,7 +303,8 @@ def build_api(runtime: Any) -> FastAPI:
             try:
                 payload = await report_for_day(coerce_day(args[0]))
             except HTTPException as exc:
-                payload = {"error": exc.detail}
+                await notifier.send_to(chat_id, str(exc.detail))
+                return
         elif cmd in {"pause", "halt"}:
             runtime.halt(" ".join(args) if args else "manual pause")
             payload = {"paused": True}
@@ -307,6 +312,9 @@ def build_api(runtime: Any) -> FastAPI:
             payload = {"resumed": runtime.resume()}
         else:
             payload = {"error": "unknown command"}
+        if cmd in HUMAN_REPORT_COMMANDS and isinstance(payload, dict):
+            await notifier.send_to(chat_id, _telegram_report_text(payload))
+            return
         await notifier.send_to(chat_id, json.dumps(payload, default=str, sort_keys=True))
 
     @asynccontextmanager

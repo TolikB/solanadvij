@@ -108,3 +108,18 @@ def test_release_revision_creates_distinct_immutable_strategy_identity() -> None
         AppConfig(**{**_base_config(), "APP_REVISION": "not-a-commit"})
     with pytest.raises(ValueError, match="real Git commit"):
         AppConfig(**{**_base_config(), "APP_REVISION": "0" * 40})
+
+
+def test_stale_checkpoint_reset_is_off_by_default_and_outside_strategy_identity() -> None:
+    default = AppConfig(**_base_config())
+    accepted = AppConfig(
+        **{
+            **_base_config(),
+            "chain": {"allow_stale_checkpoint_reset": True},
+        }
+    )
+
+    assert default.chain.allow_stale_checkpoint_reset is False
+    assert accepted.chain.allow_stale_checkpoint_reset is True
+    assert accepted.config_hash == default.config_hash
+    assert accepted.strategy_version == default.strategy_version

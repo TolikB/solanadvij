@@ -16,6 +16,9 @@ python scripts/benchmark_internal.py
 Migration smoke testing must cover both a fresh database and upgrade from the previous revision.
 Replay tests assert ordered consumption of repeated identical external requests, fixed virtual
 time, stable hashes, no network clients, historical reports, and final ledger reconciliation.
+Raw replay orders events by the durable `ingest_sequence`. An archive whose events predate that
+field replays under `legacy_order`, is reported as such on the run and in `replay_runs.result_json`,
+and is not accepted as exact canonical acceptance evidence.
 Recovery tests cover failed event reclaim, durable checkpoints, outbox uncertainty, atomic paper
 risk limits, and partial-exit accounting.
 

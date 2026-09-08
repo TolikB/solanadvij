@@ -388,6 +388,11 @@ class AppConfig(BaseSettings):
             "postgres_dsn",
         ):
             data.pop(key, None)
+        chain = data.get("chain")
+        if isinstance(chain, dict):
+            # Operational recovery switch: toggling it during an incident must
+            # not fork the strategy identity, report keys, or replay evidence.
+            chain.pop("allow_stale_checkpoint_reset", None)
         data["risk"] = data.get("risk", {})
         return data
 
