@@ -111,17 +111,17 @@ def test_release_revision_creates_distinct_immutable_strategy_identity() -> None
         AppConfig(**{**_base_config(), "APP_REVISION": "0" * 40})
 
 
-def test_stale_checkpoint_reset_is_off_by_default_and_outside_strategy_identity() -> None:
+def test_gap_halt_is_off_by_default_and_outside_strategy_identity() -> None:
     default = AppConfig(**_base_config())
     accepted = AppConfig(
         **{
             **_base_config(),
-            "chain": {"allow_stale_checkpoint_reset": True},
+            "chain": {"halt_on_unrecoverable_gap": True},
         }
     )
 
-    assert default.chain.allow_stale_checkpoint_reset is False
-    assert accepted.chain.allow_stale_checkpoint_reset is True
+    assert default.chain.halt_on_unrecoverable_gap is False
+    assert accepted.chain.halt_on_unrecoverable_gap is True
     assert accepted.config_hash == default.config_hash
     assert accepted.strategy_version == default.strategy_version
 
@@ -129,24 +129,24 @@ def test_stale_checkpoint_reset_is_off_by_default_and_outside_strategy_identity(
 def test_chain_env_override_enables_the_operator_reset(tmp_path, monkeypatch) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
-        "chain:\n  allow_stale_checkpoint_reset: false\n  max_stream_lag_ms: 3000\n",
+        "chain:\n  halt_on_unrecoverable_gap: false\n  max_stream_lag_ms: 3000\n",
         encoding="utf-8",
     )
     for key, value in _base_config().items():
         monkeypatch.setenv(key, str(value))
 
     monkeypatch.delenv("CHAIN", raising=False)
-    assert AppConfig.load(str(config_file)).chain.allow_stale_checkpoint_reset is False
+    assert AppConfig.load(str(config_file)).chain.halt_on_unrecoverable_gap is False
 
-    monkeypatch.setenv("CHAIN", '{"allow_stale_checkpoint_reset":true}')
+    monkeypatch.setenv("CHAIN", '{"halt_on_unrecoverable_gap":true}')
     overridden = AppConfig.load(str(config_file))
-    assert overridden.chain.allow_stale_checkpoint_reset is True
+    assert overridden.chain.halt_on_unrecoverable_gap is True
 
 
 def test_blank_nested_env_override_falls_back_to_yaml(tmp_path, monkeypatch) -> None:
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
-        "chain:\n  allow_stale_checkpoint_reset: false\n  max_stream_lag_ms: 1234\n",
+        "chain:\n  halt_on_unrecoverable_gap: false\n  max_stream_lag_ms: 1234\n",
         encoding="utf-8",
     )
     for key, value in _base_config().items():
@@ -157,7 +157,7 @@ def test_blank_nested_env_override_falls_back_to_yaml(tmp_path, monkeypatch) -> 
     monkeypatch.setenv("CHAIN", "")
     config = AppConfig.load(str(config_file))
 
-    assert config.chain.allow_stale_checkpoint_reset is False
+    assert config.chain.halt_on_unrecoverable_gap is False
     assert config.chain.max_stream_lag_ms == 1234
     assert os.environ["CHAIN"] == ""
 

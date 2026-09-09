@@ -430,6 +430,7 @@ async def test_unrecoverable_checkpoint_holds_without_touching_the_provider(
 ) -> None:
     gateway = _gateway()
     gateway.UNRECOVERABLE_GAP_HOLD_SECONDS = 0.05
+    gateway.halt_on_unrecoverable_gap = True
     gateway.restore_checkpoint(
         123,
         "old-signature",
@@ -475,7 +476,7 @@ async def test_unrecoverable_checkpoint_holds_without_touching_the_provider(
 
 
 @pytest.mark.asyncio
-async def test_operator_accepted_reset_starts_audited_non_tradable_baseline(
+async def test_unrecoverable_gap_is_recorded_then_baseline_restarts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = FakeConnection(
@@ -491,7 +492,6 @@ async def test_operator_accepted_reset_starts_audited_non_tradable_baseline(
         return FakeConnectionContext(connection, events, "stale")
 
     gateway = _gateway()
-    gateway.allow_stale_checkpoint_reset = True
     gateway.restore_checkpoint(
         123,
         "old-signature",
@@ -504,7 +504,7 @@ async def test_operator_accepted_reset_starts_audited_non_tradable_baseline(
     gap_reasons: list[str] = []
 
     async def unexpected_recovery() -> None:
-        pytest.fail("an accepted reset must not trigger historical gap recovery")
+        pytest.fail("an unrecoverable gap must not trigger historical gap recovery")
 
     async def record_gap(reason: str) -> None:
         gap_reasons.append(reason)
@@ -550,7 +550,7 @@ async def test_operator_accepted_reset_starts_audited_non_tradable_baseline(
             await checkpoint_discarded.wait()
             await recovery_gap_unblocked.wait()
 
-        assert gap_reasons == ["operator_baseline_reset"]
+        assert gap_reasons == ["unrecoverable_gap_accepted"]
         assert gateway.last_slot == 0
         assert gateway.last_signature is None
         assert gateway.last_observed_at is None

@@ -31,38 +31,25 @@ python scripts/control.py resume
 These commands use Linux pidfds and the PID plus process start time stored in `data/sniper.pid`.
 They fail closed if the file is stale, malformed, or no longer identifies the running bot.
 
-## Stale stream checkpoint
+## Unrecoverable stream checkpoint
 
-When the durable stream checkpoint is older than the bounded recovery window, the gateway holds
-fail-closed: it records a `checkpoint_unrecoverable` row in `stream_recovery_gaps`, blocks entries
-with `stream_recovery_gap`, serves `/health/ready` as `503`, and opens no socket and issues no RPC
-while it waits. It never starts a tradable baseline over an archive hole. Retrying the backfill
-would be futile at mainnet volume and would only consume the provider quota, so the bot idles until
-an operator decides.
+Gap recovery is bounded by `MAX_GAP_RECOVERY_AGE` (60 seconds) and buffers the live socket in memory
+for at most `GAP_RECOVERY_TIMEOUT_SECONDS` (15 seconds). At mainnet Pump/PumpSwap volume that buffer
+fills long before even that window can be paginated, so any outage past it - an ordinary restart
+included - leaves a checkpoint that cannot be backfilled.
 
-Gap recovery is bounded by `MAX_GAP_RECOVERY_AGE` (60 seconds) and buffers the live socket in
-memory for at most `GAP_RECOVERY_TIMEOUT_SECONDS` (15 seconds). At mainnet Pump/PumpSwap volume that
-buffer fills long before a multi-minute gap can be paginated, so any outage longer than the recovery
-window - including an ordinary restart - leaves a checkpoint that cannot be backfilled.
+By default the bot then records the hole permanently as an `ACCEPTED` row in `stream_recovery_gaps`
+and resumes on a fresh non-tradable baseline. It never trades over the hole: entries stay blocked
+through the baseline warmup, and the recorded range must be excluded from canonical replay
+acceptance evidence. `ACCEPTED` rows are terminal and a later successful recovery never closes them.
 
-Accepting the resulting archive hole is an explicit operator decision, never an automatic one.
-`configs/` is baked into the image, so the switch is an environment override and needs no rebuild:
+Retrying such a backfill is futile and only consumes the provider quota, so the bot never does it.
 
-1. Confirm from `/api/v1/status` and `stream_recovery_gaps` that the backfill is genuinely
-   unreachable, and record why.
-2. Set `CHAIN={"allow_stale_checkpoint_reset":true}` in `/opt/solanadvij/.env`, keeping mode `600`.
-3. Restart only this project's bot:
-   `docker compose -p solanadvij --env-file .env up -d sniper-bot`, then wait for the `ACCEPTED`
-   `stream_recovery_gaps` rows that permanently record the hole and for `/health/ready` to serve
-   `200`.
-4. Clear `CHAIN=` again once the bot is ready, so the next stale checkpoint fails closed. Note that
-   the next restart will hit the same decision, because it too exceeds the recovery window.
-
-`CHAIN` replaces the whole `chain` block, so any value that must differ from the model defaults has
-to be repeated in that JSON.
-
-`ACCEPTED` gap rows are terminal. A later successful recovery never resolves them, and the affected
-range must be excluded from canonical replay acceptance evidence.
+To require a human decision instead, set `CHAIN={"halt_on_unrecoverable_gap":true}` in
+`/opt/solanadvij/.env`, keeping mode `600`. The bot then records `checkpoint_unrecoverable`, blocks
+entries, serves `/health/ready` as `503`, and opens no socket and issues no RPC until the setting is
+cleared. `CHAIN` replaces the whole `chain` block, so any value that must differ from the model
+defaults has to be repeated in that JSON.
 
 ## Database recovery
 

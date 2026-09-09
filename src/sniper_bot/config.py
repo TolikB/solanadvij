@@ -45,11 +45,13 @@ class ChainConfig(BaseModel):
     primary_commitment: str = "confirmed"
     max_stream_lag_ms: int = 3000
     warmup_seconds: int = 60
-    # Fail-closed by default: a checkpoint older than the bounded recovery
-    # window keeps the recovery gap open and entries blocked. Operators may
-    # accept the archive hole explicitly, which is recorded as an ACCEPTED
-    # recovery gap before a fresh non-tradable baseline starts.
-    allow_stale_checkpoint_reset: bool = False
+    # A checkpoint older than the bounded recovery window cannot be backfilled
+    # before the live buffer overflows, so by default the bot records the gap
+    # permanently as an ACCEPTED row and resumes on a fresh non-tradable
+    # baseline. It never trades over the hole: entries stay blocked through the
+    # baseline warmup, and the recorded range is excluded from canonical replay
+    # evidence. Set this to halt instead and wait for a human.
+    halt_on_unrecoverable_gap: bool = False
 
 
 class PaperConfig(BaseModel):
@@ -392,7 +394,7 @@ class AppConfig(BaseSettings):
         if isinstance(chain, dict):
             # Operational recovery switch: toggling it during an incident must
             # not fork the strategy identity, report keys, or replay evidence.
-            chain.pop("allow_stale_checkpoint_reset", None)
+            chain.pop("halt_on_unrecoverable_gap", None)
         data["risk"] = data.get("risk", {})
         return data
 

@@ -130,13 +130,13 @@ async def test_recovery_gap_retries_update_one_pending_row_per_protocol(
 
 
 @pytest.mark.asyncio
-async def test_operator_accepted_gap_is_terminal_and_survives_resolution(
+async def test_accepted_gap_is_terminal_and_survives_resolution(
     tmp_path: Path,
 ) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'accepted_gaps.db'}")
     await database.create_schema_for_tests()
     try:
-        await database.record_stream_recovery_gap("operator_baseline_reset")
+        await database.record_stream_recovery_gap("unrecoverable_gap_accepted")
         await database.resolve_stream_recovery_gaps()
 
         async with database.sessions() as session:
@@ -152,7 +152,7 @@ async def test_operator_accepted_gap_is_terminal_and_survives_resolution(
         assert len(rows) == 2
         assert all(row.status == "ACCEPTED" for row in rows)
         assert all(row.completed_at is not None for row in rows)
-        assert all(row.reason == "operator_baseline_reset" for row in rows)
+        assert all(row.reason == "unrecoverable_gap_accepted" for row in rows)
     finally:
         await database.close()
 

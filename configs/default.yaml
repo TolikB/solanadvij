@@ -31,10 +31,11 @@ chain:
   primary_commitment: "confirmed"
   max_stream_lag_ms: 3000
   warmup_seconds: 60
-  # Keep false in production. When true, a checkpoint older than the bounded
-  # recovery window is accepted as a permanent archive hole (recorded as an
-  # ACCEPTED stream_recovery_gaps row) and a fresh non-tradable baseline starts.
-  allow_stale_checkpoint_reset: false
+  # A checkpoint older than the bounded recovery window is recorded as a
+  # permanent archive hole (an ACCEPTED stream_recovery_gaps row) and the bot
+  # resumes on a fresh non-tradable baseline. Set true to halt and wait for a
+  # human instead; the bot then serves 503 until an operator intervenes.
+  halt_on_unrecoverable_gap: false
 paper:
   execution_delay_ms: 1200
   adverse_fill_bps: 50

@@ -79,7 +79,11 @@ RUNTIME_ADVISORY_LOCK_CLASS_ID = 21326
 RUNTIME_ADVISORY_LOCK_OBJECT_ID = 1229997394
 MAX_EVENT_PROCESSING_ATTEMPTS = 3
 MAX_EVENT_BATCH_SIZE = 1024
-ACCEPTED_RECOVERY_GAP_REASONS = frozenset({"operator_baseline_reset"})
+# Terminal audit rows: the archive hole they record is permanent, so a later
+# successful recovery must never close them.
+ACCEPTED_RECOVERY_GAP_REASONS = frozenset(
+    {"unrecoverable_gap_accepted", "checkpoint_unrecoverable"}
+)
 # Staged upserts must be applied parents-first: a candidate references its
 # token and pool, so an alphabetical order would violate those foreign keys.
 # The schema's own dependency order stays deterministic as the schema grows.

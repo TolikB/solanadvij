@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -35,13 +36,19 @@ from sniper_bot.events import EventEnvelope, EventSource, Protocol
 from sniper_bot.features import LiquidityObservation, TradeObservation
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.pipeline import ConfirmationPipeline
+from sniper_bot.protocols import pump as pump_package
+from sniper_bot.protocols import pumpswap as pumpswap_package
 from sniper_bot.protocols.anchor import _base58_encode
 from sniper_bot.protocols.pump import PUMP_PROGRAM_ID
 from sniper_bot.protocols.pumpswap import PUMPSWAP_PROGRAM_ID
 from sniper_bot.registry import WSOL_MINT
 from sniper_bot.stream import EntryGate
 
-TARGET_NOTIFICATIONS_PER_SECOND = 800
+# The floor CI can hold on a small runner. Production must be gated at the
+# rate the deployment actually sees, which is measured on the VM.
+TARGET_NOTIFICATIONS_PER_SECOND = int(
+    os.environ.get("CAPACITY_TARGET_NOTIFICATIONS_PER_SECOND", "800")
+)
 WARMUP_SECONDS = float(os.environ.get("CAPACITY_WARMUP_SECONDS", "5"))
 MEASURED_SECONDS = float(os.environ.get("CAPACITY_MEASURED_SECONDS", "20"))
 SUBMIT_INTERVAL_SECONDS = 0.025
@@ -173,6 +180,13 @@ class BorshEventEncoder:
         raise ValueError(f"unsupported benchmark primitive IDL type {name}")
 
 
+def _idl_path(package: ModuleType) -> Path:
+    location = package.__file__
+    if location is None:  # pragma: no cover - namespace packages are not used
+        raise RuntimeError(f"{package.__name__} has no filesystem location")
+    return Path(location).parent / "idl.json"
+
+
 def _base58_decode(value: str) -> bytes:
     number = 0
     for character in value:
@@ -222,15 +236,11 @@ def _slope(samples: list[tuple[float, int]]) -> float:
 
 class NotificationGenerator:
     def __init__(self) -> None:
-        protocols = (
-            Path(__file__).resolve().parents[1]
-            / "src"
-            / "sniper_bot"
-            / "protocols"
-        )
+        # Resolve the IDLs through the installed package so the gate runs the
+        # same way from the repository and from inside the release image.
         self._encoders = {
-            "pump": BorshEventEncoder(protocols / "pump" / "idl.json"),
-            "pumpswap": BorshEventEncoder(protocols / "pumpswap" / "idl.json"),
+            "pump": BorshEventEncoder(_idl_path(pump_package)),
+            "pumpswap": BorshEventEncoder(_idl_path(pumpswap_package)),
         }
         self._programs = {
             "pump": PUMP_PROGRAM_ID,

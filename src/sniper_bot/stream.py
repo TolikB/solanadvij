@@ -139,7 +139,7 @@ class HeliusStreamGateway:
         max_processing_lag_seconds: float = 3.0,
         log_fetch_concurrency: int = LOG_FETCH_CONCURRENCY,
         notification_queue_size: int = NOTIFICATION_QUEUE_SIZE,
-        allow_stale_checkpoint_reset: bool = False,
+        halt_on_unrecoverable_gap: bool = False,
     ) -> None:
         if max_processing_lag_seconds <= 0:
             raise ValueError("max_processing_lag_seconds must be greater than zero")
@@ -154,7 +154,7 @@ class HeliusStreamGateway:
         self.fatal_handler = fatal_handler
         self.gap_handler = gap_handler
         self.gap_resolved_handler = gap_resolved_handler
-        self.allow_stale_checkpoint_reset = allow_stale_checkpoint_reset
+        self.halt_on_unrecoverable_gap = halt_on_unrecoverable_gap
         self._unrecoverable_gap_recorded = False
         self.entry_gate = entry_gate
         self.metrics = metrics
@@ -286,7 +286,7 @@ class HeliusStreamGateway:
         """
         if not self.last_slot or self._checkpoint_is_recent():
             return False
-        if self.allow_stale_checkpoint_reset:
+        if not self.halt_on_unrecoverable_gap:
             return False
         self.entry_gate.block("stream_recovery_gap")
         self.metrics.stream_recovery_gap_active.set(1)
@@ -336,37 +336,22 @@ class HeliusStreamGateway:
                         recovered: list[tuple[Protocol, dict[str, Any], EventSource]] = []
                         if self.last_slot:
                             stale_checkpoint = not self._checkpoint_is_recent()
-                            if (
-                                stale_checkpoint
-                                and self.allow_stale_checkpoint_reset
-                            ):
+                            if stale_checkpoint:
                                 logger.warning(
-                                    "Solana checkpoint exceeds the bounded recovery window and "
-                                    "operators accepted the archive gap; starting a new "
+                                    "Solana checkpoint exceeds the bounded recovery window; "
+                                    "recording the archive gap permanently and starting a new "
                                     "non-tradable live baseline"
                                 )
                                 self.entry_gate.block("stream_recovery_gap")
                                 self.metrics.stream_recovery_gap_active.set(1)
                                 if self.gap_handler is not None:
                                     await self.gap_handler(
-                                        "operator_baseline_reset"
+                                        "unrecoverable_gap_accepted"
                                     )
                                 self._discard_in_memory_checkpoint()
                                 self.entry_gate.unblock("stream_recovery_gap")
                                 self.metrics.stream_recovery_gap_active.set(0)
                             else:
-                                if stale_checkpoint:
-                                    logger.error(
-                                        "Solana checkpoint exceeds the bounded recovery window; "
-                                        "entries stay blocked until the paginated backfill "
-                                        "completes"
-                                    )
-                                    self.entry_gate.block("stream_recovery_gap")
-                                    self.metrics.stream_recovery_gap_active.set(1)
-                                    if self.gap_handler is not None:
-                                        await self.gap_handler(
-                                            "checkpoint_stale"
-                                        )
                                 try:
                                     recovered, pending_handshake_messages = (
                                         await self._recover_gap_with_live_buffer(
@@ -386,18 +371,6 @@ class HeliusStreamGateway:
                                             "recovery_timeout"
                                         )
                                     self.metrics.websocket_reconnects.inc()
-                                    if stale_checkpoint:
-                                        # A stale checkpoint keeps retrying the
-                                        # backfill fail-closed, so back off to
-                                        # avoid an unbounded RPC hot loop.
-                                        delay = self.BACKOFF_SECONDS[
-                                            min(
-                                                attempt,
-                                                len(self.BACKOFF_SECONDS) - 1,
-                                            )
-                                        ]
-                                        attempt += 1
-                                        await asyncio.sleep(delay)
                                     continue
                         if recovered:
                             await self._commit_recovered_events(recovered)
