@@ -33,11 +33,12 @@ They fail closed if the file is stale, malformed, or no longer identifies the ru
 
 ## Stale stream checkpoint
 
-When the durable stream checkpoint is older than the bounded recovery window, the gateway keeps
-resuming from that checkpoint, records an `OPEN` row in `stream_recovery_gaps`, blocks entries with
-`stream_recovery_gap`, and serves `/health/ready` as `503`. It never starts a tradable baseline over
-an archive hole, so a bot that was down longer than the recovery window will not trade until the
-paginated backfill completes.
+When the durable stream checkpoint is older than the bounded recovery window, the gateway holds
+fail-closed: it records a `checkpoint_unrecoverable` row in `stream_recovery_gaps`, blocks entries
+with `stream_recovery_gap`, serves `/health/ready` as `503`, and opens no socket and issues no RPC
+while it waits. It never starts a tradable baseline over an archive hole. Retrying the backfill
+would be futile at mainnet volume and would only consume the provider quota, so the bot idles until
+an operator decides.
 
 Gap recovery is bounded by `MAX_GAP_RECOVERY_AGE` (60 seconds) and buffers the live socket in
 memory for at most `GAP_RECOVERY_TIMEOUT_SECONDS` (15 seconds). At mainnet Pump/PumpSwap volume that

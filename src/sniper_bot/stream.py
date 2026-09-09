@@ -119,6 +119,7 @@ class HeliusStreamGateway:
     PROCESSING_BATCH_SIZE = 1024
     PROCESSING_BATCH_WINDOW_SECONDS = 0.02
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 120.0
+    UNRECOVERABLE_GAP_HOLD_SECONDS = 60.0
     PROCESSING_RETRY_LIMIT = 3
     PROCESSING_RETRY_DELAYS = (1, 2)
 
@@ -154,6 +155,7 @@ class HeliusStreamGateway:
         self.gap_handler = gap_handler
         self.gap_resolved_handler = gap_resolved_handler
         self.allow_stale_checkpoint_reset = allow_stale_checkpoint_reset
+        self._unrecoverable_gap_recorded = False
         self.entry_gate = entry_gate
         self.metrics = metrics
         self.last_slot = 0
@@ -274,12 +276,44 @@ class HeliusStreamGateway:
         if drain_error is not None:
             raise drain_error
 
+    async def _hold_for_unrecoverable_gap(self) -> bool:
+        """Hold fail-closed instead of retrying a backfill that cannot succeed.
+
+        A checkpoint older than the bounded recovery window cannot be paginated
+        before the in-memory live buffer overflows, so retrying it only burns
+        provider quota. Keep the gap open and entries blocked, open no socket
+        and issue no RPC, and wait for the operator decision instead.
+        """
+        if not self.last_slot or self._checkpoint_is_recent():
+            return False
+        if self.allow_stale_checkpoint_reset:
+            return False
+        self.entry_gate.block("stream_recovery_gap")
+        self.metrics.stream_recovery_gap_active.set(1)
+        if not self._unrecoverable_gap_recorded:
+            logger.error(
+                "Solana checkpoint is older than the bounded recovery window; "
+                "holding fail-closed without contacting the provider until an "
+                "operator accepts the archive gap"
+            )
+            if self.gap_handler is not None:
+                await self.gap_handler("checkpoint_unrecoverable")
+            self._unrecoverable_gap_recorded = True
+        try:
+            async with asyncio.timeout(self.UNRECOVERABLE_GAP_HOLD_SECONDS):
+                await self._stopping.wait()
+        except TimeoutError:
+            pass
+        return True
+
     async def _run(self) -> None:
         attempt = 0
         logs_only = False
         pending_handshake_messages: list[dict[str, Any]] = []
         while not self._stopping.is_set():
             self.entry_gate.block("stream_disconnected")
+            if await self._hold_for_unrecoverable_gap():
+                continue
             try:
                 async with websockets.connect(
                     self.websocket_url,

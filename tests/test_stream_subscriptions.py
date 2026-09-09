@@ -425,80 +425,48 @@ async def test_gap_recovery_timeout_reconnects_without_partial_publish(
 
 
 @pytest.mark.asyncio
-async def test_stale_checkpoint_stays_fail_closed_until_backfill(
+async def test_unrecoverable_checkpoint_holds_without_touching_the_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    connection = FakeConnection(
-        [
-            {"jsonrpc": "2.0", "id": 1, "result": 11},
-            {"jsonrpc": "2.0", "id": 2, "result": 12},
-        ],
-        finish_iteration=False,
-    )
-    events: list[str] = []
-
-    def connect(*_args: object, **_kwargs: object) -> FakeConnectionContext:
-        return FakeConnectionContext(connection, events, "stale")
-
     gateway = _gateway()
-    gateway.GAP_RECOVERY_TIMEOUT_SECONDS = 0.01
-    gateway.BACKOFF_SECONDS = (0.01,)
+    gateway.UNRECOVERABLE_GAP_HOLD_SECONDS = 0.05
     gateway.restore_checkpoint(
         123,
         "old-signature",
         datetime.now(tz=timezone.utc) - timedelta(minutes=5),
     )
-    gateway.restore_protocol_checkpoint(
-        Protocol.PUMP,
-        "old-signature",
-    )
+    gateway.restore_protocol_checkpoint(Protocol.PUMP, "old-signature")
     gap_reasons: list[str] = []
-    timeout_recorded = asyncio.Event()
+    recorded = asyncio.Event()
 
-    async def never_completing_recovery() -> list[
-        tuple[Protocol, dict[str, Any], object]
-    ]:
-        await asyncio.sleep(60)
-        return []
+    def unexpected_connect(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("an unrecoverable gap must not open a provider socket")
+
+    async def unexpected_recovery() -> None:
+        pytest.fail("an unrecoverable gap must not paginate the provider")
 
     async def record_gap(reason: str) -> None:
         gap_reasons.append(reason)
-        if reason == "recovery_timeout":
-            timeout_recorded.set()
-
-    async def unexpected_resolve() -> None:
-        pytest.fail("a stale checkpoint gap must not be resolved automatically")
+        recorded.set()
 
     def unexpected_discard() -> None:
-        pytest.fail("a stale checkpoint must not discard the durable checkpoint")
+        pytest.fail("an unrecoverable gap must not discard the checkpoint")
 
-    monkeypatch.setattr(
-        "sniper_bot.stream.websockets.connect",
-        connect,
-    )
-    monkeypatch.setattr(
-        gateway,
-        "_recover_gap",
-        never_completing_recovery,
-    )
-    monkeypatch.setattr(
-        gateway,
-        "_discard_in_memory_checkpoint",
-        unexpected_discard,
-    )
+    monkeypatch.setattr("sniper_bot.stream.websockets.connect", unexpected_connect)
+    monkeypatch.setattr(gateway, "_recover_gap", unexpected_recovery)
+    monkeypatch.setattr(gateway, "_discard_in_memory_checkpoint", unexpected_discard)
     gateway.gap_handler = record_gap
-    gateway.gap_resolved_handler = unexpected_resolve
+
     run_task = asyncio.create_task(gateway._run())
     try:
         async with asyncio.timeout(1):
-            await timeout_recorded.wait()
+            await recorded.wait()
+            await asyncio.sleep(0.2)
 
-        assert gap_reasons[:2] == ["checkpoint_stale", "recovery_timeout"]
+        # The reason is recorded once, not on every hold cycle.
+        assert gap_reasons == ["checkpoint_unrecoverable"]
         assert gateway.last_slot == 123
         assert gateway.last_signature == "old-signature"
-        assert gateway._last_signatures == {
-            Protocol.PUMP: "old-signature"
-        }
         assert "stream_recovery_gap" in gateway.entry_gate.reasons
     finally:
         run_task.cancel()
