@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 
 import pytest
@@ -140,3 +141,25 @@ def test_chain_env_override_enables_the_operator_reset(tmp_path, monkeypatch) ->
     monkeypatch.setenv("CHAIN", '{"allow_stale_checkpoint_reset":true}')
     overridden = AppConfig.load(str(config_file))
     assert overridden.chain.allow_stale_checkpoint_reset is True
+
+
+def test_blank_nested_env_override_falls_back_to_yaml(tmp_path, monkeypatch) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "chain:\n  allow_stale_checkpoint_reset: false\n  max_stream_lag_ms: 1234\n",
+        encoding="utf-8",
+    )
+    for key, value in _base_config().items():
+        monkeypatch.setenv(key, str(value))
+
+    # Compose always defines the optional override, so the blank case is the
+    # normal one and must not abort startup.
+    monkeypatch.setenv("CHAIN", "")
+    config = AppConfig.load(str(config_file))
+
+    assert config.chain.allow_stale_checkpoint_reset is False
+    assert config.chain.max_stream_lag_ms == 1234
+    assert os.environ["CHAIN"] == ""
+
+    monkeypatch.setenv("TELEGRAM", "   ")
+    assert AppConfig.load(str(config_file)).telegram.daily_report_time == "00:00"

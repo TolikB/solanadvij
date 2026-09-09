@@ -485,7 +485,30 @@ class AppConfig(BaseSettings):
                     yaml_values.pop(alias, None)
                 break
 
-        return cls(**yaml_values)
+        # A blank env var means "not set". Nested models are decoded as JSON by
+        # BaseSettings before any validator runs, so an empty value would abort
+        # startup instead of falling back to YAML. Compose always defines the
+        # optional overrides, so hide the blank ones while the model is built.
+        blanked = {
+            name: os.environ[name]
+            for name in _optional_model_env_names(cls)
+            if name in os.environ and not os.environ[name].strip()
+        }
+        for name in blanked:
+            del os.environ[name]
+        try:
+            return cls(**yaml_values)
+        finally:
+            os.environ.update(blanked)
+
+
+def _optional_model_env_names(cls: type["AppConfig"]) -> list[str]:
+    names: list[str] = []
+    for field_name, model_field in cls.model_fields.items():
+        annotation = model_field.annotation
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            names.append(field_name.upper())
+    return names
 
 
 def _intify_telegram_ids(items: list[object]) -> list[int]:
