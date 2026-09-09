@@ -33,6 +33,10 @@ services:
       TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-[]}
       TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-[]}
       TELEGRAM: "${TELEGRAM:?TELEGRAM is required}"
+      # Operational override for chain settings, applied without rebuilding the
+      # image: configs/ is baked in, so a stale-checkpoint reset during an
+      # incident has to be switchable from .env.
+      CHAIN: "${CHAIN:-}"
       STARTING_EQUITY_USD: ${STARTING_EQUITY_USD:-500}
       BASE_QUOTE_MINT: ${BASE_QUOTE_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
       BASE_QUOTE_DECIMALS: ${BASE_QUOTE_DECIMALS:-6}

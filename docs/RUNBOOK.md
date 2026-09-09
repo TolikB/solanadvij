@@ -39,16 +39,26 @@ resuming from that checkpoint, records an `OPEN` row in `stream_recovery_gaps`, 
 an archive hole, so a bot that was down longer than the recovery window will not trade until the
 paginated backfill completes.
 
-If the backfill cannot complete, accepting the archive hole is an explicit operator decision, never
-an automatic one:
+Gap recovery is bounded by `MAX_GAP_RECOVERY_AGE` (60 seconds) and buffers the live socket in
+memory for at most `GAP_RECOVERY_TIMEOUT_SECONDS` (15 seconds). At mainnet Pump/PumpSwap volume that
+buffer fills long before a multi-minute gap can be paginated, so any outage longer than the recovery
+window - including an ordinary restart - leaves a checkpoint that cannot be backfilled.
+
+Accepting the resulting archive hole is an explicit operator decision, never an automatic one.
+`configs/` is baked into the image, so the switch is an environment override and needs no rebuild:
 
 1. Confirm from `/api/v1/status` and `stream_recovery_gaps` that the backfill is genuinely
    unreachable, and record why.
-2. Stop only this project's bot:
-   `docker compose -p solanadvij --env-file .env stop sniper-bot`.
-3. Set `chain.allow_stale_checkpoint_reset: true` in `configs/default.yaml`, restart `sniper-bot`,
-   and wait for the `ACCEPTED` `stream_recovery_gaps` rows that permanently record the hole.
-4. Set the flag back to `false` and restart again, so the next stale checkpoint fails closed.
+2. Set `CHAIN={"allow_stale_checkpoint_reset":true}` in `/opt/solanadvij/.env`, keeping mode `600`.
+3. Restart only this project's bot:
+   `docker compose -p solanadvij --env-file .env up -d sniper-bot`, then wait for the `ACCEPTED`
+   `stream_recovery_gaps` rows that permanently record the hole and for `/health/ready` to serve
+   `200`.
+4. Clear `CHAIN=` again once the bot is ready, so the next stale checkpoint fails closed. Note that
+   the next restart will hit the same decision, because it too exceeds the recovery window.
+
+`CHAIN` replaces the whole `chain` block, so any value that must differ from the model defaults has
+to be repeated in that JSON.
 
 `ACCEPTED` gap rows are terminal. A later successful recovery never resolves them, and the affected
 range must be excluded from canonical replay acceptance evidence.

@@ -123,3 +123,20 @@ def test_stale_checkpoint_reset_is_off_by_default_and_outside_strategy_identity(
     assert accepted.chain.allow_stale_checkpoint_reset is True
     assert accepted.config_hash == default.config_hash
     assert accepted.strategy_version == default.strategy_version
+
+
+def test_chain_env_override_enables_the_operator_reset(tmp_path, monkeypatch) -> None:
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "chain:\n  allow_stale_checkpoint_reset: false\n  max_stream_lag_ms: 3000\n",
+        encoding="utf-8",
+    )
+    for key, value in _base_config().items():
+        monkeypatch.setenv(key, str(value))
+
+    monkeypatch.delenv("CHAIN", raising=False)
+    assert AppConfig.load(str(config_file)).chain.allow_stale_checkpoint_reset is False
+
+    monkeypatch.setenv("CHAIN", '{"allow_stale_checkpoint_reset":true}')
+    overridden = AppConfig.load(str(config_file))
+    assert overridden.chain.allow_stale_checkpoint_reset is True

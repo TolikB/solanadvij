@@ -76,3 +76,9 @@ def test_compose_requires_valid_telegram_runtime_config() -> None:
         'TELEGRAM={"enabled":true,"daily_report_time":"00:00",'
         '"include_all_time_with_daily":false}'
     ) in env_example
+
+
+def test_compose_exposes_the_chain_override_without_a_rebuild() -> None:
+    services = _compose_services()
+
+    assert services["sniper-bot"]["environment"]["CHAIN"] == "${CHAIN:-}"
