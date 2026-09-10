@@ -72,7 +72,7 @@ def test_capacity_gate_accepts_a_result_that_meets_every_target() -> None:
 def test_capacity_gate_rejects_each_missed_target() -> None:
     below_throughput = {
         **_passing_result(),
-        "notifications_per_second": TARGET_NOTIFICATIONS_PER_SECOND - 1,
+        "notifications_per_second": TARGET_NOTIFICATIONS_PER_SECOND * 0.9,
     }
     slow_events = {
         **_passing_result(),
@@ -140,3 +140,19 @@ def test_phase_p95_reports_each_instrumented_stage() -> None:
     assert phases["chain_batch_phase_seconds:state_commit"] >= 250.0
     assert phases["postgres_event_ingest_phase_seconds:commit"] <= 25.0
     assert _phase_p95_ms(BotMetrics()) == {}
+
+
+def test_submit_jitter_passes_but_real_backpressure_fails() -> None:
+    # Sub-percent jitter is the driver's own scheduling, not a system property.
+    jitter = {
+        **_passing_result(),
+        "notifications_per_second": TARGET_NOTIFICATIONS_PER_SECOND * 0.9985,
+    }
+    # The contended VM measured this far below its target.
+    backpressure = {
+        **_passing_result(),
+        "notifications_per_second": TARGET_NOTIFICATIONS_PER_SECOND * 0.956,
+    }
+
+    assert _failures(jitter) == []
+    assert "sustained throughput" in _failures(backpressure)[0]

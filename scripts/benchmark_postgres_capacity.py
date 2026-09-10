@@ -62,6 +62,12 @@ BACKLOG_SAMPLE_INTERVAL_SECONDS = 0.25
 # and drain criteria already fail on. The backlog trend therefore only has to
 # separate a diverging queue from the ordinary in-flight batch, so it is
 # measured against a small fraction of the ingest rate rather than zero.
+# The gate drives submission at the target rate, so the achieved rate is a
+# setpoint comparison and carries the submit loop's scheduling jitter, which
+# has been under a percent. A real shortfall means the producer was blocked
+# by backpressure and is far larger: the contended VM measured 4.4% low at a
+# 800/s target and 40% low at 1200/s.
+THROUGHPUT_TOLERANCE_FRACTION = 0.02
 BACKLOG_SLOPE_TOLERANCE_FRACTION = 0.01
 MINIMUM_BACKLOG_SLOPE_LIMIT = 1.0
 DISTINCT_POOLS = 64
@@ -619,11 +625,15 @@ async def _run_capacity_gate(dsn: str) -> dict[str, Any]:
 
 def _failures(result: dict[str, Any]) -> list[str]:
     failures: list[str] = []
-    if result["notifications_per_second"] < TARGET_NOTIFICATIONS_PER_SECOND:
+    minimum_rate = TARGET_NOTIFICATIONS_PER_SECOND * (
+        1 - THROUGHPUT_TOLERANCE_FRACTION
+    )
+    if result["notifications_per_second"] < minimum_rate:
         failures.append(
             "sustained throughput "
             f"{result['notifications_per_second']}/s is below "
-            f"{TARGET_NOTIFICATIONS_PER_SECOND}/s"
+            f"{round(minimum_rate, 1)}/s, the floor for a "
+            f"{TARGET_NOTIFICATIONS_PER_SECOND}/s target"
         )
     if result["internal_event_p95_ms"] >= INTERNAL_EVENT_P95_LIMIT_MS:
         failures.append(
