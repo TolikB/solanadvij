@@ -455,6 +455,43 @@ async def _count_benchmark_events(database: Database) -> tuple[int, int]:
     return persisted, processed
 
 
+PHASE_HISTOGRAMS = (
+    "chain_batch_phase_seconds",
+    "postgres_event_ingest_phase_seconds",
+)
+
+
+def _phase_p95_ms(metrics: BotMetrics) -> dict[str, float]:
+    """Approximate a per-phase p95 from the Prometheus bucket counts."""
+    buckets: dict[str, list[tuple[float, float]]] = {}
+    totals: dict[str, float] = {}
+    for metric in metrics.registry.collect():
+        if metric.name not in PHASE_HISTOGRAMS:
+            continue
+        for sample in metric.samples:
+            phase = sample.labels.get("phase")
+            if phase is None:
+                continue
+            key = f"{metric.name}:{phase}"
+            if sample.name.endswith("_bucket"):
+                edge = float(sample.labels["le"])
+                buckets.setdefault(key, []).append((edge, sample.value))
+            elif sample.name.endswith("_count"):
+                totals[key] = sample.value
+
+    result: dict[str, float] = {}
+    for key, edges in buckets.items():
+        observed = totals.get(key, 0.0)
+        if observed <= 0:
+            continue
+        target = observed * 0.95
+        for edge, cumulative in sorted(edges):
+            if cumulative >= target:
+                result[key] = round(edge * 1000, 3)
+                break
+    return dict(sorted(result.items()))
+
+
 def _dropped_events(metrics: BotMetrics) -> int:
     total = 0.0
     for metric in metrics.registry.collect():
@@ -574,6 +611,9 @@ async def _run_capacity_gate(dsn: str) -> dict[str, Any]:
         "events_processed": processed,
         "drain_seconds": round(drain_seconds, 3),
         "drain_limit_seconds": MAX_DRAIN_SECONDS,
+        # Which stage dominates decides whether more cores can help: PostgreSQL
+        # phases scale with the server, the ordered Python stages do not.
+        "phase_p95_ms": _phase_p95_ms(metrics),
     }
 
 

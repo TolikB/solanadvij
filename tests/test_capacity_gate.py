@@ -10,9 +10,11 @@ from scripts.benchmark_postgres_capacity import (
     NotificationGenerator,
     _backlog_slope_limit,
     _failures,
+    _phase_p95_ms,
     _slope,
 )
 from sniper_bot.events import ChainEventType, Protocol
+from sniper_bot.metrics import BotMetrics
 from sniper_bot.protocols.pump import PumpDecoder
 from sniper_bot.protocols.pumpswap import PumpSwapDecoder
 
@@ -125,3 +127,16 @@ def test_one_in_flight_batch_is_not_a_diverging_backlog() -> None:
     assert _backlog_slope_limit(10.0) == 1.0
     assert _failures(in_flight) == []
     assert "backlog trends upwards" in _failures(diverging)[0]
+
+
+def test_phase_p95_reports_each_instrumented_stage() -> None:
+    metrics = BotMetrics()
+    for seconds in (0.002, 0.004, 0.3):
+        metrics.chain_batch_phase_seconds.labels(phase="state_commit").observe(seconds)
+    metrics.postgres_event_ingest_phase_seconds.labels(phase="commit").observe(0.02)
+
+    phases = _phase_p95_ms(metrics)
+
+    assert phases["chain_batch_phase_seconds:state_commit"] >= 250.0
+    assert phases["postgres_event_ingest_phase_seconds:commit"] <= 25.0
+    assert _phase_p95_ms(BotMetrics()) == {}
