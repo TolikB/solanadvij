@@ -616,3 +616,29 @@ async def test_solana_rpc_rejects_incomplete_holder_supply() -> None:
     )
     with pytest.raises(RuntimeError, match="does not match"):
         await client.get_all_holders("MINT", expected_supply_raw=Decimal("100"))
+
+
+@pytest.mark.asyncio
+async def test_holder_supply_tolerance_is_configurable() -> None:
+    def index(amount: str) -> list[object]:
+        return [
+            {
+                "last_indexed_slot": 100,
+                "cursor": None,
+                "token_accounts": [{"address": "A", "owner": "OWNER", "amount": amount}],
+            },
+            100,
+        ]
+
+    client = SolanaRpcClient("https://rpc.invalid")
+    client._call = AsyncMock(side_effect=index("9996"))
+    holders = await client.get_all_holders(
+        "MINT", expected_supply_raw=Decimal("10000"), supply_tolerance_pct=Decimal("0.0005")
+    )
+    assert holders[0].amount_raw == Decimal("9996")
+
+    client._call = AsyncMock(side_effect=index("9990"))
+    with pytest.raises(RuntimeError, match="does not match"):
+        await client.get_all_holders(
+            "MINT", expected_supply_raw=Decimal("10000"), supply_tolerance_pct=Decimal("0.0005")
+        )

@@ -215,7 +215,12 @@ class _CountingRpc:
         )
 
     async def get_all_holders(
-        self, mint: str, *, expected_supply_raw: Decimal
+        self,
+        mint: str,
+        *,
+        expected_supply_raw: Decimal,
+        maximum_index_slot_lag: int = 20,
+        supply_tolerance_pct: Decimal = Decimal("0"),
     ) -> list[HolderBalance]:
         self.holder_calls += 1
         return [HolderBalance(token_account="acc", owner="holder", amount_raw=Decimal("10"))]

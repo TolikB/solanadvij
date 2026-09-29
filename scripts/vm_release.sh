@@ -11,6 +11,8 @@
 #   scripts/vm_release.sh soak MINUTES [calibration]
 #                                              record-mode Helius/Jupiter quote-only soak
 #   scripts/vm_release.sh funnel [HOURS]       calibration funnel and the frozen decision
+#   scripts/vm_release.sh marks                reserve vs Jupiter marks and the frozen rule
+#   scripts/vm_release.sh sensitivity SINCE    re-price closed trades (delay, bps, size, fees)
 #   scripts/vm_release.sh freeze START [GAP]   protocol for START..+15d..+30d
 #   scripts/vm_release.sh start                paper bot, readiness, monitor
 #   scripts/vm_release.sh restart-drill PROTOCOL
@@ -199,6 +201,27 @@ report=json.load(open(sys.argv[1]))
 print("funnel=ok decision=%s changes=%s" % (report["decision"], json.dumps(report["config_changes"])))' "$result"
 }
 
+marks() {
+  local result
+  mkdir -p "$ARTIFACTS"
+  result="$ARTIFACTS/marks-$(date -u +%Y%m%dT%H%M%SZ).json"
+  in_image scripts/mark_divergence.py /app/data/mark_comparisons.ndjson >"$result"
+  cat "$result"
+  python3 -c 'import json,sys
+report=json.load(open(sys.argv[1]))
+print("marks=ok decision=%s pairs=%s" % (report["decision"], report["pairs"]))' "$result"
+}
+
+sensitivity() {
+  local since="${1:-}" result
+  [[ -n "$since" ]] || blocked "SINCE (UTC ISO timestamp) is required"
+  mkdir -p "$ARTIFACTS"
+  result="$ARTIFACTS/sensitivity-$(date -u +%Y%m%dT%H%M%SZ).json"
+  in_image scripts/fill_sensitivity.py --since "$since" >"$result"
+  cat "$result"
+  echo "sensitivity=ok result=$result"
+}
+
 freeze() {
   local start="${1:-}" gap="${2:-}"
   [[ -n "$start" ]] || blocked "collection start (UTC ISO timestamp) is required"
@@ -292,6 +315,8 @@ case "$command" in
   db) db ;;
   soak) soak "${1:-30}" "${2:-}" ;;
   funnel) funnel "${1:-24}" ;;
+  marks) marks ;;
+  sensitivity) sensitivity "${1:-}" ;;
   freeze) freeze "${1:-}" "${2:-}" ;;
   start) start ;;
   restart-drill) restart_drill "${1:-}" ;;

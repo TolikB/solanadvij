@@ -30,10 +30,13 @@ commands on the shared host. `scripts/vm_release.sh` wraps every step below with
    no open recovery gap, no protocol layout quarantine, accumulating events, working Jupiter
    quotes, stream lag p95 within 3 s, readiness, and candidates reaching outcomes. The JSON
    result is kept in `artifacts/`.
-7. `scripts/vm_release.sh funnel 24` applies the decision rule below to the soak and prints the
-   decision with its exact config changes.
-8. For decision B, commit those changes to `configs/default.yaml`, let CI pass, and repeat steps
-   1-5 plus a one-hour `soak 60` for the new SHA. For A, commit the trade-cap change the same way.
+7. `scripts/vm_release.sh funnel 24` applies the threshold rule below to the soak and prints the
+   decision with its exact config changes. `scripts/vm_release.sh marks` applies the mark-source
+   rule, and the soak JSON carries the other measurements (`security_reads`,
+   `jupiter_quotes_without_network_fee`, `entry_fills_failed_slippage`); apply every
+   pre-registered rule in "Calibration decisions" below.
+8. Commit the resulting config changes to `configs/default.yaml` (always at least the trade cap),
+   let CI pass, and repeat steps 1-5 plus a one-hour `soak 60` for the new SHA.
 9. Freeze the statistical protocol (see below), `scripts/vm_release.sh start`, then
    `scripts/vm_release.sh restart-drill artifacts/acceptance/statistical-protocol.json` at least
    15 minutes before the window: it restarts the bot once and requires the equity path to
@@ -68,6 +71,26 @@ rung reaches the target, decision C keeps the specified strategy unchanged and a
 itself the result. Safety, execution, holder, developer, exit and sizing rules are never part
 of the ladder. A calibration window shorter than 20 hours does not decide.
 
+## Calibration decisions
+
+The same soak fixes the other data-dependent settings, each by a rule written down before the
+data exists. Record the numbers and the resulting changes in the release commit.
+
+| Setting | Measurement | Rule |
+| --- | --- | --- |
+| `exits.mark_source` | `vm_release.sh marks` (reserve vs Jupiter value of every security round trip, and of positions in paper mode) | `reserves` only with >= 500 pairs, median absolute divergence <= 100 bps and p95 <= 300 bps; otherwise `jupiter` |
+| `holders.index_supply_tolerance_pct` | `security_reads.holders.failure_ratio` in the soak JSON | above 0.20: set `0.0005` (the index may miss 0.05% of supply) and re-measure; otherwise keep `0` |
+| `paper.min_network_fee_lamports` | `jupiter_quotes_without_network_fee.share_of_ok_quotes` | above 0.50: set the floor to the median priority fee paid by PumpSwap swaps at the time (Helius `getPriorityFeeEstimate` for the PumpSwap program, `Medium`), plus 5000; otherwise keep 5000 |
+| thresholds and trade cap | `vm_release.sh funnel 24` | the ladder below |
+
+`entry_fills_failed_slippage` and `paper_entry_slippage_bps` are recorded, not tuned: the 300 bps
+entry tolerance is part of the specified fill model.
+
+After the collection window, `scripts/vm_release.sh sensitivity START` re-prices every closed
+trade for 0/50/100/200 bps adverse fill, fills at the decision-time pool price (no delay), 2x,
+5x and 10x the size, and extra per-transaction fees. It shows how much of the result depends on
+the frozen fill model; it is reported next to the statistical gate, never used to change it.
+
 ## Statistical collection window
 
 The window is fixed before collection: start, OOS boundary on day 15, end on day 30. It cannot
@@ -101,9 +124,25 @@ the latest monitor verdict, and progress toward 3000 pools and 300 closed trades
 The `monitor` service reruns `scripts/soak_check.py` against the bot every 10 minutes and logs
 one JSON verdict per window: `docker compose -p solanadvij logs --tail 5 monitor`. A failed
 verdict names the criterion (dropped events, queue growth, reconnect churn, layout quarantine,
-stalled stream, Jupiter errors, readiness). `unknown_event_types` and `appended_layout_events`
-are informational: the programs gained event types or fields since the vendored IDL; trading
-continues, and the IDL is updated between collection windows. Nothing is sent to Telegram.
+stalled stream, Jupiter errors, readiness, free disk below 5 GB or 10% on the data or backup
+volume). `unknown_event_types` and `appended_layout_events` are informational: the programs
+gained event types or fields since the vendored IDL; trading continues, and the IDL is updated
+between collection windows. Nothing is sent to Telegram.
+
+Dead-man's switch: set `MONITOR_HEARTBEAT_URL` in `.env` to a check URL of an external service
+such as healthchecks.io (period 10 minutes, grace 20 minutes) and recreate the monitor. Every
+passing window pings the URL, a failing one pings `URL/fail` with the failed criteria, and a
+dead bot, monitor or host pings nothing, which is exactly what the service alerts on (email or
+push). Telegram stays limited to start, stop and the daily report.
+
+Off-host copies: the nightly dumps and the raw event archive live on the same disk as the
+database. Fill the `OFFSITE_*` variables in `.env` (any S3-compatible bucket; the password is
+rclone-obscured) and run `docker compose -p solanadvij --env-file .env --profile offsite up -d
+offsite`. rclone encrypts client-side and copies every 6 hours whatever changed in the last 72.
+
+Memory and disk stay bounded for the whole window: settled tokens, pools and wallet history
+leave memory (the `sniper_memory_entries` gauge shows what is resident), provider call audit
+rows are kept 3 days (`storage.api_call_retention_days`), and market snapshots 24 hours.
 
 ## Degraded state
 

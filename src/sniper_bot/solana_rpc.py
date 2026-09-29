@@ -203,6 +203,7 @@ class SolanaRpcClient:
         *,
         expected_supply_raw: Decimal,
         maximum_index_slot_lag: int = 20,
+        supply_tolerance_pct: Decimal = Decimal("0"),
     ) -> list[HolderBalance]:
         """Return every non-zero token account through Helius DAS pagination.
 
@@ -261,7 +262,7 @@ class SolanaRpcClient:
         if current_slot - min(indexed_slots) > maximum_index_slot_lag:
             raise SolanaRpcError("token-account index is too stale for concentration checks")
         indexed_supply = sum((holder.amount_raw for holder in holders), Decimal("0"))
-        if indexed_supply != expected_supply_raw:
+        if abs(indexed_supply - expected_supply_raw) > expected_supply_raw * supply_tolerance_pct:
             raise SolanaRpcError(
                 "token-account index supply does not match the mint total supply"
             )

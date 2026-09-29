@@ -205,7 +205,7 @@ jobs:
             "/backups/$(basename "$backup_file")" "$restore_dsn"
           test "$(docker run --rm --network host postgres:16 \
             psql "$restore_dsn" -Atc 'SELECT version_num FROM alembic_version')" \
-            = "20260901_0010"
+            = "20260929_0011"
           POSTGRES_DSN="$restore_dsn" MIGRATION_POSTGRES_DSN="$restore_dsn" \
             uv run python scripts/verify_data.py
           printf '%s isolated_restore\n' "$GITHUB_SHA" > ci-gates/isolated_restore.ok

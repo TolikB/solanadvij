@@ -132,6 +132,10 @@ class HolderConfig(BaseModel):
     max_dev_cluster_pct: Decimal = Decimal("0.05")
     max_related_cluster_pct: Decimal = Decimal("0.15")
     max_unknown_supply_pct: Decimal = Decimal("0.05")
+    # The holder index must account for the mint supply within this fraction
+    # (0 = exactly) and lag the confirmed slot by at most this many slots.
+    index_supply_tolerance_pct: Decimal = Field(default=Decimal("0"), ge=0, le=Decimal("0.01"))
+    max_index_slot_lag: int = Field(default=20, ge=1, le=150)
 
 
 class ExitConfig(BaseModel):

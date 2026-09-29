@@ -40,13 +40,41 @@ paper execution, reporting, Telegram command intake, and the read-only API.
    filters (quote liquidity, external sellers, pool age, liquidity trend, price extension) run
    first and reject without spending RPC or Jupiter quota. Each candidate is evaluated in
    isolation: one token's unavailable holder index or quote leaves that candidate waiting, and
-   expiry never waits on provider data.
-7. Jupiter V2 `/order` is queried without a taker. Risk sizing and the paper broker then write
-   order, fill, position, account, risk audit, and Telegram outbox in one DB transaction.
-8. The exit monitor marks every open position with a fresh executable sell quote and applies
-   stop, partial take-profit, trailing, momentum, time, developer-dump, liquidity, and risk exits.
-9. Source-linked infrastructure charges enter the immutable operational-cost ledger and update
-   paper cash/equity in the same transaction; OOS analysis reads only interval-bounded rows.
+   expiry never waits on provider data. Provider reads of all candidates in a pass run
+   concurrently (decisions stay sequential); mint and holder data refresh every
+   `execution.holder_refresh_seconds`, round trips every `execution.quote_refresh_seconds` and
+   always again for the entry decision, which alone must pass `max_quote_age_ms`. Two scores
+   above the entry bar confirm when they are at least one window apart with no lower score in
+   between and no silence longer than `candidate.score_confirmation_max_gap_seconds`.
+7. Jupiter V2 `/order` is queried without a taker, through one priority rate limiter: exits
+   and marks first, then entries, the SOL/USD reference, and candidate security round trips.
+   After `paper.execution_delay_ms` the broker re-quotes; an entry that moved more than
+   `paper.max_entry_slippage_bps` against the decision quote fails like a swap with a minimum
+   output (rejected order, network fee paid). Otherwise order, fill (with the pool reserves
+   before and after the delay and the quote as evidence), position, account, risk audit, and
+   Telegram outbox are written in one DB transaction.
+8. The exit monitor marks every open position (a Jupiter sell quote, or the tracked pool
+   reserves with `exits.mark_source: reserves`; the two are always compared and logged) and
+   applies stop, partial take-profit, trailing, momentum, time, developer-dump, liquidity, and
+   risk exits. Exits wait the same execution delay before they are priced.
+9. An entry refused only by the account's risk state (loss-streak pause or halt, daily loss or
+   trade cap, full slots, exposure, cash, drawdown, exhausted daily budget) is taken in the
+   shadow book instead: same size rule on a fresh day, same fill model and exits, own tables
+   and own exit loop, never touching the account. Account plus shadow trades are the signal
+   sample the statistical protocol measures; the account alone is the portfolio result.
+10. Source-linked infrastructure charges enter the immutable operational-cost ledger and update
+    paper cash/equity in the same transaction; OOS analysis reads only interval-bounded rows.
+
+## Bounded state
+
+A collection window runs for a month on one VPS. Tokens, pools and feature windows leave
+memory once no candidate, position or shadow trade needs them (a token that migrates later is
+reloaded from PostgreSQL with its creator). Wallet history is indexed by creator, evicted after
+a day of inactivity and reloaded on the creator's next launch or candidate; wallet rows merge
+instead of overwriting, so a process that holds only part of a history never clobbers it.
+Relations are kept for a week, seen-event ids and provider caches are capped. Tokens and pools
+are written when they change, candidate rows on lifecycle changes, open-position equity marks
+every 5 s, provider audit rows are kept 3 days, and restart restores only what it needs.
 
 ## Failure boundaries
 
@@ -57,8 +85,8 @@ minus `collection.entry_cutoff_seconds` no new entry is taken and open candidate
 so every pool and position of a frozen statistical window finishes inside it.
 
 PostgreSQL is authoritative for paper fills. The exit monitor marks executable equity every
-second while positions are open and at least once a minute while the account is flat, so the
-OOS equity path has bounded gaps. The JSON ledger is a deterministic local mirror
+5 seconds while positions are open (fills add exact marks) and at least once a minute while the
+account is flat, so the OOS equity path has bounded gaps. The JSON ledger is a deterministic local mirror
 and is hydrated from committed DB rows after restart. Raw archives and external-response
 journals preserve repeated responses in call order and make replay independent of the live
 network. Stream and event-time momentum checkpoints are restored before entry can be enabled.

@@ -47,6 +47,10 @@ def summarize(
     oos_trades = sum(
         1 for trade in inputs.closed_trades if _utc(trade.entry_time) >= protocol.oos_started_at
     )
+    signal_trades = [*inputs.closed_trades, *inputs.shadow_trades]
+    signal_oos = sum(
+        1 for trade in signal_trades if _utc(trade.entry_time) >= protocol.oos_started_at
+    )
     return {
         "phase": phase,
         "now": now.isoformat(),
@@ -63,12 +67,17 @@ def summarize(
         "pools_without_outcome_yet": inputs.missing_final_pool_outcome_count,
         "rejected_pools": inputs.negative_launch_count,
         "rejected_pools_target": protocol.minimum_negative_launches,
+        # The sample-size targets count signal trades: account plus shadow.
         "closed_trades": len(inputs.closed_trades),
-        "closed_trades_target": TARGET_CLOSED_TRADES,
-        "in_sample_trades": len(inputs.closed_trades) - oos_trades,
-        "oos_trades": oos_trades,
-        "oos_trades_target": protocol.minimum_oos_trades,
+        "shadow_trades": len(inputs.shadow_trades),
+        "signal_trades": len(signal_trades),
+        "signal_trades_target": TARGET_CLOSED_TRADES,
+        "in_sample_signal_trades": len(signal_trades) - signal_oos,
+        "oos_signal_trades": signal_oos,
+        "oos_signal_trades_target": protocol.minimum_oos_trades,
+        "oos_account_trades": oos_trades,
         "open_positions": inputs.censored_position_count,
+        "open_shadow_positions": inputs.censored_shadow_position_count,
         "oos_equity_marks": sum(
             1
             for point in inputs.equity_points

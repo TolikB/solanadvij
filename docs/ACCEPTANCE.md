@@ -40,8 +40,10 @@ The cohort is restricted to one strategy/config/revision. OOS assignment uses po
 not close time. Distinct PumpSwap `pool_created` raw events are compared with materialized pool rows,
 and rejected-launch counts use distinct rejected candidate pools in the same interval and strategy.
 All cohort positions are loaded: any position not closed by the cutoff fails the gate. Outer joins
-prevent missing metadata from disappearing, and only an explicit known funding cluster counts as
-completed clustering; inferred singleton clusters do not pass.
+prevent missing metadata from disappearing. A trade is attributed to its developer's funding
+cluster when one is known and to the creator wallet otherwise (tokens first seen at migration
+take the creator from the PumpSwap pool's `coin_creator`); a trade with neither fails
+`cluster_attribution_complete`.
 Every discovered raw PumpSwap pool must also be materialized and reach a terminal candidate outcome
 (`REJECTED` by the cutoff or a position closed by the cutoff). Rejections recorded after the cutoff
 do not enter the negative cohort.
@@ -53,6 +55,17 @@ receipt artifact referenced by runtime evidence, and the verifier compares its a
 amount, and incurred timestamp with the statistical report. Max drawdown comes from a gap-bounded durable executable-equity
 curve that reaches both OOS boundaries, including unrealized movement and overlapping positions. The gate also requires net
 PnL to remain positive without the best trade day and without the best developer cluster.
+
+Protocol schema 4 measures the signal, not only the risk-limited account. An entry the account's
+own risk rules refused is taken as a shadow trade with the same fill model and exits
+(`signal_sample_definition: account_and_risk_blocked_shadow_trades`). The sample-size criteria
+(300 closed trades, `minimum_oos_trades`, an IS/OOS split, no censored positions) count account
+plus shadow trades, and two criteria require the mean OOS signal R and its one-sided 95% lower
+confidence bound to be positive, where R is a trade's PnL over its entry cost times
+`risk_unit_pct` (the hard stop, 15%). Net PnL after costs, profit factor, drawdown, trade
+concentration, day and developer independence stay account-only. A shadow entry that failed its
+slippage tolerance is a cost, not a trade. `scripts/fill_sensitivity.py` reports how the result
+moves with the fill model; it is context for the gate, not part of it.
 
 ## Evidence bundle
 

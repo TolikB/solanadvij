@@ -174,10 +174,11 @@ def test_collection_progress_reports_the_sample_against_its_targets() -> None:
 
     assert summary["phase"] == "out_of_sample"
     assert summary["closed_trades"] == 3
-    assert summary["in_sample_trades"] == 2
-    assert summary["oos_trades"] == 1
+    assert summary["signal_trades"] == 3
+    assert summary["in_sample_signal_trades"] == 2
+    assert summary["oos_signal_trades"] == 1
     assert summary["discovered_pumpswap_pools_target"] == 3000
-    assert summary["closed_trades_target"] == 300
+    assert summary["signal_trades_target"] == 300
     assert summary["pools_without_outcome_yet"] == 2
     assert summary["oos_equity_marks"] == 1
 

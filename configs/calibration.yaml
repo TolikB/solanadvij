@@ -95,6 +95,8 @@ holders:
   max_dev_cluster_pct: 0.05
   max_related_cluster_pct: 0.15
   max_unknown_supply_pct: 0.05
+  index_supply_tolerance_pct: 0
+  max_index_slot_lag: 20
 exits:
   take_profit_1_pct: 0.30
   take_profit_1_size_pct: 0.50

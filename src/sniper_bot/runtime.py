@@ -956,6 +956,8 @@ class SniperRuntime:
         reserve_usd: Decimal,
         jupiter_usd: Decimal,
         now: datetime,
+        *,
+        source: str = "position",
     ) -> None:
         """Log both marks so the soak can decide on reserve-based marking."""
         if jupiter_usd <= 0:
@@ -964,6 +966,7 @@ class SniperRuntime:
         self.metrics.mark_divergence_bps.observe(float(abs(divergence_bps)))
         record = {
             "at": now.isoformat(),
+            "source": source,
             "position_id": position.position_id,
             "mint": position.token_mint,
             "pool_address": position.pool_address,
@@ -1082,6 +1085,38 @@ class SniperRuntime:
             max_hold_seconds=self.config.exits.maximum_holding_seconds,
             no_new_high_seconds=self.config.exits.no_new_high_timeout_seconds,
         )
+
+    def _compare_round_trip_to_reserves(
+        self, candidate: Candidate, round_trip: RoundTripQuote, at: datetime
+    ) -> None:
+        """Every security round trip is also a reserve-versus-Jupiter sample.
+
+        Record-mode soaks hold no positions, so this is where the evidence
+        for the mark-source decision comes from before paper trading.
+        """
+        sell_usd = (
+            round_trip.sell.out_amount_usd
+            if round_trip.sell.out_amount_usd
+            else round_trip.sell.out_amount
+        )
+        probe = PositionRecord(
+            position_id=f"round-trip:{candidate.candidate_id}",
+            token_mint=candidate.mint,
+            open_fill_id="",
+            entry_token_amount=round_trip.buy.out_amount,
+            entry_cost_usd=round_trip.starting_usd,
+            open_ratio=Decimal("1"),
+            opened_at=at,
+            locked_usd=round_trip.starting_usd,
+            remaining_token_amount=round_trip.buy.out_amount,
+            remaining_cost_usd=round_trip.starting_usd,
+            pool_address=candidate.pool_address,
+        )
+        reserve_usd = self._reserve_mark_usd(probe, at)
+        if reserve_usd is not None and sell_usd:
+            self._record_mark_comparison(
+                probe, reserve_usd, sell_usd, at, source="security_round_trip"
+            )
 
     def _pool_evidence(self, pool_address: str) -> dict[str, str] | None:
         return pool_evidence(
@@ -1356,6 +1391,8 @@ class SniperRuntime:
                 self.rpc.get_all_holders(
                     candidate.mint,
                     expected_supply_raw=mint_info.total_supply_raw,
+                    maximum_index_slot_lag=self.config.holders.max_index_slot_lag,
+                    supply_tolerance_pct=self.config.holders.index_supply_tolerance_pct,
                 ),
             )
             if refresh_quote:
@@ -1410,6 +1447,8 @@ class SniperRuntime:
                 if refresh_quote
                 else cached.round_trip
             )
+        if refresh_quote:
+            self._compare_round_trip_to_reserves(candidate, round_trip, at)
         self._security_inputs[candidate.candidate_id] = _SecurityInputs(
             mint_info=mint_info,
             holder_accounts=holder_accounts,
