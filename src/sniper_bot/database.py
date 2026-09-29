@@ -155,6 +155,118 @@ def _json_batch_default(value: object) -> str:
     )
 
 
+# Wallet history is evicted from memory and reloaded on demand, so a row may
+# be written by a process that does not hold the wallet's full history. These
+# columns merge instead of overwriting: identity keeps its earliest value and
+# creator counts only change when the writer carries the creator's history.
+_WALLET_CREATOR_COLUMNS = (
+    "tokens_created",
+    "tokens_traded",
+    "tokens_created_7d",
+    "tokens_created_30d",
+    "tokens_reaching_pumpswap",
+    "tokens_reaching_2x_executable",
+    "tokens_with_liquidity_rug",
+    "tokens_with_dev_dump_5m",
+    "median_peak_return",
+    "median_token_lifetime_seconds",
+    "median_dev_sell_delay_seconds",
+    "last_token_created_at",
+)
+_MERGE_UPSERT_RULES: dict[str, dict[str, str]] = {
+    "wallet_profiles": {
+        "first_seen_at": "least",
+        "initial_funder": "keep",
+        "funding_signature": "keep",
+        "known_funding_cluster": "keep",
+        "known_creator": "or",
+        "profile_updated_at": "greatest",
+        **{column: "creator" for column in _WALLET_CREATOR_COLUMNS},
+    },
+    "wallet_relations": {"first_detected_at": "least"},
+}
+
+
+def _merge_update_sql(table: str, column: str, quote: Any) -> str:
+    rule = _MERGE_UPSERT_RULES.get(table, {}).get(column)
+    current = f"{table}.{quote(column)}"
+    incoming = f"EXCLUDED.{quote(column)}"
+    if rule == "least":
+        return f"LEAST({current}, {incoming})"
+    if rule == "greatest":
+        return f"GREATEST({current}, {incoming})"
+    if rule == "keep":
+        return f"COALESCE({current}, {incoming})"
+    if rule == "or":
+        return f"({current} OR {incoming})"
+    if rule == "creator":
+        return (
+            f"CASE WHEN EXCLUDED.{quote('known_creator')} "
+            f"THEN {incoming} ELSE {current} END"
+        )
+    return incoming
+
+
+def _merge_update_expression(model: Any, statement: Any, column: str) -> Any:
+    rule = _MERGE_UPSERT_RULES.get(model.__tablename__, {}).get(column)
+    current = model.__table__.c[column]
+    incoming = statement.excluded[column]
+    if rule == "least":
+        return func.min(current, incoming)
+    if rule == "greatest":
+        return func.max(current, incoming)
+    if rule == "keep":
+        return func.coalesce(current, incoming)
+    if rule == "or":
+        return or_(current, incoming)
+    if rule == "creator":
+        return case((statement.excluded["known_creator"], incoming), else_=current)
+    return incoming
+
+
+def _entry_signal_value(
+    signals: dict[str, SignalEvaluationRow],
+    candidate_id: str | None,
+    field: str,
+) -> Any:
+    signal = signals.get(candidate_id) if candidate_id else None
+    if signal is None:
+        return None
+    if field == "score":
+        return signal.score
+    return (signal.features_json or {}).get(field)
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def _wallet_profile_from_row(row: WalletProfileRow) -> WalletProfile:
+    return WalletProfile(
+        wallet_address=row.wallet_address,
+        first_seen_at=_aware(row.first_seen_at) or datetime.now(tz=timezone.utc),
+        initial_funder=row.initial_funder,
+        funding_signature=row.funding_signature,
+        known_creator=row.known_creator,
+        tokens_created_total=row.tokens_created,
+        tokens_created_7d=row.tokens_created_7d,
+        tokens_created_30d=row.tokens_created_30d,
+        tokens_reaching_pumpswap=row.tokens_reaching_pumpswap,
+        tokens_reaching_2x_executable=row.tokens_reaching_2x_executable,
+        tokens_with_liquidity_rug=row.tokens_with_liquidity_rug,
+        tokens_with_dev_dump_5m=row.tokens_with_dev_dump_5m,
+        median_peak_return=row.median_peak_return,
+        median_token_lifetime_seconds=row.median_token_lifetime_seconds,
+        median_dev_sell_delay_seconds=row.median_dev_sell_delay_seconds,
+        last_token_created_at=_aware(row.last_token_created_at),
+        known_funding_cluster=row.known_funding_cluster,
+        tokens_traded=row.tokens_traded,
+        profile_updated_at=_aware(row.profile_updated_at) or datetime.now(tz=timezone.utc),
+    )
+
+
 def _postgresql_json_rows(rows: object) -> str:
     return json.dumps(rows, default=_json_batch_default, separators=(",", ":"))
 
@@ -945,29 +1057,31 @@ class Database:
         if active_run_id != owned_run_id:
             raise ActiveRuntimeError("paper-account transaction lost runtime ownership")
 
-    async def load_wallet_analysis(self) -> tuple[list[WalletProfile], list[WalletRelation]]:
-        async with self.sessions() as session:
-            profile_rows = list((await session.scalars(select(WalletProfileRow))).all())
-            relation_rows = list((await session.scalars(select(WalletRelationRow))).all())
-        profiles = [
-            WalletProfile(
-                wallet_address=row.wallet_address, first_seen_at=row.first_seen_at,
-                initial_funder=row.initial_funder, funding_signature=row.funding_signature,
-                known_creator=row.known_creator, tokens_created_total=row.tokens_created,
-                tokens_created_7d=row.tokens_created_7d, tokens_created_30d=row.tokens_created_30d,
-                tokens_reaching_pumpswap=row.tokens_reaching_pumpswap,
-                tokens_reaching_2x_executable=row.tokens_reaching_2x_executable,
-                tokens_with_liquidity_rug=row.tokens_with_liquidity_rug,
-                tokens_with_dev_dump_5m=row.tokens_with_dev_dump_5m,
-                median_peak_return=row.median_peak_return,
-                median_token_lifetime_seconds=row.median_token_lifetime_seconds,
-                median_dev_sell_delay_seconds=row.median_dev_sell_delay_seconds,
-                last_token_created_at=row.last_token_created_at,
-                known_funding_cluster=row.known_funding_cluster,
-                tokens_traded=row.tokens_traded, profile_updated_at=row.profile_updated_at,
+    async def load_wallet_analysis(
+        self,
+        *,
+        profiles_since: datetime | None = None,
+        relations_since: datetime | None = None,
+    ) -> tuple[list[WalletProfile], list[WalletRelation]]:
+        """Load wallet history active since the given times (all without them).
+
+        A month of launches leaves hundreds of thousands of profiles; startup
+        restores only recent ones and the rest load on demand.
+        """
+        profile_query = select(WalletProfileRow)
+        if profiles_since is not None:
+            profile_query = profile_query.where(
+                WalletProfileRow.profile_updated_at >= profiles_since
             )
-            for row in profile_rows
-        ]
+        relation_query = select(WalletRelationRow)
+        if relations_since is not None:
+            relation_query = relation_query.where(
+                WalletRelationRow.last_detected_at >= relations_since
+            )
+        async with self.sessions() as session:
+            profile_rows = list((await session.scalars(profile_query)).all())
+            relation_rows = list((await session.scalars(relation_query)).all())
+        profiles = [_wallet_profile_from_row(row) for row in profile_rows]
         relations = [
             WalletRelation(
                 wallet_a=row.wallet_a, wallet_b=row.wallet_b,
@@ -977,6 +1091,34 @@ class Database:
             for row in relation_rows
         ]
         return profiles, relations
+
+    async def load_wallet_profile(self, wallet: str) -> WalletProfile | None:
+        async with self.sessions() as session:
+            row = await session.get(WalletProfileRow, wallet)
+        return _wallet_profile_from_row(row) if row is not None else None
+
+    async def load_token(self, mint: str) -> TokenRecord | None:
+        async with self.sessions() as session:
+            row = await session.get(TokenRow, mint)
+        if row is None:
+            return None
+        return TokenRecord(
+            mint=row.mint,
+            token_program=row.token_program,
+            name=row.name,
+            symbol=row.symbol,
+            decimals=row.decimals,
+            total_supply_raw=row.total_supply_raw,
+            creator_address=row.creator_address,
+            creation_signature=row.creation_signature,
+            creation_slot=row.creation_slot,
+            creation_time=_aware(row.creation_time),
+            metadata_uri=row.metadata_uri,
+            metadata_mutable=row.metadata_mutable,
+            enrichment=dict(row.enrichment_json or {}),
+            enriched_at=_aware(row.enriched_at),
+            updated_at=_aware(row.updated_at) or datetime.now(tz=timezone.utc),
+        )
 
     async def _reconcile_event_claim_tokens(
         self,
@@ -2342,24 +2484,37 @@ class Database:
         ]
 
     async def load_candidate_score_totals(
-        self, strategy_id: str
+        self, strategy_id: str, *, candidate_ids: list[str] | None = None
     ) -> dict[str, Decimal]:
-        async with self.sessions() as session:
-            rows = (
-                await session.execute(
-                    select(
-                        SignalEvaluationRow.candidate_id,
-                        SignalEvaluationRow.score,
-                    )
-                    .join(
-                        CandidateRow,
-                        CandidateRow.id == SignalEvaluationRow.candidate_id,
-                    )
-                    .where(CandidateRow.strategy_version_id == strategy_id)
-                    .order_by(SignalEvaluationRow.evaluated_at)
+        """Latest score per candidate, limited to ``candidate_ids`` when given."""
+        query = (
+            select(
+                SignalEvaluationRow.candidate_id,
+                SignalEvaluationRow.score,
+            )
+            .join(
+                CandidateRow,
+                CandidateRow.id == SignalEvaluationRow.candidate_id,
+            )
+            .where(CandidateRow.strategy_version_id == strategy_id)
+            .order_by(SignalEvaluationRow.evaluated_at)
+        )
+        if candidate_ids is None:
+            chunks: list[Any] = [query]
+        else:
+            ordered = sorted(set(candidate_ids))
+            chunks = [
+                query.where(
+                    SignalEvaluationRow.candidate_id.in_(ordered[offset : offset + 500])
                 )
-            ).all()
-        return {str(candidate_id): Decimal(str(score)) for candidate_id, score in rows}
+                for offset in range(0, len(ordered), 500)
+            ]
+        totals: dict[str, Decimal] = {}
+        async with self.sessions() as session:
+            for chunk in chunks:
+                for candidate_id, score in (await session.execute(chunk)).all():
+                    totals[str(candidate_id)] = Decimal(str(score))
+        return totals
 
     async def record_security(
         self,
@@ -2705,11 +2860,27 @@ class Database:
                 )
             return True
 
-    async def run_retention(self, *, raw_retention_days: int) -> None:
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max(90, raw_retention_days))
+    async def run_retention(
+        self, *, raw_retention_days: int, api_call_retention_days: int = 3
+    ) -> None:
+        now = datetime.now(tz=timezone.utc)
+        cutoff = now - timedelta(days=max(90, raw_retention_days))
         async with self.sessions.begin() as session:
             await session.execute(
                 delete(RawChainEventRow).where(RawChainEventRow.block_time < cutoff)
+            )
+            # Every quote and RPC page is journaled with its full response;
+            # at a few calls per second that is gigabytes a day.
+            # Quotes a paper order points at stay as fill provenance.
+            referenced = select(PaperOrderRow.quote_request_id).where(
+                PaperOrderRow.quote_request_id.is_not(None)
+            )
+            await session.execute(
+                delete(ExternalApiCallRow).where(
+                    ExternalApiCallRow.requested_at
+                    < now - timedelta(days=max(1, api_call_retention_days)),
+                    ExternalApiCallRow.id.not_in(referenced),
+                )
             )
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 await session.execute(
@@ -2913,15 +3084,28 @@ class Database:
             orders = list((await session.scalars(select(PaperOrderRow))).all())
             fills = list((await session.scalars(select(PaperFillRow))).all())
             positions = list((await session.scalars(select(PaperPositionRow))).all())
-            signals = list(
-                (
+            # Only the entry signal of each position matters; a month of
+            # per-second evaluations must not be loaded (or rescanned per
+            # position) on every restart.
+            entry_candidates: dict[str, str] = {}
+            for order in orders:
+                if order.side == "BUY" and order.candidate_id and order.position_id:
+                    entry_candidates.setdefault(order.position_id, order.candidate_id)
+            entry_signals: dict[str, SignalEvaluationRow] = {}
+            candidate_ids = sorted(set(entry_candidates.values()))
+            for offset in range(0, len(candidate_ids), 500):
+                for signal in (
                     await session.scalars(
-                        select(SignalEvaluationRow).order_by(
-                            SignalEvaluationRow.evaluated_at
+                        select(SignalEvaluationRow)
+                        .where(
+                            SignalEvaluationRow.candidate_id.in_(
+                                candidate_ids[offset : offset + 500]
+                            )
                         )
+                        .order_by(SignalEvaluationRow.evaluated_at)
                     )
-                ).all()
-            )
+                ).all():
+                    entry_signals[signal.candidate_id] = signal
             return {
                 "account": {
                     "starting_equity": account.starting_equity,
@@ -2989,65 +3173,19 @@ class Database:
                         "exit_reason": row.exit_reason,
                         "pool_address": row.pool_address,
                         "strategy_version": row.strategy_version_id,
-                        "candidate_id": next(
-                            (
-                                order.candidate_id
-                                for order in orders
-                                if order.position_id == row.id
-                                and order.side == "BUY"
-                            ),
-                            None,
+                        "candidate_id": entry_candidates.get(row.id),
+                        "entry_score": _entry_signal_value(
+                            entry_signals, entry_candidates.get(row.id), "score"
                         ),
-                        "entry_score": next(
-                            (
-                                signal.score
-                                for signal in reversed(signals)
-                                if signal.candidate_id
-                                == next(
-                                    (
-                                        order.candidate_id
-                                        for order in orders
-                                        if order.position_id == row.id
-                                        and order.side == "BUY"
-                                    ),
-                                    None,
-                                )
-                            ),
-                            None,
+                        "entry_liquidity_usd": _entry_signal_value(
+                            entry_signals,
+                            entry_candidates.get(row.id),
+                            "quote_liquidity_usd",
                         ),
-                        "entry_liquidity_usd": next(
-                            (
-                                signal.features_json.get("quote_liquidity_usd")
-                                for signal in reversed(signals)
-                                if signal.candidate_id
-                                == next(
-                                    (
-                                        order.candidate_id
-                                        for order in orders
-                                        if order.position_id == row.id
-                                        and order.side == "BUY"
-                                    ),
-                                    None,
-                                )
-                            ),
-                            None,
-                        ),
-                        "entry_pool_age_seconds": next(
-                            (
-                                signal.features_json.get("pool_age_seconds")
-                                for signal in reversed(signals)
-                                if signal.candidate_id
-                                == next(
-                                    (
-                                        order.candidate_id
-                                        for order in orders
-                                        if order.position_id == row.id
-                                        and order.side == "BUY"
-                                    ),
-                                    None,
-                                )
-                            ),
-                            None,
+                        "entry_pool_age_seconds": _entry_signal_value(
+                            entry_signals,
+                            entry_candidates.get(row.id),
+                            "pool_age_seconds",
                         ),
                     }
                     for row in positions
@@ -3971,7 +4109,7 @@ class Database:
             elif dialect == "sqlite":
                 statement = sqlite_insert(model).values(chunk)
                 update_values = {
-                    column: statement.excluded[column]
+                    column: _merge_update_expression(model, statement, column)
                     for column in chunk[0]
                     if column not in keys
                 }
@@ -4024,7 +4162,8 @@ class Database:
         update_columns = [column for column in columns if column not in keys]
         if update_columns:
             conflict_action = "DO UPDATE SET " + ", ".join(
-                f"{quote(column)} = EXCLUDED.{quote(column)}"
+                f"{quote(column)} = "
+                f"{_merge_update_sql(table.name, column, quote)}"
                 for column in update_columns
             )
         else:

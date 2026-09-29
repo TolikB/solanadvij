@@ -145,3 +145,70 @@ def test_window_keeps_peaks_not_every_sample() -> None:
     assert window.samples == 3
     assert window.peaks["event_notification_queue_depth"] == 700
     assert window.first.at == 0 and window.last.at == 30
+
+
+def test_disk_criterion_fails_when_any_volume_runs_low() -> None:
+    from scripts.soak_check import disk_criterion
+
+    thresholds = Thresholds(min_free_disk_gb=5, min_free_disk_ratio=0.1)
+    healthy = disk_criterion({"/data": (50 * 10**9, 100 * 10**9)}, thresholds)
+    low_ratio = disk_criterion(
+        {"/data": (50 * 10**9, 100 * 10**9), "/backups": (8 * 10**9, 100 * 10**9)},
+        thresholds,
+    )
+    low_absolute = disk_criterion({"/data": (4 * 10**9, 10 * 10**9)}, thresholds)
+
+    assert healthy["passed"] is True
+    assert low_ratio["passed"] is False
+    assert low_ratio["actual"]["/backups"]["free_ratio"] == 0.08
+    assert low_absolute["passed"] is False
+
+
+def test_evaluate_includes_the_disk_criterion_when_measured() -> None:
+    result = evaluate(
+        window_of(_healthy_window()),
+        Thresholds(),
+        disk_usage={"/data": (1 * 10**9, 100 * 10**9)},
+    )
+    disk = next(item for item in result["criteria"] if item["name"] == "disk_free")
+    assert disk["passed"] is False
+    assert result["passed"] is False
+
+
+def test_heartbeat_pings_success_and_failure_endpoints() -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from scripts.soak_check import ping_heartbeat
+
+    received: list[tuple[str, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            received.append((self.path, self.rfile.read(length)))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/check-id"
+        assert ping_heartbeat(url, {"label": "monitor", "passed": True, "criteria": []}) is None
+        failing = {
+            "label": "monitor",
+            "passed": False,
+            "criteria": [{"name": "disk_free", "passed": False}],
+        }
+        assert ping_heartbeat(url, failing) is None
+    finally:
+        server.shutdown()
+
+    assert [path for path, _ in received] == ["/check-id", "/check-id/fail"]
+    assert b'"disk_free"' in received[1][1]
+    unreachable = ping_heartbeat("http://127.0.0.1:1/x", {"passed": True}, timeout=1)
+    assert unreachable is not None

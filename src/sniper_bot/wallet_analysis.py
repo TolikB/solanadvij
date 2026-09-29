@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,6 +13,20 @@ from pydantic import BaseModel
 
 from .clustering import RelationEvidence, WalletRelation, build_clusters, score_relation
 from .events import ChainEventType, EventEnvelope
+
+# A month of Pump launches must not stay resident. Everything below is
+# persisted, so memory only holds what live decisions can still touch:
+MAX_SEEN_EVENT_IDS = 200_000
+# a creator's history while they keep launching (reloaded from the database
+# the next time they launch or reach a candidate),
+CREATOR_MEMORY_RETENTION = timedelta(hours=24)
+# a trader's profile while they keep trading tracked pools,
+WALLET_MEMORY_RETENTION = timedelta(hours=24)
+# a mint's buyer evidence well past the candidate and position lifetime,
+MINT_MEMORY_RETENTION = timedelta(hours=1)
+# and wallet relations for a week of cross-pool clustering.
+RELATION_MEMORY_RETENTION = timedelta(days=7)
+MEMORY_SWEEP_INTERVAL = timedelta(seconds=60)
 
 
 class WalletProfile(BaseModel):
@@ -58,7 +72,10 @@ class _BuyerEvidence:
 class WalletAnalyzer:
     """Maintains only observations available by each requested event time."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reloadable_history: bool = False) -> None:
+        # Creator history leaves memory only when a database can reload it;
+        # an offline replay keeps it so long replays stay exact.
+        self._reloadable_history = reloadable_history
         self._profiles: dict[str, WalletProfile] = {}
         self._baselines: dict[str, WalletProfile] = {}
         self._outcomes: dict[str, TokenOutcome] = {}
@@ -72,24 +89,100 @@ class WalletAnalyzer:
         self._buyer_top_volume: dict[str, list[str]] = defaultdict(list)
         self._buyer_evidence: dict[str, dict[str, _BuyerEvidence]] = defaultdict(dict)
         self._buyer_last_order_key: dict[str, tuple[datetime, str]] = {}
-        self._seen_event_ids: set[str] = set()
+        self._seen_event_ids: OrderedDict[str, None] = OrderedDict()
+        self._outcomes_by_creator: dict[str, list[str]] = {}
+        self._relations_by_wallet: dict[str, set[tuple[str, str]]] = {}
+        self._relation_seen_at: dict[tuple[str, str], datetime] = {}
+        self._creator_active_at: dict[str, datetime] = {}
+        self._wallet_seen_at: dict[str, datetime] = {}
+        self._mint_seen_at: dict[str, datetime] = {}
+        # Wallets whose persisted history was consulted in this process.
+        self._history_checked: set[str] = set()
+        self._last_sweep_at: datetime | None = None
 
     def restore(
-        self, profiles: list[WalletProfile], relations: list[WalletRelation]
+        self,
+        profiles: list[WalletProfile],
+        relations: list[WalletRelation],
+        *,
+        restored_at: datetime | None = None,
     ) -> None:
         for profile in profiles:
-            self._profiles[profile.wallet_address] = profile
-            self._baselines[profile.wallet_address] = profile
+            self.restore_history(profile.wallet_address, profile)
+        stamp = restored_at or datetime.now(tz=timezone.utc)
         for relation in relations:
-            self._relations[(relation.wallet_a, relation.wallet_b)] = relation
+            self._store_relation(relation, stamp)
+
+    def needs_history(self, wallet: str | None) -> bool:
+        """Whether the wallet's persisted history has to be loaded first."""
+        return bool(wallet) and wallet not in self._history_checked
+
+    def restore_history(
+        self,
+        wallet: str,
+        profile: WalletProfile | None,
+        *,
+        at: datetime | None = None,
+    ) -> None:
+        """Install a wallet's persisted profile as the baseline of its history.
+
+        ``at`` is when it was needed; the wallet stays resident from then on.
+        """
+        self._history_checked.add(wallet)
+        if profile is None:
+            return
+        self._baselines[wallet] = profile
+        current = self._profiles.get(wallet)
+        if current is None:
+            self._profiles[wallet] = profile
+        else:
+            # A trade may have touched the wallet before its history loaded;
+            # keep the earliest identity and the persisted creator counts.
+            self._profiles[wallet] = profile.model_copy(
+                update={
+                    "first_seen_at": min(current.first_seen_at, profile.first_seen_at),
+                    "initial_funder": profile.initial_funder or current.initial_funder,
+                    "funding_signature": (
+                        profile.funding_signature or current.funding_signature
+                    ),
+                }
+            )
+        active_at = max(at or profile.profile_updated_at, profile.profile_updated_at)
+        if profile.known_creator or profile.tokens_created_total:
+            self._creator_active_at[wallet] = max(
+                self._creator_active_at.get(wallet, active_at), active_at
+            )
+        else:
+            self._wallet_seen_at[wallet] = max(
+                self._wallet_seen_at.get(wallet, active_at), active_at
+            )
+
+    def memory_size(self) -> dict[str, int]:
+        return {
+            "profiles": len(self._profiles),
+            "baselines": len(self._baselines),
+            "outcomes": len(self._outcomes),
+            "relations": len(self._relations),
+            "mints": len(self._buyers),
+            "seen_events": len(self._seen_event_ids),
+        }
 
     def observe(
         self,
         event: EventEnvelope,
     ) -> tuple[list[WalletProfile], list[WalletRelation]]:
         if event.event_id in self._seen_event_ids:
+            self._seen_event_ids.move_to_end(event.event_id)
             return [], []
-        self._seen_event_ids.add(event.event_id)
+        self._seen_event_ids[event.event_id] = None
+        if len(self._seen_event_ids) > MAX_SEEN_EVENT_IDS:
+            self._seen_event_ids.popitem(last=False)
+        clock = event.observed_at
+        if (
+            self._last_sweep_at is None
+            or clock - self._last_sweep_at >= MEMORY_SWEEP_INTERVAL
+        ):
+            self.sweep(clock)
         payload = event.payload
         wallet = _text(payload.get("user") or payload.get("creator"))
         creator = _text(payload.get("creator"))
@@ -109,17 +202,22 @@ class WalletAnalyzer:
             )
             if profile != previous:
                 changed.append(profile)
+            if wallet not in self._creator_active_at:
+                self._wallet_seen_at[wallet] = clock
             if (
                 profile.initial_funder
                 and (previous is None or previous.initial_funder != profile.initial_funder)
             ):
                 relation_wallets.add(wallet)
         if event.event_type == ChainEventType.TOKEN_CREATED and event.mint and creator:
+            if event.mint not in self._outcomes:
+                self._outcomes_by_creator.setdefault(creator, []).append(event.mint)
             self._outcomes[event.mint] = TokenOutcome(
                 mint=event.mint,
                 creator=creator,
                 created_at=event.block_time,
             )
+            self._mark_creator_active(creator, clock)
             changed.append(
                 self._rebuild_developer_profile(creator, event.block_time)
             )
@@ -155,6 +253,7 @@ class WalletAnalyzer:
                 self._outcomes[event.mint or ""] = outcome.model_copy(
                     update=update
                 )
+                self._mark_creator_active(outcome.creator, clock)
                 changed.append(
                     self._rebuild_developer_profile(
                         outcome.creator,
@@ -172,6 +271,7 @@ class WalletAnalyzer:
                 or payload.get("token_amount")
             ) or Decimal("0")
             bundle = _text(payload.get("bundle_id"))
+            self._mint_seen_at[event.mint] = clock
             relation_state = self._observe_buyer(
                 event.mint,
                 event.block_time,
@@ -186,6 +286,7 @@ class WalletAnalyzer:
                 relation_wallets,
                 evidence_by_wallet=relation_state[0],
                 scope=relation_state[1],
+                at=clock,
             )
             if event.mint and relation_wallets and relation_state is not None
             else []
@@ -194,8 +295,85 @@ class WalletAnalyzer:
             list({item.wallet_address: item for item in changed}.values()),
             relations,
         )
+
+    def sweep(self, now: datetime) -> None:
+        """Release history that live decisions can no longer touch."""
+        self._last_sweep_at = now
+        creator_cutoff = now - CREATOR_MEMORY_RETENTION
+        for creator, active_at in list(self._creator_active_at.items()):
+            if not self._reloadable_history or active_at >= creator_cutoff:
+                continue
+            del self._creator_active_at[creator]
+            for mint in self._outcomes_by_creator.pop(creator, []):
+                self._outcomes.pop(mint, None)
+            self._profiles.pop(creator, None)
+            self._baselines.pop(creator, None)
+            self._history_checked.discard(creator)
+            self._wallet_seen_at.pop(creator, None)
+        wallet_cutoff = now - WALLET_MEMORY_RETENTION
+        for wallet, seen_at in list(self._wallet_seen_at.items()):
+            if seen_at >= wallet_cutoff:
+                continue
+            del self._wallet_seen_at[wallet]
+            if wallet in self._creator_active_at:
+                continue
+            self._profiles.pop(wallet, None)
+            self._baselines.pop(wallet, None)
+            self._history_checked.discard(wallet)
+        mint_cutoff = now - MINT_MEMORY_RETENTION
+        for mint, seen_at in list(self._mint_seen_at.items()):
+            if seen_at >= mint_cutoff:
+                continue
+            del self._mint_seen_at[mint]
+            self._forget_mint_buyers(mint)
+        relation_cutoff = now - RELATION_MEMORY_RETENTION
+        for key, seen_at in list(self._relation_seen_at.items()):
+            if seen_at >= relation_cutoff:
+                continue
+            self._drop_relation(key)
+
+    def _forget_mint_buyers(self, mint: str) -> None:
+        self._buyers.pop(mint, None)
+        self._buyer_first_order.pop(mint, None)
+        self._buyer_first_members.pop(mint, None)
+        self._buyer_top_volume.pop(mint, None)
+        self._buyer_evidence.pop(mint, None)
+        self._buyer_last_order_key.pop(mint, None)
+
+    def _mark_creator_active(self, creator: str, at: datetime) -> None:
+        current = self._creator_active_at.get(creator)
+        if current is None or at > current:
+            self._creator_active_at[creator] = at
+        self._wallet_seen_at.pop(creator, None)
+
+    def _store_relation(self, relation: WalletRelation, at: datetime) -> None:
+        key = (relation.wallet_a, relation.wallet_b)
+        self._relations[key] = relation
+        self._relation_seen_at[key] = at
+        self._relations_by_wallet.setdefault(relation.wallet_a, set()).add(key)
+        self._relations_by_wallet.setdefault(relation.wallet_b, set()).add(key)
+
+    def _drop_relation(self, key: tuple[str, str]) -> None:
+        self._relations.pop(key, None)
+        self._relation_seen_at.pop(key, None)
+        for wallet in key:
+            keys = self._relations_by_wallet.get(wallet)
+            if keys is None:
+                continue
+            keys.discard(key)
+            if not keys:
+                del self._relations_by_wallet[wallet]
+
+    def _relations_within(self, wallets: set[str]) -> list[WalletRelation]:
+        keys: set[tuple[str, str]] = set()
+        for wallet in wallets:
+            for key in self._relations_by_wallet.get(wallet, ()):
+                if key[0] in wallets and key[1] in wallets:
+                    keys.add(key)
+        return [self._relations[key] for key in sorted(keys)]
+
     def profile(self, wallet: str | None, *, at: datetime | None = None) -> WalletProfile | None:
-        if not wallet or wallet not in self._profiles:
+        if not wallet or (wallet not in self._profiles and wallet not in self._baselines):
             return None
         return self._rebuild_developer_profile(wallet, at or datetime.now(tz=timezone.utc))
 
@@ -214,10 +392,7 @@ class WalletAnalyzer:
         if not wallet:
             return set()
         wallets = set(scope) | {wallet}
-        relations = [
-            relation for relation in self._relations.values()
-            if relation.wallet_a in wallets and relation.wallet_b in wallets
-        ]
+        relations = self._relations_within(wallets)
         for cluster in build_clusters(wallets, relations):
             if wallet in cluster.wallets:
                 return set(cluster.wallets)
@@ -227,10 +402,7 @@ class WalletAnalyzer:
         self, scope: set[str], *, excluded: set[str] | None = None
     ) -> set[str]:
         excluded = excluded or set()
-        relations = [
-            relation for relation in self._relations.values()
-            if relation.wallet_a in scope and relation.wallet_b in scope
-        ]
+        relations = self._relations_within(set(scope))
         clusters = [
             set(cluster.wallets) - excluded for cluster in build_clusters(scope, relations)
         ]
@@ -290,14 +462,30 @@ class WalletAnalyzer:
         )
         baseline = self._baselines.get(wallet)
         outcomes = [
-            item for item in self._outcomes.values()
+            item
+            for item in (
+                self._outcomes[mint]
+                for mint in self._outcomes_by_creator.get(wallet, ())
+                if mint in self._outcomes
+            )
             if item.creator == wallet
             and item.created_at <= at
             and (baseline is None or item.created_at > baseline.profile_updated_at)
         ]
         base_total = baseline.tokens_created_total if baseline else 0
-        base_7d = baseline.tokens_created_7d if baseline else 0
-        base_30d = baseline.tokens_created_30d if baseline else 0
+        # A persisted baseline cannot age its rolling counts token by token;
+        # once the whole window has passed since it was written they are zero.
+        baseline_age = at - baseline.profile_updated_at if baseline else timedelta(0)
+        base_7d = (
+            baseline.tokens_created_7d
+            if baseline and baseline_age <= timedelta(days=7)
+            else 0
+        )
+        base_30d = (
+            baseline.tokens_created_30d
+            if baseline and baseline_age <= timedelta(days=30)
+            else 0
+        )
         base_pumpswap = baseline.tokens_reaching_pumpswap if baseline else 0
         base_success = baseline.tokens_reaching_2x_executable if baseline else 0
         base_rugs = baseline.tokens_with_liquidity_rug if baseline else 0
@@ -468,6 +656,7 @@ class WalletAnalyzer:
         *,
         evidence_by_wallet: dict[str, _BuyerEvidence],
         scope: set[str],
+        at: datetime,
     ) -> list[WalletRelation]:
         if not evidence_by_wallet:
             return []
@@ -512,8 +701,9 @@ class WalletAnalyzer:
                 if not relation.evidence:
                     continue
                 if self._relations.get(key) == relation:
+                    self._relation_seen_at[key] = at
                     continue
-                self._relations[key] = relation
+                self._store_relation(relation, at)
                 relations.append(relation)
         return relations
 def _median(values: list[Decimal]) -> Decimal:

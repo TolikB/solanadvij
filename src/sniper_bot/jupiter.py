@@ -16,6 +16,7 @@ import httpx
 from .errors import QuoteStaleError, QuoteUnavailableError, RateLimitExceededError
 from .models import QuoteResponse, RoundTripQuote
 from .quote_journal import QuoteJournal
+from .rate_limit import PriorityRateLimiter, QuotePriority
 
 
 def _journal_time(
@@ -31,6 +32,9 @@ def _journal_time(
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+MAX_QUOTE_CACHE_ENTRIES = 4096
 
 
 class JupiterQuoteProvider:
@@ -61,11 +65,10 @@ class JupiterQuoteProvider:
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._rate_window = 1.0 / max(1e-6, rate_limit_per_second)
+        self._limiter = PriorityRateLimiter(self._rate_window)
         self._cache_seconds = cache_seconds
         self._cache_floor_usd = cache_floor_usd
         self._quote_cache: dict[str, tuple[datetime, QuoteResponse]] = {}
-        self._last_call = datetime.min.replace(tzinfo=timezone.utc)
-        self._rate_lock = asyncio.Lock()
         self._replay_mode = replay_mode
         self._record_quotes = record_quotes
         self._quote_journal = QuoteJournal(quote_journal_path) if quote_journal_path else None
@@ -87,6 +90,7 @@ class JupiterQuoteProvider:
         slippage_bps: int = 120,
         cache: bool = False,
         cache_ttl_seconds: float | None = None,
+        priority: QuotePriority = QuotePriority.ENTRY,
     ) -> QuoteResponse:
         if token_in == token_out:
             raise QuoteUnavailableError("token_in and token_out must differ")
@@ -131,7 +135,9 @@ class JupiterQuoteProvider:
                 raise QuoteUnavailableError("replay data missing for quote request")
 
         requested_at = self._clock()
-        result, received_at, latency_ms = await self._request_with_retry("/order", payload)
+        result, received_at, latency_ms = await self._request_with_retry(
+            "/order", payload, priority=priority
+        )
         quote = self._build_quote(
             token_in=token_in,
             token_out=token_out,
@@ -257,22 +263,38 @@ class JupiterQuoteProvider:
             raise QuoteStaleError("quote is stale")
         return quote
 
-    async def get_buy_quote(self, quote_token: str, token: str, usdc_amount: Decimal) -> QuoteResponse:
+    async def get_buy_quote(
+        self,
+        quote_token: str,
+        token: str,
+        usdc_amount: Decimal,
+        *,
+        priority: QuotePriority = QuotePriority.ENTRY,
+    ) -> QuoteResponse:
         return await self.get_quote(
             token_in=quote_token,
             token_out=token,
             amount_usd=usdc_amount,
             cache=False,
             force_no_taker=True,
+            priority=priority,
         )
 
-    async def get_sell_quote(self, token: str, quote_token: str, token_amount: Decimal) -> QuoteResponse:
+    async def get_sell_quote(
+        self,
+        token: str,
+        quote_token: str,
+        token_amount: Decimal,
+        *,
+        priority: QuotePriority = QuotePriority.EXIT,
+    ) -> QuoteResponse:
         return await self.get_quote(
             token_in=token,
             token_out=quote_token,
             amount_usd=token_amount,
             cache=False,
             force_no_taker=True,
+            priority=priority,
         )
 
     async def get_sell_quote_mark_to_market(
@@ -289,6 +311,7 @@ class JupiterQuoteProvider:
             cache=True,
             force_no_taker=True,
             cache_ttl_seconds=2.0,
+            priority=QuotePriority.EXIT,
         )
 
     async def get_round_trip_quote(
@@ -297,9 +320,14 @@ class JupiterQuoteProvider:
         quote_token: str,
         token: str,
         usdc_amount: Decimal,
+        priority: QuotePriority = QuotePriority.SECURITY,
     ) -> RoundTripQuote:
-        buy = await self.get_buy_quote(quote_token, token, usdc_amount)
-        sell = await self.get_sell_quote(token, quote_token, buy.out_amount)
+        buy = await self.get_buy_quote(
+            quote_token, token, usdc_amount, priority=priority
+        )
+        sell = await self.get_sell_quote(
+            token, quote_token, buy.out_amount, priority=priority
+        )
         starting = buy.in_amount_usd if buy.in_amount_usd and buy.in_amount_usd > 0 else usdc_amount
         ending = sell.out_amount_usd if sell.out_amount_usd and sell.out_amount_usd > 0 else sell.out_amount
         loss = max(Decimal("0"), Decimal("1") - ending / starting) if starting > 0 else Decimal("1")
@@ -318,6 +346,7 @@ class JupiterQuoteProvider:
             amount_usd=Decimal("1000000000"),
             cache=True,
             cache_ttl_seconds=5.0,
+            priority=QuotePriority.REFERENCE,
         )
         if quote.out_amount_usd and quote.out_amount_usd > 0:
             price = quote.out_amount_usd
@@ -377,10 +406,16 @@ class JupiterQuoteProvider:
         return quote
 
     def _set_cached_quote(self, payload: dict[str, Any], cache_ttl_seconds: float | None, quote: QuoteResponse) -> None:
-        self._quote_cache[self._cache_key(payload)] = (
+        key = self._cache_key(payload)
+        # Re-insert so the dict stays ordered oldest first, then bound it:
+        # every candidate and position size adds keys for the whole run.
+        self._quote_cache.pop(key, None)
+        self._quote_cache[key] = (
             self._clock(),
             quote,
         )
+        while len(self._quote_cache) > MAX_QUOTE_CACHE_ENTRIES:
+            self._quote_cache.pop(next(iter(self._quote_cache)))
         # Respect TTL policy by pruning at write-time only; stale reads are filtered lazily.
         if cache_ttl_seconds and cache_ttl_seconds <= 0:
             self._quote_cache.pop(self._cache_key(payload), None)
@@ -396,11 +431,15 @@ class JupiterQuoteProvider:
         return str(int(amount * multiplier))
 
     async def _request_with_retry(
-        self, path: str, payload: dict[str, Any]
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        priority: QuotePriority = QuotePriority.ENTRY,
     ) -> tuple[dict[str, Any], datetime, int]:
         last_error: Exception | None = None
         for attempt in range(self._max_retries + 1):
-            await self._enforce_rate()
+            await self._enforce_rate(priority)
             requested_at = self._clock()
             started = time.perf_counter()
             try:
@@ -523,13 +562,12 @@ class JupiterQuoteProvider:
             error_code=error_code,
         )
 
-    async def _enforce_rate(self) -> None:
-        async with self._rate_lock:
-            now = datetime.now(tz=timezone.utc)
-            delay = self._rate_window - (now - self._last_call).total_seconds()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._last_call = datetime.now(tz=timezone.utc)
+    async def _enforce_rate(
+        self, priority: QuotePriority = QuotePriority.ENTRY
+    ) -> None:
+        await self._limiter.acquire(priority)
+        if self._metrics is not None:
+            self._metrics.jupiter_queue_depth.set(self._limiter.queued)
 
     async def _sleep_with_backoff(self, attempt: int) -> None:
         await asyncio.sleep((2**attempt) * 0.25)

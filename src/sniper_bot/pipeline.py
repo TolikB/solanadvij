@@ -79,10 +79,34 @@ INGEST_TRACKING_MARGIN = timedelta(seconds=60)
 # Terminal candidates stay in memory for API listing and restart rehydration,
 # then leave the per-second evaluation set for good.
 TERMINAL_CANDIDATE_RETENTION = timedelta(hours=1)
+# Tokens and pools no candidate needs any more leave memory on these horizons;
+# the database keeps them and a later event reloads a token on demand.
+TOKEN_MEMORY_RETENTION = timedelta(hours=24)
+POOL_MEMORY_RETENTION = timedelta(hours=2)
+MEMORY_SWEEP_INTERVAL = timedelta(seconds=60)
+# A candidate row is rewritten when its lifecycle changes; the per-second price
+# memory only needs to reach the database often enough for a restart.
+CANDIDATE_PERSIST_INTERVAL = timedelta(seconds=15)
+VOLATILE_CANDIDATE_FIELDS = frozenset({"updated_at", "previous_price", "previous_vwap"})
 UNKNOWN_LAYOUT_ARCHIVE_INTERVAL_SECONDS = 60.0
 # New event types appear with routine program upgrades; remember a bounded
 # number of them so each is logged and archived once.
 MAX_REMEMBERED_UNKNOWN_EVENT_TYPES = 256
+# A monitoring quote is re-used for scoring until the next refresh; allow for
+# one slow evaluation pass on top of the refresh cadence.
+MONITORING_QUOTE_AGE_SLACK_SECONDS = Decimal("3")
+SECURITY_CANDIDATE_STATES = frozenset(
+    {
+        CandidateState.SECURITY_CHECK,
+        CandidateState.ELIGIBLE,
+        CandidateState.WAITING_PULLBACK,
+        CandidateState.ARMED,
+        CandidateState.ENTRY_PENDING,
+    }
+)
+# Security inputs of different candidates are fetched concurrently so one slow
+# holder index or quote no longer delays every other candidate's evaluation.
+SECURITY_PREFETCH_CONCURRENCY = 4
 MARKET_PRICE_FLAGS = frozenset(
     {
         "QUOTE_PRICE_UNAVAILABLE",
@@ -193,6 +217,13 @@ class ConfirmationPipeline:
                 if config
                 else Decimal("1.5")
             ),
+            maximum_monitoring_quote_age_seconds=(
+                Decimal(config.execution.quote_refresh_seconds)
+                + Decimal(config.execution.max_quote_age_ms) / Decimal("1000")
+                + MONITORING_QUOTE_AGE_SLACK_SECONDS
+                if config
+                else None
+            ),
         )
         self.scoring = ScoringEngine()
         self.state_machine = CandidateStateMachine(
@@ -203,6 +234,9 @@ class ConfirmationPipeline:
                 config.candidate.score_confirmation_windows if config else 2
             ),
             score_window_seconds=(config.candidate.score_window_seconds if config else 5),
+            score_confirmation_max_gap_seconds=(
+                config.candidate.score_confirmation_max_gap_seconds if config else None
+            ),
             minimum_pullback=(config.candidate.min_pullback_pct if config else Decimal("0.10")),
             maximum_pullback=(config.candidate.max_pullback_pct if config else Decimal("0.25")),
             maximum_liquidity_drop=(
@@ -235,6 +269,8 @@ class ConfirmationPipeline:
         self._security_results: dict[str, tuple[SecurityContext, SecurityResult]] = {}
         self._scores: dict[str, ScoreBreakdown] = {}
         self._persisted_score_totals: dict[str, Decimal] = {}
+        self._last_memory_sweep_at: datetime | None = None
+        self._candidate_persisted_at: dict[str, datetime] = {}
         self._state_poisoned = False
         self._durable_queue: asyncio.Queue[_StageBatch | None] = (
             asyncio.Queue(maxsize=128)
@@ -1148,10 +1184,26 @@ class ConfirmationPipeline:
         )
         if observe and self.event_observer is not None:
             await self.event_observer(effective_event)
-        token = self.tokens.apply(effective_event)
-        if persist and token is not None and self.database is not None:
+        if (
+            self.database is not None
+            and effective_event.mint
+            and effective_event.event_type != ChainEventType.TOKEN_CREATED
+            and self.tokens.get(effective_event.mint) is None
+        ):
+            # A token that left memory (or predates this process) keeps its
+            # creator and metadata: reload it before the event touches it.
+            persisted_token = await self.database.load_token(effective_event.mint)
+            if persisted_token is not None:
+                self.tokens.restore(persisted_token)
+        token, token_changed = self.tokens.apply_tracked(effective_event)
+        if persist and token is not None and token_changed and self.database is not None:
             await self.database.upsert_token(token)
-        if persist and pool_record is not None and self.database is not None:
+        if (
+            persist
+            and pool_record is not None
+            and effective_event.event_type == ChainEventType.POOL_CREATED
+            and self.database is not None
+        ):
             await self.database.upsert_pool(pool_record)
         if (
             effective_event.event_type == ChainEventType.POOL_CREATED
@@ -1222,17 +1274,74 @@ class ConfirmationPipeline:
     async def evaluate_candidates(self, at: datetime | None = None) -> list[Candidate]:
         at = at or datetime.now(tz=timezone.utc)
         self._forget_settled_candidates(at)
+        prefetched = await self._prefetch_security(at)
         changed: list[Candidate] = []
         for candidate_id, candidate in list(self.candidates.items()):
             if candidate.state in TERMINAL_CANDIDATE_STATES:
                 continue
-            updated = await self._evaluate_candidate(candidate_id, candidate, at)
+            updated = await self._evaluate_candidate(
+                candidate_id,
+                candidate,
+                at,
+                prefetched=prefetched.get(candidate_id),
+            )
             if updated.state != candidate.state:
                 changed.append(updated)
         return changed
 
+    async def _prefetch_security(
+        self, at: datetime
+    ) -> dict[str, SecurityContext | Exception]:
+        """Fetch security inputs of every candidate that needs them at once.
+
+        Decisions stay sequential (entries share one account); only the slow
+        provider reads overlap, so a pass takes as long as its slowest
+        candidate instead of the sum of all of them.
+        """
+        provider = self.security_provider
+        if provider is None or self._collection_closed(at):
+            return {}
+        targets: list[tuple[str, Candidate, FeatureSnapshot]] = []
+        for candidate_id, candidate in self.candidates.items():
+            if (
+                candidate.state not in SECURITY_CANDIDATE_STATES
+                or self.state_machine.is_expired(candidate, at)
+            ):
+                continue
+            snapshot = self.features.snapshot(candidate.pool_address, at)
+            market_usable, market_reject = self._market_reject_reason(candidate, snapshot)
+            if not market_usable or (
+                market_reject is not None
+                and candidate.state == CandidateState.SECURITY_CHECK
+            ):
+                continue
+            targets.append((candidate_id, candidate, snapshot))
+        if len(targets) < 2:
+            return {}
+        semaphore = asyncio.Semaphore(SECURITY_PREFETCH_CONCURRENCY)
+
+        async def fetch(
+            candidate: Candidate, snapshot: FeatureSnapshot
+        ) -> SecurityContext | Exception:
+            async with semaphore:
+                try:
+                    return await provider(candidate, snapshot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    return error
+
+        results = await asyncio.gather(
+            *(fetch(candidate, snapshot) for _, candidate, snapshot in targets)
+        )
+        return {
+            candidate_id: result
+            for (candidate_id, _, _), result in zip(targets, results, strict=True)
+        }
+
     def _forget_settled_candidates(self, at: datetime) -> None:
         cutoff = at - TERMINAL_CANDIDATE_RETENTION
+        forgotten: list[Candidate] = []
         for candidate_id, candidate in list(self.candidates.items()):
             if (
                 candidate.state in TERMINAL_CANDIDATE_STATES
@@ -1242,7 +1351,50 @@ class ConfirmationPipeline:
                 self._security_results.pop(candidate_id, None)
                 self._scores.pop(candidate_id, None)
                 self._persisted_score_totals.pop(candidate_id, None)
+                self._candidate_persisted_at.pop(candidate_id, None)
+                forgotten.append(candidate)
+        if forgotten:
+            live_pools = {candidate.pool_address for candidate in self.candidates.values()}
+            live_mints = {candidate.mint for candidate in self.candidates.values()}
+            for candidate in forgotten:
+                if candidate.pool_address not in live_pools:
+                    self.pools.forget(candidate.pool_address)
+                    self.features.forget_pool(candidate.pool_address)
+                if candidate.mint not in live_mints:
+                    self.tokens.forget(candidate.mint)
         self.metrics.candidate_count.set(len(self.candidates))
+        if (
+            self._last_memory_sweep_at is None
+            or at - self._last_memory_sweep_at >= MEMORY_SWEEP_INTERVAL
+        ):
+            self.sweep_memory(at)
+
+    def sweep_memory(self, at: datetime) -> None:
+        """Release tokens and pools that no candidate can still need."""
+        self._last_memory_sweep_at = at
+        live_pools = {candidate.pool_address for candidate in self.candidates.values()}
+        live_mints = {candidate.mint for candidate in self.candidates.values()}
+        for pool_address in self.pools.sweep(at - POOL_MEMORY_RETENTION, keep=live_pools):
+            self.features.forget_pool(pool_address)
+        self.tokens.sweep(at - TOKEN_MEMORY_RETENTION, keep=live_mints)
+        self.metrics.memory_entries.labels(kind="tokens").set(len(self.tokens))
+        self.metrics.memory_entries.labels(kind="pools").set(len(self.pools))
+        self.metrics.memory_entries.labels(kind="feature_pools").set(
+            self.features.pool_count()
+        )
+        self.metrics.memory_entries.labels(kind="candidates").set(len(self.candidates))
+
+    def _candidate_needs_persisting(
+        self, previous: Candidate | None, candidate: Candidate
+    ) -> bool:
+        if previous is None or previous.state != candidate.state:
+            return True
+        persisted_at = self._candidate_persisted_at.get(candidate.candidate_id)
+        if persisted_at is None or candidate.updated_at - persisted_at >= CANDIDATE_PERSIST_INTERVAL:
+            return True
+        return previous.model_dump(exclude=set(VOLATILE_CANDIDATE_FIELDS)) != candidate.model_dump(
+            exclude=set(VOLATILE_CANDIDATE_FIELDS)
+        )
 
     async def _store_candidate(
         self,
@@ -1250,9 +1402,13 @@ class ConfirmationPipeline:
         before: CandidateState,
         candidate: Candidate,
     ) -> Candidate:
+        previous = self.candidates.get(candidate_id)
         self.candidates[candidate_id] = candidate
-        if self.database is not None:
+        if self.database is not None and self._candidate_needs_persisting(
+            previous, candidate
+        ):
             await self.database.upsert_candidate(candidate, self.strategy_version)
+            self._candidate_persisted_at[candidate_id] = candidate.updated_at
         if candidate.state != before:
             if candidate.state == CandidateState.REJECTED:
                 reason = candidate.reject_reason or RejectReason.API_UNAVAILABLE
@@ -1292,6 +1448,8 @@ class ConfirmationPipeline:
         candidate_id: str,
         candidate: Candidate,
         at: datetime,
+        *,
+        prefetched: SecurityContext | Exception | None = None,
     ) -> Candidate:
         before = candidate.state
         snapshot = self.features.snapshot(candidate.pool_address, at)
@@ -1325,13 +1483,10 @@ class ConfirmationPipeline:
         security_context: SecurityContext | None = None
         security_result: SecurityResult | None = None
         score: ScoreBreakdown | None = None
-        if self.security_provider is not None and candidate.state in {
-            CandidateState.SECURITY_CHECK,
-            CandidateState.ELIGIBLE,
-            CandidateState.WAITING_PULLBACK,
-            CandidateState.ARMED,
-            CandidateState.ENTRY_PENDING,
-        }:
+        if (
+            self.security_provider is not None
+            and candidate.state in SECURITY_CANDIDATE_STATES
+        ):
             market_usable, market_reject = self._market_reject_reason(
                 candidate, snapshot
             )
@@ -1352,7 +1507,13 @@ class ConfirmationPipeline:
                     ),
                 )
             try:
-                security_context = await self.security_provider(candidate, snapshot)
+                if isinstance(prefetched, Exception):
+                    raise prefetched
+                security_context = (
+                    prefetched
+                    if prefetched is not None
+                    else await self.security_provider(candidate, snapshot)
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1368,7 +1529,11 @@ class ConfirmationPipeline:
                 )
                 return candidate
             snapshot = self.features.snapshot(candidate.pool_address, at)
-            security_result = self.security.evaluate(security_context, now=at)
+            security_result = self.security.evaluate(
+                security_context,
+                now=at,
+                entry_decision=candidate.state == CandidateState.ENTRY_PENDING,
+            )
             self._security_results[candidate_id] = (security_context, security_result)
             if self.database is not None:
                 await self.database.record_security(security_context, security_result)

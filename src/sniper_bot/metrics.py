@@ -44,6 +44,17 @@ class BotMetrics:
             ["protocol", "event"],
             registry=self.registry,
         )
+        self.jupiter_queue_depth = Gauge(
+            "jupiter_rate_limit_queue_depth",
+            "Jupiter requests waiting for a rate-limit slot",
+            registry=self.registry,
+        )
+        self.memory_entries = Gauge(
+            "sniper_memory_entries",
+            "Entries resident in bounded in-memory state",
+            ["kind"],
+            registry=self.registry,
+        )
         self.candidate_evaluation_failures = Counter(
             "candidate_evaluation_failures_total",
             "Candidate evaluations skipped because security or market data was unavailable",

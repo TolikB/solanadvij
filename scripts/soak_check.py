@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 import time
 import urllib.error
@@ -39,6 +41,9 @@ DEFAULT_MAX_RECONNECTS_PER_HOUR = 1.0
 DEFAULT_MAX_JUPITER_ERROR_RATIO = 0.2
 DEFAULT_MIN_READY_RATIO = 0.9
 DEFAULT_MAX_PROCESSING_LAG_SECONDS = 3.0
+# PostgreSQL stops accepting writes on a full disk; alert well before that.
+DEFAULT_MIN_FREE_DISK_GB = 5.0
+DEFAULT_MIN_FREE_DISK_RATIO = 0.10
 
 
 def parse_prometheus(text: str) -> MetricSample:
@@ -168,13 +173,78 @@ class Thresholds:
     min_ready_ratio: float = DEFAULT_MIN_READY_RATIO
     max_processing_lag_seconds: float = DEFAULT_MAX_PROCESSING_LAG_SECONDS
     require_candidates: bool = True
+    min_free_disk_gb: float = DEFAULT_MIN_FREE_DISK_GB
+    min_free_disk_ratio: float = DEFAULT_MIN_FREE_DISK_RATIO
 
 
 def _criterion(name: str, passed: bool, actual: Any, expected: str) -> dict[str, Any]:
     return {"name": name, "passed": bool(passed), "actual": actual, "expected": expected}
 
 
-def evaluate(window: Window, thresholds: Thresholds) -> dict[str, Any]:
+def disk_criterion(
+    usage: dict[str, tuple[int, int]], thresholds: Thresholds
+) -> dict[str, Any]:
+    """Free space on every watched volume, as (free bytes, total bytes)."""
+    actual = {
+        path: {
+            "free_gb": round(free / 1e9, 2),
+            "free_ratio": round(free / total, 4) if total else 0.0,
+        }
+        for path, (free, total) in sorted(usage.items())
+    }
+    passed = all(
+        free / 1e9 >= thresholds.min_free_disk_gb
+        and (free / total if total else 0.0) >= thresholds.min_free_disk_ratio
+        for free, total in usage.values()
+    )
+    return _criterion(
+        "disk_free",
+        passed,
+        actual,
+        f">= {thresholds.min_free_disk_gb:g} GB and "
+        f">= {thresholds.min_free_disk_ratio:.0%} free on every volume",
+    )
+
+
+def measure_disks(paths: Iterable[str]) -> dict[str, tuple[int, int]]:
+    usage: dict[str, tuple[int, int]] = {}
+    for path in paths:
+        stats = shutil.disk_usage(path)
+        usage[path] = (int(stats.free), int(stats.total))
+    return usage
+
+
+def ping_heartbeat(url: str, result: dict[str, Any], timeout: float = 10.0) -> str | None:
+    """Tell an external dead-man's switch how this window went.
+
+    A passing window pings ``url``; a failing one pings ``url/fail`` with the
+    failed criteria. When the bot, the monitor or the host is down nothing
+    pings at all, which is what the external service alerts on. Telegram stays
+    limited to start, stop and the daily report.
+    """
+    failed = [item["name"] for item in result.get("criteria", []) if not item["passed"]]
+    target = url.rstrip("/") + ("" if result.get("passed") else "/fail")
+    body = json.dumps(
+        {"label": result.get("label"), "passed": result.get("passed"), "failed": failed},
+        sort_keys=True,
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        target, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            response.read()
+    except (OSError, ValueError) as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+def evaluate(
+    window: Window,
+    thresholds: Thresholds,
+    *,
+    disk_usage: dict[str, tuple[int, int]] | None = None,
+) -> dict[str, Any]:
     if window.samples < 2:
         raise ValueError("at least two observations are required")
     first, last = window.first.metrics, window.last.metrics
@@ -278,6 +348,8 @@ def evaluate(window: Window, thresholds: Thresholds) -> dict[str, Any]:
             f">= {thresholds.min_ready_ratio:g} of samples and ready at the end",
         ),
     ]
+    if disk_usage:
+        criteria.append(disk_criterion(disk_usage, thresholds))
     if thresholds.require_candidates:
         criteria.append(
             _criterion(
@@ -348,11 +420,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="do not require candidate outcomes (short monitoring windows)",
     )
+    parser.add_argument(
+        "--disk-path",
+        action="append",
+        default=[],
+        help="volume path whose free space must stay above the limits (repeatable)",
+    )
+    parser.add_argument("--min-free-disk-gb", type=float, default=DEFAULT_MIN_FREE_DISK_GB)
+    parser.add_argument(
+        "--min-free-disk-ratio", type=float, default=DEFAULT_MIN_FREE_DISK_RATIO
+    )
+    parser.add_argument(
+        "--heartbeat-url",
+        default=os.environ.get("MONITOR_HEARTBEAT_URL", ""),
+        help="dead-man's-switch URL pinged after every window (e.g. healthchecks.io)",
+    )
     args = parser.parse_args(argv)
     if args.duration <= 0 or args.interval <= 0:
         parser.error("--duration and --interval must be positive")
 
-    thresholds = Thresholds(require_candidates=not args.no_candidates)
+    thresholds = Thresholds(
+        require_candidates=not args.no_candidates,
+        min_free_disk_gb=args.min_free_disk_gb,
+        min_free_disk_ratio=args.min_free_disk_ratio,
+    )
     started = datetime.now(tz=timezone.utc)
     window: Window | None = None
     deadline = time.monotonic() + args.duration
@@ -372,10 +463,17 @@ def main(argv: list[str] | None = None) -> int:
             break
         time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
 
+    disk_usage: dict[str, tuple[int, int]] = {}
+    try:
+        disk_usage = measure_disks(args.disk_path)
+    except OSError as error:
+        errors.append(f"disk: {type(error).__name__}: {error}")
     if window is None or window.samples < 2:
         result: dict[str, Any] = {"passed": False, "criteria": [], "errors": errors}
+        if disk_usage:
+            result["criteria"].append(disk_criterion(disk_usage, thresholds))
     else:
-        result = evaluate(window, thresholds)
+        result = evaluate(window, thresholds, disk_usage=disk_usage)
         if errors:
             result["errors"] = errors
             result["passed"] = False
@@ -385,6 +483,10 @@ def main(argv: list[str] | None = None) -> int:
         "finished_at": datetime.now(tz=timezone.utc).isoformat(),
         **result,
     }
+    if args.heartbeat_url:
+        heartbeat_error = ping_heartbeat(args.heartbeat_url, result)
+        if heartbeat_error:
+            result["heartbeat_error"] = heartbeat_error
     rendered = json.dumps(result, sort_keys=True)
     print(rendered)
     if args.output:

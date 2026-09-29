@@ -264,6 +264,7 @@ class SecurityEngine:
         maximum_return_since_creation: Decimal = Decimal("2.50"),
         maximum_stream_age_seconds: Decimal = Decimal("3"),
         maximum_quote_age_seconds: Decimal = Decimal("1.5"),
+        maximum_monitoring_quote_age_seconds: Decimal | None = None,
     ) -> None:
         self.minimum_quote_liquidity_usd = minimum_quote_liquidity_usd
         self.minimum_pool_age_seconds = minimum_pool_age_seconds
@@ -283,6 +284,9 @@ class SecurityEngine:
         self.maximum_return_since_creation = maximum_return_since_creation
         self.maximum_stream_age_seconds = maximum_stream_age_seconds
         self.maximum_quote_age_seconds = maximum_quote_age_seconds
+        self.maximum_monitoring_quote_age_seconds = (
+            maximum_monitoring_quote_age_seconds or maximum_quote_age_seconds
+        )
 
     def market_reject_reasons(
         self,
@@ -317,8 +321,25 @@ class SecurityEngine:
             reasons.append(RejectReason.OVEREXTENDED_PRICE)
         return reasons
 
-    def evaluate(self, context: SecurityContext, *, now: datetime | None = None) -> SecurityResult:
+    def evaluate(
+        self,
+        context: SecurityContext,
+        *,
+        now: datetime | None = None,
+        entry_decision: bool = True,
+    ) -> SecurityResult:
+        """Judge a candidate; ``entry_decision`` demands an entry-fresh quote.
+
+        While a candidate is only being watched its score may use the last
+        periodic round trip; the entry itself always re-quotes and must pass
+        the strict ``maximum_quote_age_seconds``.
+        """
         now = now or datetime.now(tz=timezone.utc)
+        maximum_quote_age = (
+            self.maximum_quote_age_seconds
+            if entry_decision
+            else self.maximum_monitoring_quote_age_seconds
+        )
         reasons: list[RejectReason] = []
         mint = context.mint
         holders = context.holders
@@ -383,7 +404,7 @@ class SecurityEngine:
             reasons.append(RejectReason.LIQUIDITY_DECLINING)
         if _age(now, context.stream_observed_at) > self.maximum_stream_age_seconds:
             reasons.append(RejectReason.STALE_DATA)
-        if _age(now, execution.quote_observed_at) > self.maximum_quote_age_seconds:
+        if _age(now, execution.quote_observed_at) > maximum_quote_age:
             reasons.append(RejectReason.STALE_QUOTE)
         if not context.protocol_layout_known:
             reasons.append(RejectReason.UNKNOWN_PROTOCOL_LAYOUT)

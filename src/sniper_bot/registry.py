@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -102,11 +103,36 @@ class TokenRegistry:
     def __init__(self) -> None:
         self._tokens: dict[str, TokenRecord] = {}
 
+    def __len__(self) -> int:
+        return len(self._tokens)
+
     def get(self, mint: str) -> TokenRecord | None:
         return self._tokens.get(mint)
 
     def all(self) -> list[TokenRecord]:
         return list(self._tokens.values())
+
+    def restore(self, record: TokenRecord) -> None:
+        """Bring back a persisted token the registry no longer holds in memory."""
+        self._tokens.setdefault(record.mint, record)
+
+    def forget(self, mint: str) -> None:
+        self._tokens.pop(mint, None)
+
+    def sweep(self, cutoff: datetime, *, keep: Collection[str] = ()) -> int:
+        """Drop tokens untouched since ``cutoff``; the database keeps them.
+
+        Nearly every Pump token is created, never migrates and is never seen
+        again, so a month of them must not stay resident.
+        """
+        stale = [
+            mint
+            for mint, record in self._tokens.items()
+            if record.updated_at < cutoff and mint not in keep
+        ]
+        for mint in stale:
+            del self._tokens[mint]
+        return len(stale)
 
     def apply_enrichment(
         self, mint: str, payload: dict[str, Any], observed_at: datetime
@@ -150,6 +176,10 @@ class TokenRegistry:
         return token
 
     def apply(self, event: EventEnvelope) -> TokenRecord | None:
+        return self.apply_tracked(event)[0]
+
+    def apply_tracked(self, event: EventEnvelope) -> tuple[TokenRecord | None, bool]:
+        """Apply one event; the flag says whether a persisted field changed."""
         payload = event.payload
         if event.event_type == ChainEventType.TOKEN_CREATED and event.mint:
             record = TokenRecord(
@@ -167,10 +197,11 @@ class TokenRegistry:
                 updated_at=event.observed_at,
             )
             self._tokens[event.mint] = record
-            return record
+            return record, True
         if event.mint is None:
-            return None
+            return None, False
         token_record = self._tokens.get(event.mint)
+        created = token_record is None
         if token_record is None:
             token_record = TokenRecord(mint=event.mint, updated_at=event.observed_at)
         update: dict[str, Any] = {"updated_at": event.observed_at}
@@ -183,9 +214,14 @@ class TokenRegistry:
         elif event.event_type == ChainEventType.POOL_CREATED and not token_record.first_pool_address:
             update["first_pool_address"] = event.pool_address
             update["first_pool_time"] = event.block_time
+        changed = created or any(
+            getattr(token_record, key) != value
+            for key, value in update.items()
+            if key != "updated_at"
+        )
         token_record = token_record.model_copy(update=update)
         self._tokens[event.mint] = token_record
-        return token_record
+        return token_record, changed
 
 
 class PoolStateTracker:
@@ -208,6 +244,24 @@ class PoolStateTracker:
 
     def pools(self) -> list[PoolRecord]:
         return list(self._pools.values())
+
+    def __len__(self) -> int:
+        return len(self._pools)
+
+    def forget(self, pool_address: str) -> None:
+        self._pools.pop(pool_address, None)
+        self._states.pop(pool_address, None)
+
+    def sweep(self, cutoff: datetime, *, keep: Collection[str] = ()) -> list[str]:
+        """Drop pools untouched since ``cutoff`` and return their addresses."""
+        stale = [
+            address
+            for address, record in self._pools.items()
+            if record.updated_at < cutoff and address not in keep
+        ]
+        for address in stale:
+            self.forget(address)
+        return stale
 
     def apply_base_supply(
         self,

@@ -29,6 +29,9 @@ class TokenEnrichment(BaseModel):
     observed_at: datetime
 
 
+MAX_ENRICHMENT_CACHE_ENTRIES = 10_000
+
+
 class DexscreenerClient:
     def __init__(
         self,
@@ -144,7 +147,10 @@ class DexscreenerClient:
             boosts_active=_non_negative_int(boosts.get("active")),
             observed_at=observed_at,
         )
+        self._cache.pop(mint, None)
         self._cache[mint] = enrichment
+        while len(self._cache) > MAX_ENRICHMENT_CACHE_ENTRIES:
+            self._cache.pop(next(iter(self._cache)))
         return enrichment
 
 

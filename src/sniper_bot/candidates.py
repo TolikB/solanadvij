@@ -80,6 +80,7 @@ class CandidateStateMachine:
         minimum_score: Decimal = Decimal("80"),
         required_confirmations: int = 2,
         score_window_seconds: int = 5,
+        score_confirmation_max_gap_seconds: int | None = None,
         minimum_pullback: Decimal = Decimal("0.10"),
         maximum_pullback: Decimal = Decimal("0.25"),
         maximum_liquidity_drop: Decimal = Decimal("0.03"),
@@ -90,6 +91,10 @@ class CandidateStateMachine:
         self.minimum_score = minimum_score
         self.required_confirmations = required_confirmations
         self.score_window_seconds = score_window_seconds
+        self.score_confirmation_max_gap_seconds = max(
+            score_window_seconds + 1,
+            score_confirmation_max_gap_seconds or score_window_seconds + 1,
+        )
         self.minimum_pullback = minimum_pullback
         self.maximum_pullback = maximum_pullback
         self.maximum_liquidity_drop = maximum_liquidity_drop
@@ -240,9 +245,13 @@ class CandidateStateMachine:
         elif not confirmations:
             confirmations = [at]
         else:
+            # A confirmation needs the score to hold for about one window.
+            # Evaluations arrive every second when the loop keeps up; under
+            # provider load they arrive later, which must not wipe a signal
+            # that never dropped below the bar in between.
             delta = (at - confirmations[-1]).total_seconds()
             minimum_delta = max(0, self.score_window_seconds - 1)
-            maximum_delta = self.score_window_seconds + 1
+            maximum_delta = self.score_confirmation_max_gap_seconds
             if minimum_delta <= delta <= maximum_delta:
                 confirmations = (confirmations + [at])[-self.required_confirmations :]
             elif delta > maximum_delta:

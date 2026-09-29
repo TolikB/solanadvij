@@ -82,3 +82,23 @@ def test_compose_exposes_the_chain_override_without_a_rebuild() -> None:
     services = _compose_services()
 
     assert services["sniper-bot"]["environment"]["CHAIN"] == "${CHAIN:-}"
+
+
+def test_monitor_watches_disks_and_offsite_copies_are_opt_in() -> None:
+    services = _compose_services()
+
+    monitor = services["monitor"]
+    assert "--disk-path /monitor/volumes/bot-data" in monitor["command"][-1]
+    assert all(volume.endswith(":ro") for volume in monitor["volumes"])
+    assert monitor["environment"]["MONITOR_HEARTBEAT_URL"] == "${MONITOR_HEARTBEAT_URL:-}"
+
+    offsite = services["offsite"]
+    assert offsite["profiles"] == ["offsite"]
+    assert all(volume.endswith(":ro") for volume in offsite["volumes"])
+    assert offsite["environment"]["RCLONE_CONFIG_SECURE_TYPE"] == "crypt"
+    assert {
+        "POSTGRES_DSN",
+        "HELIUS_API_KEY",
+        "JUPITER_API_KEY",
+        "TELEGRAM_BOT_TOKEN",
+    }.isdisjoint(offsite["environment"])

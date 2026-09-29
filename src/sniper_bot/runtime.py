@@ -9,7 +9,9 @@ import logging
 import os
 import signal
 import socket
+from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -29,19 +31,36 @@ from .jupiter import JupiterQuoteProvider
 from .ledger import PaperLedger
 from .maintenance import RawRetentionManager
 from .metrics import BotMetrics
-from .models import QuoteResponse
+from .models import QuoteResponse, RoundTripQuote
 from .outbox import TelegramOutboxWorker
-from .pipeline import TERMINAL_CANDIDATE_RETENTION, ConfirmationPipeline
+from .pipeline import (
+    SECURITY_CANDIDATE_STATES,
+    TERMINAL_CANDIDATE_RETENTION,
+    ConfirmationPipeline,
+)
+from .rate_limit import QuotePriority
 from .registry import USDC_MINT, WSOL_MINT, QuoteAssetPrice
 from .reports import ReportBuilder
 from .risk import RiskManager
 from .scoring import ScoreBreakdown
-from .security import ExecutionChecks, RejectReason, SecurityContext, aggregate_holders
+from .security import (
+    ExecutionChecks,
+    HolderBalance,
+    HolderMetrics,
+    MintInfo,
+    RejectReason,
+    SecurityContext,
+    aggregate_holders,
+)
 from .sizing import PositionSizingInput, SizingRejectReason, calculate_position_size
 from .solana_rpc import SolanaRpcClient
 from .stream import EntryGate, HeliusStreamGateway
 from .telegram import NoopTelegramNotifier, TelegramNotifier
-from .wallet_analysis import WalletAnalyzer
+from .wallet_analysis import (
+    CREATOR_MEMORY_RETENTION,
+    RELATION_MEMORY_RETENTION,
+    WalletAnalyzer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +69,26 @@ logger = logging.getLogger(__name__)
 # gaps even while no position is open; marks otherwise only follow fills and
 # quoted open positions.
 EQUITY_MARK_HEARTBEAT = timedelta(seconds=60)
+# With positions open the durable path is marked every few seconds instead of
+# every exit-loop pass: fills write their own exact marks, and a month of
+# one-second marks would outgrow the bounded statistical evaluator.
+EQUITY_MARK_OPEN_INTERVAL = timedelta(seconds=5)
+MAX_ENRICHMENT_REMEMBERED = 10_000
 
 
 class RecoveryStateError(RuntimeError):
     """Raised when persisted runtime state cannot be recovered safely."""
+
+
+@dataclass(slots=True)
+class _SecurityInputs:
+    """Provider reads behind one candidate's security context."""
+
+    mint_info: MintInfo
+    holder_accounts: list[HolderBalance]
+    holders_at: datetime
+    round_trip: RoundTripQuote
+    quote_at: datetime
 
 
 class SniperRuntime:
@@ -71,11 +106,14 @@ class SniperRuntime:
         self._system_run_id: str | None = None
         self._external_journal = ExternalJournal(self.data_dir / "external_responses.ndjson")
         self._enrichment_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
-        self._enrichment_seen: set[str] = set()
+        self._enrichment_seen: OrderedDict[str, None] = OrderedDict()
         self._momentum_windows: dict[str, int] = {}
         self._mark_quote_failures: dict[str, tuple[datetime, int]] = {}
+        self._security_inputs: dict[str, _SecurityInputs] = {}
         self._last_equity_mark_at: datetime | None = None
-        self.wallet_analyzer = WalletAnalyzer()
+        self.wallet_analyzer = WalletAnalyzer(
+            reloadable_history=self.database is not None
+        )
         id_factory = self._build_id_factory()
         self._report_runs_path = self.data_dir / "report_runs.json"
         self._report_runs = self._load_report_runs()
@@ -91,7 +129,8 @@ class SniperRuntime:
         self.risk_manager = RiskManager(config.risk, self.ledger)
         self.quote_provider = JupiterQuoteProvider(
             config.jupiter_api_key.get_secret_value(),
-            base_url="https://api.jup.ag/swap/v2",
+            base_url=config.providers.jupiter_base_url,
+            rate_limit_per_second=config.providers.jupiter_requests_per_second,
             quote_mint=config.base_quote_mint,
             quote_mint_decimals=config.base_quote_decimals,
             timeout_seconds=config.execution.quote_timeout_ms / 1000,
@@ -141,6 +180,7 @@ class SniperRuntime:
             )
         self.rpc = SolanaRpcClient(
             config.resolved_helius_rpc_url(),
+            rpc_requests_per_second=config.providers.rpc_requests_per_second,
             replay_mode=config.replay_mode,
             journal=self._external_journal,
             record_responses=config.quote_journal_record,
@@ -247,8 +287,14 @@ class SniperRuntime:
                         today,
                         Decimal(str(daily_bounds["starting_equity_usd"])),
                     )
-                profiles, relations = await self.database.load_wallet_analysis()
-                self.wallet_analyzer.restore(profiles, relations)
+                restored_at = datetime.now(tz=timezone.utc)
+                profiles, relations = await self.database.load_wallet_analysis(
+                    profiles_since=restored_at - CREATOR_MEMORY_RETENTION,
+                    relations_since=restored_at - RELATION_MEMORY_RETENTION,
+                )
+                self.wallet_analyzer.restore(
+                    profiles, relations, restored_at=restored_at
+                )
                 restored_candidates = await self.database.load_active_candidates(
                     self.config.strategy_version,
                     terminal_since=(
@@ -260,7 +306,10 @@ class SniperRuntime:
                 self.pipeline.restore_candidates(restored_candidates)
                 self.pipeline.restore_score_totals(
                     await self.database.load_candidate_score_totals(
-                        self.config.strategy_version
+                        self.config.strategy_version,
+                        candidate_ids=[
+                            candidate.candidate_id for candidate in restored_candidates
+                        ],
                     )
                 )
                 tracked_pool_addresses = {
@@ -294,6 +343,7 @@ class SniperRuntime:
                 }
                 for event in pool_bootstrap_events:
                     if await self.pipeline.rehydrate_event(event):
+                        await self._ensure_wallet_history_for(event)
                         self.wallet_analyzer.observe(event)
                 quarantined_protocols = (
                     await self.database.load_quarantined_event_protocols()
@@ -312,6 +362,7 @@ class SniperRuntime:
                     if event.event_id in bootstrap_event_ids:
                         continue
                     if await self.pipeline.rehydrate_event(event):
+                        await self._ensure_wallet_history_for(event)
                         self.wallet_analyzer.observe(event)
                 runtime_checkpoint = await self.database.load_runtime_checkpoint(
                     "paper-main:exit-monitor"
@@ -828,10 +879,38 @@ class SniperRuntime:
         await asyncio.sleep(self.config.chain.warmup_seconds)
         self.entry_gate.unblock("warmup")
 
+    def _prune_security_inputs(self) -> None:
+        for candidate_id in list(self._security_inputs):
+            candidate = self.pipeline.candidates.get(candidate_id)
+            if candidate is None or candidate.state not in SECURITY_CANDIDATE_STATES:
+                del self._security_inputs[candidate_id]
+
+    def _ingest_holder_observation(
+        self,
+        candidate: Candidate,
+        snapshot: FeatureSnapshot,
+        holders: HolderMetrics,
+    ) -> None:
+        self.pipeline.features.ingest_holders(
+            HolderObservation(
+                event_id=(
+                    f"holders:{candidate.candidate_id}:"
+                    f"{snapshot.snapshot_time.isoformat()}"
+                ),
+                pool_address=candidate.pool_address,
+                event_time=snapshot.snapshot_time,
+                holder_count=holders.holder_count,
+                top_10_holders_pct=holders.top_10_holders_pct,
+                dev_cluster_holding_pct=holders.dev_cluster_holding_pct,
+                largest_related_cluster_pct=holders.related_cluster_holding_pct,
+            )
+        )
+
     async def _candidate_loop(self) -> None:
         while True:
             try:
                 await self.pipeline.evaluate_candidates()
+                self._prune_security_inputs()
                 self.entry_gate.unblock("security_data_unavailable")
             except asyncio.CancelledError:
                 raise
@@ -880,7 +959,33 @@ class SniperRuntime:
                 self.entry_gate.block("sol_price_unavailable")
             await asyncio.sleep(5)
 
+    async def _ensure_wallet_history(
+        self, wallet: str | None, *, at: datetime | None = None
+    ) -> None:
+        """Load a wallet's persisted history before memory writes over it."""
+        if (
+            wallet is None
+            or self.database is None
+            or not self.wallet_analyzer.needs_history(wallet)
+        ):
+            return
+        profile = await self.database.load_wallet_profile(wallet)
+        self.wallet_analyzer.restore_history(
+            wallet, profile, at=at or datetime.now(tz=timezone.utc)
+        )
+
+    async def _ensure_wallet_history_for(self, event: EventEnvelope) -> None:
+        # Launches rebuild the creator's history; every other touch of a wallet
+        # only merges identity fields and never needs the persisted history.
+        if event.event_type != ChainEventType.TOKEN_CREATED:
+            return
+        for key in ("creator", "user"):
+            value = event.payload.get(key)
+            if value:
+                await self._ensure_wallet_history(str(value), at=event.observed_at)
+
     async def _observe_event(self, event: EventEnvelope) -> None:
+        await self._ensure_wallet_history_for(event)
         profiles, relations = self.wallet_analyzer.observe(event)
         wallet = str(event.payload.get("user") or "")
         if event.mint and wallet:
@@ -892,18 +997,27 @@ class SniperRuntime:
                 await self.database.upsert_wallet_profile(profile)
             for relation in relations:
                 await self.database.upsert_wallet_relation(relation, event.observed_at)
+
+    def _request_enrichment(self, mint: str) -> None:
+        """Enrich only tokens that reached a candidate decision.
+
+        Enrichment feeds reports, never a decision, so the rare candidate
+        that passes the market screen is worth a Dexscreener call and the
+        tens of thousands of daily launches are not.
+        """
         if (
-            self.config.enrichment.enabled
-            and not self.config.replay_mode
-            and event.event_type == ChainEventType.TOKEN_CREATED
-            and event.mint
-            and event.mint not in self._enrichment_seen
+            not self.config.enrichment.enabled
+            or self.config.replay_mode
+            or mint in self._enrichment_seen
         ):
-            self._enrichment_seen.add(event.mint)
-            try:
-                self._enrichment_queue.put_nowait(event.mint)
-            except asyncio.QueueFull:
-                self._enrichment_seen.discard(event.mint)
+            return
+        self._enrichment_seen[mint] = None
+        if len(self._enrichment_seen) > MAX_ENRICHMENT_REMEMBERED:
+            self._enrichment_seen.popitem(last=False)
+        try:
+            self._enrichment_queue.put_nowait(mint)
+        except asyncio.QueueFull:
+            self._enrichment_seen.pop(mint, None)
 
     async def _enrichment_loop(self) -> None:
         while True:
@@ -921,7 +1035,7 @@ class SniperRuntime:
                 raise
             except Exception:
                 logger.exception("token enrichment failed", extra={"mint": mint})
-                self._enrichment_seen.discard(mint)
+                self._enrichment_seen.pop(mint, None)
             finally:
                 self._enrichment_queue.task_done()
 
@@ -953,7 +1067,10 @@ class SniperRuntime:
                 await asyncio.to_thread(self.retention.run)
                 if self.database is not None:
                     await self.database.run_retention(
-                        raw_retention_days=self.config.storage.raw_retention_days
+                        raw_retention_days=self.config.storage.raw_retention_days,
+                        api_call_retention_days=(
+                            self.config.storage.api_call_retention_days
+                        ),
                     )
             except asyncio.CancelledError:
                 raise
@@ -989,35 +1106,87 @@ class SniperRuntime:
         if pool is None:
             raise RuntimeError("candidate pool is unavailable")
         dev_wallet = token.creator_address if token else None
-        mint_info = await self.rpc.get_mint_info(candidate.mint)
-        holder_accounts, round_trip = await asyncio.gather(
-            self.rpc.get_all_holders(
+        await self._ensure_wallet_history(dev_wallet)
+        self._request_enrichment(candidate.mint)
+        at = snapshot.snapshot_time
+        entry_decision = candidate.state == CandidateState.ENTRY_PENDING
+        cached = self._security_inputs.get(candidate.candidate_id)
+        refresh_holders = cached is None or at - cached.holders_at >= timedelta(
+            seconds=self.config.execution.holder_refresh_seconds
+        )
+        # The score may use the last periodic round trip; the entry decision
+        # itself always re-quotes so it passes the strict quote-age bound.
+        refresh_quote = (
+            entry_decision
+            or cached is None
+            or at - cached.quote_at
+            >= timedelta(seconds=self.config.execution.quote_refresh_seconds)
+        )
+        quote_priority = (
+            QuotePriority.ENTRY if entry_decision else QuotePriority.SECURITY
+        )
+        if refresh_holders:
+            mint_info = await self.rpc.get_mint_info(candidate.mint)
+            if refresh_quote:
+                holder_accounts, round_trip = await asyncio.gather(
+                    self.rpc.get_all_holders(
+                        candidate.mint,
+                        expected_supply_raw=mint_info.total_supply_raw,
+                    ),
+                    self.quote_provider.get_round_trip_quote(
+                        quote_token=self.config.base_quote_mint,
+                        token=candidate.mint,
+                        usdc_amount=Decimal("10"),
+                        priority=quote_priority,
+                    ),
+                )
+            else:
+                assert cached is not None
+                round_trip = cached.round_trip
+                holder_accounts = await self.rpc.get_all_holders(
+                    candidate.mint,
+                    expected_supply_raw=mint_info.total_supply_raw,
+                )
+            if token is not None and token.total_supply_raw is not None:
+                mint_info = mint_info.model_copy(
+                    update={"supply_changed": token.total_supply_raw != mint_info.total_supply_raw}
+                )
+            updated_token = self.pipeline.tokens.apply_mint_state(
                 candidate.mint,
-                expected_supply_raw=mint_info.total_supply_raw,
-            ),
-            self.quote_provider.get_round_trip_quote(
-                quote_token=self.config.base_quote_mint,
-                token=candidate.mint,
-                usdc_amount=Decimal("10"),
-            ),
-        )
-        if token is not None and token.total_supply_raw is not None:
-            mint_info = mint_info.model_copy(
-                update={"supply_changed": token.total_supply_raw != mint_info.total_supply_raw}
+                token_program=mint_info.token_program,
+                decimals=mint_info.decimals,
+                total_supply_raw=mint_info.total_supply_raw,
+                observed_at=mint_info.observed_at,
             )
-        updated_token = self.pipeline.tokens.apply_mint_state(
-            candidate.mint,
-            token_program=mint_info.token_program,
-            decimals=mint_info.decimals,
-            total_supply_raw=mint_info.total_supply_raw,
-            observed_at=mint_info.observed_at,
-        )
-        if updated_token is not None and self.database is not None:
-            await self.database.upsert_token(updated_token)
-        self.pipeline.update_pool_supply(
-            candidate.pool_address,
-            total_supply_raw=mint_info.total_supply_raw,
-            observed_at=mint_info.observed_at,
+            if updated_token is not None and self.database is not None:
+                await self.database.upsert_token(updated_token)
+            self.pipeline.update_pool_supply(
+                candidate.pool_address,
+                total_supply_raw=mint_info.total_supply_raw,
+                observed_at=mint_info.observed_at,
+            )
+        else:
+            assert cached is not None
+            mint_info = cached.mint_info
+            holder_accounts = cached.holder_accounts
+            round_trip = (
+                await self.quote_provider.get_round_trip_quote(
+                    quote_token=self.config.base_quote_mint,
+                    token=candidate.mint,
+                    usdc_amount=Decimal("10"),
+                    priority=quote_priority,
+                )
+                if refresh_quote
+                else cached.round_trip
+            )
+        self._security_inputs[candidate.candidate_id] = _SecurityInputs(
+            mint_info=mint_info,
+            holder_accounts=holder_accounts,
+            holders_at=(
+                at if refresh_holders or cached is None else cached.holders_at
+            ),
+            round_trip=round_trip,
+            quote_at=at if refresh_quote or cached is None else cached.quote_at,
         )
         owner_scope = {holder.owner for holder in holder_accounts if holder.owner}
         dev_cluster = self.wallet_analyzer.cluster_for(dev_wallet, owner_scope)
@@ -1043,20 +1212,8 @@ class SniperRuntime:
             early_buyers=early_buyers,
             system_addresses=system_addresses,
         )
-        self.pipeline.features.ingest_holders(
-            HolderObservation(
-                event_id=(
-                    f"holders:{candidate.candidate_id}:"
-                    f"{snapshot.snapshot_time.isoformat()}"
-                ),
-                pool_address=candidate.pool_address,
-                event_time=snapshot.snapshot_time,
-                holder_count=holders.holder_count,
-                top_10_holders_pct=holders.top_10_holders_pct,
-                dev_cluster_holding_pct=holders.dev_cluster_holding_pct,
-                largest_related_cluster_pct=holders.related_cluster_holding_pct,
-            )
-        )
+        if refresh_holders:
+            self._ingest_holder_observation(candidate, snapshot, holders)
         trades = self.pipeline.features.trades(
             candidate.pool_address, at=snapshot.snapshot_time
         )
@@ -1286,7 +1443,14 @@ class SniperRuntime:
             )
         if prices and len(prices) == len(positions):
             self.ledger.mark_to_market(prices, observed_at=now)
-            if self.database is not None and self.database_available:
+            if (
+                self.database is not None
+                and self.database_available
+                and (
+                    self._last_equity_mark_at is None
+                    or now - self._last_equity_mark_at >= EQUITY_MARK_OPEN_INTERVAL
+                )
+            ):
                 await self.database.update_paper_marks(
                     account_id="paper-main",
                     positions=list(self.ledger.open_positions),

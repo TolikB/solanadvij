@@ -74,6 +74,9 @@ class CandidateConfig(BaseModel):
     score_entry: Decimal = Decimal("80")
     score_confirmation_windows: int = 2
     score_window_seconds: int = 5
+    # Two qualifying scores still confirm when the evaluation loop slows down;
+    # only a longer silence (or any score below the entry bar) starts over.
+    score_confirmation_max_gap_seconds: int = Field(default=15, ge=6)
 
 
 class LiquidityConfig(BaseModel):
@@ -92,6 +95,12 @@ class ExecutionConfig(BaseModel):
     max_sell_price_impact_pct: Decimal = Decimal("0.035")
     max_round_trip_loss_pct: Decimal = Decimal("0.08")
     min_external_sellers: int = 5
+    # Candidate security inputs are refreshed on a cadence instead of every
+    # evaluation: round-trip quotes feed the score every few seconds and are
+    # always re-quoted for the entry decision itself (max_quote_age_ms);
+    # holder snapshots stay within the 15 s holder staleness bound.
+    quote_refresh_seconds: int = Field(default=5, ge=1)
+    holder_refresh_seconds: int = Field(default=10, ge=1, le=14)
 
 
 class FlowConfig(BaseModel):
@@ -151,10 +160,21 @@ class EnrichmentConfig(BaseModel):
     minimum_interval_ms: int = Field(250, ge=0)
 
 
+class ProvidersConfig(BaseModel):
+    """Provider endpoints and plan limits; operational, never a decision."""
+
+    jupiter_base_url: str = "https://api.jup.ag/swap/v2"
+    jupiter_requests_per_second: float = Field(default=3.0, gt=0)
+    rpc_requests_per_second: float = Field(default=4.0, gt=0)
+
+
 class StorageConfig(BaseModel):
     raw_events_enabled: bool = True
     raw_compression: str = "zstd"
     raw_retention_days: int = Field(90, ge=90)
+    # Provider request/response audit rows; quotes behind fills are kept with
+    # the fills themselves, so only recent calls are needed for debugging.
+    api_call_retention_days: int = Field(default=3, ge=1)
 
 
 class ReportingConfig(BaseModel):
@@ -252,6 +272,7 @@ class AppConfig(BaseSettings):
         minimum_interval_ms=250,
     )
     storage: StorageConfig = StorageConfig(raw_retention_days=90)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     collection: CollectionConfig = Field(default_factory=CollectionConfig)
@@ -439,6 +460,13 @@ class AppConfig(BaseSettings):
             # Operational recovery switch: toggling it during an incident must
             # not fork the strategy identity, report keys, or replay evidence.
             chain.pop("halt_on_unrecoverable_gap", None)
+        storage = data.get("storage")
+        if isinstance(storage, dict):
+            # Housekeeping only: how long debug rows are kept decides nothing.
+            storage.pop("api_call_retention_days", None)
+        # Endpoints and plan limits move with the provider account, not the
+        # strategy; a fake-provider rehearsal keeps the frozen identity.
+        data.pop("providers", None)
         if self.collection.ends_at is None:
             # No frozen window changes no decision, so it keeps the identity
             # of configurations that predate the setting.

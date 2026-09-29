@@ -122,7 +122,19 @@ class EventTimeFeatureEngine:
         self._trades: dict[str, list[TradeObservation]] = {}
         self._liquidity: dict[str, list[LiquidityObservation]] = {}
         self._holders: dict[str, list[HolderObservation]] = {}
-        self._seen: set[str] = set()
+        # Seen observation ids per pool, so forgetting a pool frees them too.
+        self._seen: dict[str, set[str]] = {}
+
+    def pool_count(self) -> int:
+        return len(self._pool_created.keys() | self._liquidity.keys() | self._trades.keys())
+
+    def forget_pool(self, pool_address: str) -> None:
+        """Release every window of a pool that can no longer be evaluated."""
+        self._pool_created.pop(pool_address, None)
+        self._trades.pop(pool_address, None)
+        self._liquidity.pop(pool_address, None)
+        self._holders.pop(pool_address, None)
+        self._seen.pop(pool_address, None)
 
     def register_pool(self, pool_address: str, created_at: datetime) -> None:
         if created_at.tzinfo is None:
@@ -133,7 +145,7 @@ class EventTimeFeatureEngine:
             self._pool_created[pool_address] = created
 
     def ingest_trade(self, event: TradeObservation) -> bool:
-        if not self._accept(event.event_id):
+        if not self._accept(event.pool_address, event.event_id):
             return False
         _insert_ordered(
             self._trades.setdefault(event.pool_address, []),
@@ -150,7 +162,7 @@ class EventTimeFeatureEngine:
         return tuple(events)
 
     def ingest_liquidity(self, event: LiquidityObservation) -> bool:
-        if not self._accept(event.event_id):
+        if not self._accept(event.pool_address, event.event_id):
             return False
         _insert_ordered(
             self._liquidity.setdefault(event.pool_address, []),
@@ -159,7 +171,7 @@ class EventTimeFeatureEngine:
         return True
 
     def ingest_holders(self, event: HolderObservation) -> bool:
-        if not self._accept(event.event_id):
+        if not self._accept(event.pool_address, event.event_id):
             return False
         _insert_ordered(
             self._holders.setdefault(event.pool_address, []),
@@ -286,10 +298,11 @@ class EventTimeFeatureEngine:
             largest_related_cluster_pct=current_holders.largest_related_cluster_pct if current_holders else Decimal("0"),
         )
 
-    def _accept(self, event_id: str) -> bool:
-        if event_id in self._seen:
+    def _accept(self, pool_address: str, event_id: str) -> bool:
+        seen = self._seen.setdefault(pool_address, set())
+        if event_id in seen:
             return False
-        self._seen.add(event_id)
+        seen.add(event_id)
         return True
 
 
