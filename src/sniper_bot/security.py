@@ -72,6 +72,7 @@ class RejectReason(StrEnum):
     # The frozen statistical collection window is closing: every pool must
     # reach a terminal outcome and every position must close before its end.
     COLLECTION_WINDOW_CLOSED = "COLLECTION_WINDOW_CLOSED"
+    ENTRY_SLIPPAGE_EXCEEDED = "ENTRY_SLIPPAGE_EXCEEDED"
 
 
 class MintInfo(BaseModel):

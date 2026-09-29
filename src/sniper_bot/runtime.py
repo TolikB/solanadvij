@@ -10,18 +10,19 @@ import os
 import signal
 import socket
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypeVar
 
-from .broker import PaperBroker
+from .broker import FillReference, PaperBroker
 from .candidates import Candidate, CandidateState
 from .config import AppConfig, AppMode
 from .database import ActiveRuntimeError, Database, _telegram_report_text
 from .enrichment import DexscreenerClient
+from .errors import EntrySlippageExceededError, ExecutionBlockedError
 from .events import ChainEventType, EventEnvelope, EventSource, Protocol
 from .exit_engine import ExitDecision, ExitPolicy, ExitReason, evaluate_exit
 from .external_journal import ExternalJournal
@@ -31,7 +32,7 @@ from .jupiter import JupiterQuoteProvider
 from .ledger import PaperLedger
 from .maintenance import RawRetentionManager
 from .metrics import BotMetrics
-from .models import QuoteResponse, RoundTripQuote
+from .models import PositionRecord, RoundTripQuote
 from .outbox import TelegramOutboxWorker
 from .pipeline import (
     SECURITY_CANDIDATE_STATES,
@@ -39,7 +40,13 @@ from .pipeline import (
     ConfirmationPipeline,
 )
 from .rate_limit import QuotePriority
-from .registry import USDC_MINT, WSOL_MINT, QuoteAssetPrice
+from .registry import (
+    USDC_MINT,
+    WSOL_MINT,
+    QuoteAssetPrice,
+    pool_evidence,
+    reserve_sell_value_usd,
+)
 from .reports import ReportBuilder
 from .risk import RiskManager
 from .scoring import ScoreBreakdown
@@ -63,6 +70,7 @@ from .wallet_analysis import (
 )
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 # The statistical gate needs a durable executable-equity path with bounded
@@ -74,6 +82,10 @@ EQUITY_MARK_HEARTBEAT = timedelta(seconds=60)
 # one-second marks would outgrow the bounded statistical evaluator.
 EQUITY_MARK_OPEN_INTERVAL = timedelta(seconds=5)
 MAX_ENRICHMENT_REMEMBERED = 10_000
+# Reserve-based versus Jupiter marks of open positions, one JSON per line,
+# summarised by scripts/mark_divergence.py for the pre-registered decision.
+MARK_COMPARISON_LOG = "mark_comparisons.ndjson"
+MARK_COMPARISON_LOG_BYTES = 50_000_000
 
 
 class RecoveryStateError(RuntimeError):
@@ -140,6 +152,7 @@ class SniperRuntime:
             quote_journal_path=config.quote_journal_path,
             recorder=(self.database.record_external_api_call if self.database else None),
             metrics=self.metrics,
+            minimum_network_fee_lamports=config.paper.min_network_fee_lamports,
         )
 
         self.broker: Optional[PaperBroker] = None
@@ -156,6 +169,9 @@ class SniperRuntime:
                 config_hash=config.config_hash,
                 exit_retry_interval_ms=config.paper.exit_retry_interval_ms,
                 exit_retry_timeout_seconds=config.paper.exit_retry_timeout_seconds,
+                max_entry_slippage_bps=config.paper.max_entry_slippage_bps,
+                pool_evidence=self._pool_evidence,
+                metrics=self.metrics,
             )
         self.notifier: NoopTelegramNotifier | TelegramNotifier
         if config.replay_mode or not config.telegram.enabled:
@@ -879,6 +895,76 @@ class SniperRuntime:
         await asyncio.sleep(self.config.chain.warmup_seconds)
         self.entry_gate.unblock("warmup")
 
+    async def _counted(self, source: str, read: Awaitable[_T]) -> _T:
+        """Await one security read and count it by source and outcome."""
+        try:
+            result = await read
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.metrics.security_input_requests.labels(
+                source=source, outcome="failed"
+            ).inc()
+            raise
+        self.metrics.security_input_requests.labels(source=source, outcome="ok").inc()
+        return result
+
+    def _reserve_mark_usd(self, position: PositionRecord, now: datetime) -> Decimal | None:
+        """Executable value of a position from the tracked pool reserves."""
+        if not position.pool_address or position.remaining_token_amount <= 0:
+            return None
+        pool = self.pipeline.pools.pool(position.pool_address)
+        state = self.pipeline.pools.state(position.pool_address)
+        if pool is None or state is None:
+            return None
+        quote_price = self.pipeline.pools.quote_price(pool.quote_mint)
+        if quote_price is None or (
+            pool.quote_mint != USDC_MINT and quote_price.is_stale(now)
+        ):
+            return None
+        return reserve_sell_value_usd(
+            state,
+            pool,
+            position.remaining_token_amount,
+            quote_price_usd=quote_price.price_usd,
+        )
+
+    def _record_mark_comparison(
+        self,
+        position: PositionRecord,
+        reserve_usd: Decimal,
+        jupiter_usd: Decimal,
+        now: datetime,
+    ) -> None:
+        """Log both marks so the soak can decide on reserve-based marking."""
+        if jupiter_usd <= 0:
+            return
+        divergence_bps = (reserve_usd / jupiter_usd - Decimal("1")) * Decimal("10000")
+        self.metrics.mark_divergence_bps.observe(float(abs(divergence_bps)))
+        record = {
+            "at": now.isoformat(),
+            "position_id": position.position_id,
+            "mint": position.token_mint,
+            "pool_address": position.pool_address,
+            "jupiter_usd": str(jupiter_usd),
+            "reserve_usd": str(reserve_usd),
+            "divergence_bps": str(divergence_bps.quantize(Decimal("0.01"))),
+        }
+        path = self.data_dir / MARK_COMPARISON_LOG
+        try:
+            if path.exists() and path.stat().st_size > MARK_COMPARISON_LOG_BYTES:
+                path.replace(path.with_suffix(path.suffix + ".1"))
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+        except OSError:
+            logger.warning("mark comparison log unavailable", exc_info=True)
+
+    def _pool_evidence(self, pool_address: str) -> dict[str, str] | None:
+        return pool_evidence(
+            self.pipeline.pools.state(pool_address),
+            self.pipeline.pools.pool(pool_address),
+        )
+
     def _prune_security_inputs(self) -> None:
         for candidate_id in list(self._security_inputs):
             candidate = self.pipeline.candidates.get(candidate_id)
@@ -1126,27 +1212,33 @@ class SniperRuntime:
             QuotePriority.ENTRY if entry_decision else QuotePriority.SECURITY
         )
         if refresh_holders:
-            mint_info = await self.rpc.get_mint_info(candidate.mint)
+            mint_info = await self._counted(
+                "mint", self.rpc.get_mint_info(candidate.mint)
+            )
+            holders_read = self._counted(
+                "holders",
+                self.rpc.get_all_holders(
+                    candidate.mint,
+                    expected_supply_raw=mint_info.total_supply_raw,
+                ),
+            )
             if refresh_quote:
                 holder_accounts, round_trip = await asyncio.gather(
-                    self.rpc.get_all_holders(
-                        candidate.mint,
-                        expected_supply_raw=mint_info.total_supply_raw,
-                    ),
-                    self.quote_provider.get_round_trip_quote(
-                        quote_token=self.config.base_quote_mint,
-                        token=candidate.mint,
-                        usdc_amount=Decimal("10"),
-                        priority=quote_priority,
+                    holders_read,
+                    self._counted(
+                        "round_trip",
+                        self.quote_provider.get_round_trip_quote(
+                            quote_token=self.config.base_quote_mint,
+                            token=candidate.mint,
+                            usdc_amount=Decimal("10"),
+                            priority=quote_priority,
+                        ),
                     ),
                 )
             else:
                 assert cached is not None
                 round_trip = cached.round_trip
-                holder_accounts = await self.rpc.get_all_holders(
-                    candidate.mint,
-                    expected_supply_raw=mint_info.total_supply_raw,
-                )
+                holder_accounts = await holders_read
             if token is not None and token.total_supply_raw is not None:
                 mint_info = mint_info.model_copy(
                     update={"supply_changed": token.total_supply_raw != mint_info.total_supply_raw}
@@ -1170,11 +1262,14 @@ class SniperRuntime:
             mint_info = cached.mint_info
             holder_accounts = cached.holder_accounts
             round_trip = (
-                await self.quote_provider.get_round_trip_quote(
-                    quote_token=self.config.base_quote_mint,
-                    token=candidate.mint,
-                    usdc_amount=Decimal("10"),
-                    priority=quote_priority,
+                await self._counted(
+                    "round_trip",
+                    self.quote_provider.get_round_trip_quote(
+                        quote_token=self.config.base_quote_mint,
+                        token=candidate.mint,
+                        usdc_amount=Decimal("10"),
+                        priority=quote_priority,
+                    ),
                 )
                 if refresh_quote
                 else cached.round_trip
@@ -1296,9 +1391,15 @@ class SniperRuntime:
                 estimated_round_trip_cost_pct=security.execution.round_trip_loss_pct,
                 score=score.total_score,
                 hard_stop_pct=self.config.risk.hard_stop_pct,
+                adverse_execution_buffer_pct=self.config.risk.adverse_execution_buffer_pct,
                 daily_loss_limit_usd=self.config.risk.daily_loss_limit_usdc,
                 maximum_position_usd=self.config.risk.max_position_usdc,
                 minimum_position_usd=self.config.risk.min_position_usdc,
+                risk_per_trade_pct=self.config.risk.risk_per_trade_pct,
+                maximum_position_equity_pct=self.config.risk.max_position_equity_pct,
+                maximum_position_to_liquidity_pct=(
+                    self.config.liquidity.max_position_to_quote_liquidity_pct
+                ),
             )
         )
         if not sizing.allowed:
@@ -1320,21 +1421,41 @@ class SniperRuntime:
             if risk.reason == "DAILY_LOSS_LIMIT":
                 return RejectReason.DAILY_RISK_LIMIT
             return RejectReason.RISK_MANAGER_BLOCKED
-        await self.broker.open(
-            candidate.mint,
-            sizing.position_size_usd,
-            order_id=f"entry:{candidate.candidate_id}",
-            candidate_id=candidate.candidate_id,
-            pool_address=candidate.pool_address,
-            entry_score=score.total_score,
-            entry_liquidity_usd=snapshot.quote_liquidity_usd,
-            entry_pool_age_seconds=snapshot.pool_age_seconds,
-            round_trip_cost_pct=security.execution.round_trip_loss_pct,
-            alert_text=(
-                f"paper entry | mint={candidate.mint[:6]}...{candidate.mint[-4:]} "
-                f"size=${sizing.position_size_usd} score={score.total_score}"
-            ),
+        inputs = self._security_inputs.get(candidate.candidate_id)
+        reference = (
+            FillReference(
+                tokens_per_usd=inputs.round_trip.buy.out_amount
+                / inputs.round_trip.starting_usd,
+                quoted_at=inputs.round_trip.buy.received_at,
+            )
+            if inputs is not None and inputs.round_trip.starting_usd > 0
+            else None
         )
+        try:
+            await self.broker.open(
+                candidate.mint,
+                sizing.position_size_usd,
+                order_id=f"entry:{candidate.candidate_id}",
+                candidate_id=candidate.candidate_id,
+                pool_address=candidate.pool_address,
+                entry_score=score.total_score,
+                entry_liquidity_usd=snapshot.quote_liquidity_usd,
+                entry_pool_age_seconds=snapshot.pool_age_seconds,
+                round_trip_cost_pct=security.execution.round_trip_loss_pct,
+                alert_text=(
+                    f"paper entry | mint={candidate.mint[:6]}...{candidate.mint[-4:]} "
+                    f"size=${sizing.position_size_usd} score={score.total_score}"
+                ),
+                reference=reference,
+            )
+        except EntrySlippageExceededError:
+            self._sync_paper_metrics()
+            return RejectReason.ENTRY_SLIPPAGE_EXCEEDED
+        except ExecutionBlockedError:
+            # A limit reached between the check above and the atomic commit
+            # (e.g. another entry filled meanwhile) rejects this candidate
+            # instead of aborting the whole evaluation pass.
+            return RejectReason.RISK_MANAGER_BLOCKED
         self.metrics.paper_orders.labels(status="filled").inc()
         self._sync_paper_metrics()
         return None
@@ -1364,10 +1485,20 @@ class SniperRuntime:
         positions = list(self.ledger.open_positions)
         close_limit = max_positions if max_positions is not None else len(positions)
 
-        quotes: dict[str, QuoteResponse] = {}
         prices: dict[str, Decimal] = {}
         executable_values: dict[str, Decimal] = {}
         for position in positions:
+            reserve_usd = self._reserve_mark_usd(position, now)
+            if self.config.exits.mark_source == "reserves" and reserve_usd is not None:
+                # Valued from the tracked pool reserves: no provider call per
+                # pass. Fills still go through Jupiter after the delay.
+                self._mark_quote_failures.pop(position.position_id, None)
+                executable_values[position.position_id] = reserve_usd
+                prices[position.token_mint] = (
+                    reserve_usd / position.remaining_token_amount
+                    if position.remaining_token_amount > 0 else Decimal("0")
+                )
+                continue
             try:
                 quote = await self.quote_provider.get_sell_quote_mark_to_market(
                     token=position.token_mint,
@@ -1434,9 +1565,10 @@ class SniperRuntime:
                     self._mark_quote_failures.pop(position.position_id, None)
                 continue
             self._mark_quote_failures.pop(position.position_id, None)
-            quotes[position.position_id] = quote
             executable_usd = quote.out_amount_usd if quote.out_amount_usd else quote.out_amount
             executable_values[position.position_id] = executable_usd
+            if reserve_usd is not None:
+                self._record_mark_comparison(position, reserve_usd, executable_usd, now)
             prices[position.token_mint] = (
                 executable_usd / position.remaining_token_amount
                 if position.remaining_token_amount > 0 else Decimal("0")
@@ -1475,14 +1607,10 @@ class SniperRuntime:
         for index, position in enumerate(positions):
             if index >= close_limit:
                 break
-            position_quote = quotes.get(position.position_id)
-            if position_quote is None:
+            marked_usd = executable_values.get(position.position_id)
+            if marked_usd is None:
                 continue
-            executable_usd = (
-                position_quote.out_amount_usd
-                if position_quote.out_amount_usd
-                else position_quote.out_amount
-            )
+            executable_usd = marked_usd
             if position.remaining_token_amount <= 0:
                 executable_price = Decimal("0")
             else:

@@ -367,9 +367,38 @@ def evaluate(
                 "> 0 new candidates reaching a terminal outcome",
             )
         )
+    security_reads: dict[str, dict[str, float]] = {}
+    for source in ("mint", "holders", "round_trip"):
+        ok = delta(
+            "security_input_requests_total",
+            lambda labels, source=source: labels.get("source") == source
+            and labels.get("outcome") == "ok",
+        )
+        failed = delta(
+            "security_input_requests_total",
+            lambda labels, source=source: labels.get("source") == source
+            and labels.get("outcome") == "failed",
+        )
+        security_reads[source] = {
+            "ok": ok,
+            "failed": failed,
+            "failure_ratio": round(failed / (ok + failed), 4) if ok + failed else 0.0,
+        }
+    zero_fee_quotes = delta("jupiter_quotes_without_network_fee_total")
     return {
         "window_seconds": round(window.last.at - window.first.at, 1),
         "samples": window.samples,
+        # Measurements the pre-registered calibration decisions read
+        # (docs/RUNBOOK.md): holder-check failures, quotes without a network
+        # fee, and entries whose fill slipped past the tolerance.
+        "security_reads": security_reads,
+        "jupiter_quotes_without_network_fee": {
+            "count": zero_fee_quotes,
+            "share_of_ok_quotes": round(zero_fee_quotes / jupiter_ok, 4) if jupiter_ok else 0.0,
+        },
+        "entry_fills_failed_slippage": delta(
+            "paper_orders_total", lambda labels: labels.get("status") == "failed_slippage"
+        ),
         "entry_block_reasons_seen": reasons,
         "filtered_before_ingest": delta("chain_events_filtered_before_ingest_total"),
         "paper_orders": delta("paper_orders_total"),

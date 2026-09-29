@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, field_validator, model_validator
@@ -30,6 +30,10 @@ class RiskConfig(BaseModel):
     hard_stop_pct: Decimal = Decimal("0.15")
     max_position_usdc: Decimal = Decimal("20")
     min_position_usdc: Decimal = Decimal("8")
+    # Position size caps as fractions of equity and of the pool's quote side.
+    max_position_equity_pct: Decimal = Decimal("0.04")
+    # Extra loss assumed beyond the stop when sizing (slippage through it).
+    adverse_execution_buffer_pct: Decimal = Decimal("0.01")
     max_exposure_usdc: Decimal = Decimal("50")
     max_open_positions: int = 3
     daily_loss_limit_usdc: Decimal = Decimal("10")
@@ -38,7 +42,6 @@ class RiskConfig(BaseModel):
     max_consecutive_losses: int = 3
     daily_halt_after_consecutive_losses: int = 4
     pause_minutes: int = 60
-    adverse_fill_bps: int = 50
 
 
 class ChainConfig(BaseModel):
@@ -56,8 +59,15 @@ class ChainConfig(BaseModel):
 
 
 class PaperConfig(BaseModel):
+    # Signal-to-landing latency, applied to entries and exits alike.
     execution_delay_ms: int = 1200
     adverse_fill_bps: int = 50
+    # A real swap carries a minimum output; when the price moves further
+    # than this during the delay the transaction fails and only pays fees.
+    max_entry_slippage_bps: int = Field(default=300, ge=0, le=5000)
+    # Charged per transaction when the quote reports no network fee at all
+    # (5000 lamports is the base signature fee; priority fees are measured).
+    min_network_fee_lamports: int = Field(default=5000, ge=0)
     exit_retry_interval_ms: int = 1000
     exit_retry_timeout_seconds: int = 30
     account_currency: str = "USDC"
@@ -133,6 +143,10 @@ class ExitConfig(BaseModel):
     momentum_exit_windows: int = 2
     no_new_high_timeout_seconds: int = 120
     maximum_holding_seconds: int = 600
+    # Where open positions are valued for exit decisions: a Jupiter sell quote
+    # every pass, or the tracked pool reserves (no provider call; Jupiter still
+    # fills). Both are always compared and logged; switch only by the rule.
+    mark_source: Literal["jupiter", "reserves"] = "jupiter"
 
 
 class TelegramConfig(BaseModel):
@@ -158,6 +172,55 @@ class EnrichmentConfig(BaseModel):
     timeout_ms: int = Field(2500, gt=0)
     cache_seconds: int = Field(300, ge=0)
     minimum_interval_ms: int = Field(250, ge=0)
+
+
+class ScoreAnchor(BaseModel):
+    """One score component: zero points at one bound, full points at the other.
+
+    For rising components (more is better) ``zero`` < ``full``; for falling
+    ones (less is better) ``zero`` > ``full``.
+    """
+
+    zero: Decimal
+    full: Decimal
+    points: Decimal = Field(gt=0)
+
+    @model_validator(mode="after")
+    def bounds_differ(self) -> "ScoreAnchor":
+        if self.zero == self.full:
+            raise ValueError("score anchor bounds must differ")
+        return self
+
+
+class ScoringConfig(BaseModel):
+    """Score anchors, independent of the entry thresholds on purpose.
+
+    The calibration funnel replays stricter liquidity and buyer thresholds on
+    candidates scored during the loosest rung; that is only exact while a
+    threshold change leaves every score as it was.
+    """
+
+    unique_buyers_60s: ScoreAnchor = ScoreAnchor(zero=Decimal("5"), full=Decimal("25"), points=Decimal("8"))
+    buyer_acceleration: ScoreAnchor = ScoreAnchor(zero=Decimal("0.8"), full=Decimal("1.5"), points=Decimal("6"))
+    unique_buyer_ratio: ScoreAnchor = ScoreAnchor(zero=Decimal("0.2"), full=Decimal("0.75"), points=Decimal("4"))
+    buy_sell_volume_ratio: ScoreAnchor = ScoreAnchor(zero=Decimal("1"), full=Decimal("3"), points=Decimal("4"))
+    transactions_per_trader: ScoreAnchor = ScoreAnchor(zero=Decimal("6"), full=Decimal("2"), points=Decimal("3"))
+    top_10_holders: ScoreAnchor = ScoreAnchor(zero=Decimal("0.30"), full=Decimal("0.15"), points=Decimal("6"))
+    largest_related_cluster: ScoreAnchor = ScoreAnchor(zero=Decimal("0.15"), full=Decimal("0.05"), points=Decimal("6"))
+    dev_cluster: ScoreAnchor = ScoreAnchor(zero=Decimal("0.05"), full=Decimal("0.02"), points=Decimal("4"))
+    top_5_buyers_share: ScoreAnchor = ScoreAnchor(zero=Decimal("0.70"), full=Decimal("0.35"), points=Decimal("4"))
+    round_trip_loss: ScoreAnchor = ScoreAnchor(zero=Decimal("0.08"), full=Decimal("0.03"), points=Decimal("8"))
+    price_impact: ScoreAnchor = ScoreAnchor(zero=Decimal("0.035"), full=Decimal("0.01"), points=Decimal("6"))
+    sell_route_points: Decimal = Decimal("6")
+    quote_liquidity: ScoreAnchor = ScoreAnchor(zero=Decimal("40000"), full=Decimal("100000"), points=Decimal("5"))
+    liquidity_stability: ScoreAnchor = ScoreAnchor(zero=Decimal("-0.03"), full=Decimal("0"), points=Decimal("6"))
+    market_cap_to_liquidity: ScoreAnchor = ScoreAnchor(zero=Decimal("15"), full=Decimal("5"), points=Decimal("4"))
+    pullback_min: Decimal = Decimal("0.10")
+    pullback_max: Decimal = Decimal("0.25")
+    pullback_points: Decimal = Decimal("4")
+    vwap_reclaim_points: Decimal = Decimal("4")
+    overextension_max_return: Decimal = Decimal("2.5")
+    overextension_points: Decimal = Decimal("2")
 
 
 class ProvidersConfig(BaseModel):
@@ -273,6 +336,7 @@ class AppConfig(BaseSettings):
     )
     storage: StorageConfig = StorageConfig(raw_retention_days=90)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
+    scoring: ScoringConfig = Field(default_factory=ScoringConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     collection: CollectionConfig = Field(default_factory=CollectionConfig)
@@ -397,8 +461,6 @@ class AppConfig(BaseSettings):
             raise ValueError(
                 "JUPITER_QUOTE_JOURNAL_PATH must be set when replay or record is enabled"
             )
-        if self.paper.adverse_fill_bps != self.risk.adverse_fill_bps:
-            raise ValueError("paper.adverse_fill_bps and risk.adverse_fill_bps must match")
         if self.candidate.min_pool_age_seconds < self.candidate.min_observation_seconds:
             raise ValueError("candidate min pool age cannot be shorter than observation window")
         if self.candidate.max_pool_age_seconds <= self.candidate.min_pool_age_seconds:

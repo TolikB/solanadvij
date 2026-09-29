@@ -282,7 +282,9 @@ class ExternalApiCallRow(Base):
     provider: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     endpoint: Mapped[str] = mapped_column(String(255), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     http_status: Mapped[int | None] = mapped_column(Integer)
@@ -394,6 +396,8 @@ class PaperFillRow(Base):
     )
     config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    # Pool state and quotes around the execution delay, for offline re-pricing.
+    evidence_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
 class PaperPositionRow(Base):

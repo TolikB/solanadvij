@@ -44,6 +44,29 @@ class BotMetrics:
             ["protocol", "event"],
             registry=self.registry,
         )
+        self.security_input_requests = Counter(
+            "security_input_requests_total",
+            "Candidate security reads by source and outcome",
+            ["source", "outcome"],
+            registry=self.registry,
+        )
+        self.jupiter_quotes_without_network_fee = Counter(
+            "jupiter_quotes_without_network_fee_total",
+            "Jupiter quotes that reported no network fee (the configured floor applied)",
+            registry=self.registry,
+        )
+        self.paper_fill_slippage_bps = Histogram(
+            "paper_entry_slippage_bps",
+            "Entry fill price move against the decision quote during the execution delay",
+            buckets=(-100, 0, 25, 50, 100, 200, 300, 500, 1000, 2000),
+            registry=self.registry,
+        )
+        self.mark_divergence_bps = Histogram(
+            "position_mark_divergence_bps",
+            "Absolute difference between the reserve-based and the Jupiter mark",
+            buckets=(10, 25, 50, 100, 150, 200, 300, 500, 1000, 5000),
+            registry=self.registry,
+        )
         self.jupiter_queue_depth = Gauge(
             "jupiter_rate_limit_queue_depth",
             "Jupiter requests waiting for a rate-limit slot",

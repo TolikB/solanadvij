@@ -6,15 +6,39 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from .database import Database
-from .errors import ExecutionBlockedError
+from .errors import EntrySlippageExceededError, ExecutionBlockedError
 from .jupiter import JupiterQuoteProvider
 from .ledger import PaperLedger
-from .models import FillType
+from .models import FillType, QuoteResponse
 from .risk import RiskDecision, RiskManager
+
+# Pool state a fill can later be re-priced from: (pool address) -> evidence.
+PoolEvidenceLookup = Callable[[str], "dict[str, str] | None"]
+
+
+@dataclass(frozen=True)
+class FillReference:
+    """What the entry decision was priced at, before the execution delay."""
+
+    tokens_per_usd: Decimal
+    quoted_at: datetime
+
+
+def _quote_evidence(quote: QuoteResponse) -> dict[str, str]:
+    return {
+        "request_id": quote.request_id,
+        "received_at": quote.received_at.isoformat(),
+        "in_amount": str(quote.in_amount),
+        "out_amount": str(quote.out_amount),
+        "in_amount_usd": str(quote.in_amount_usd or ""),
+        "out_amount_usd": str(quote.out_amount_usd or ""),
+        "price_impact_pct": str(quote.price_impact_pct),
+        "network_fee_usd": str(quote.estimated_network_fee_usd),
+    }
 
 
 @dataclass
@@ -45,6 +69,9 @@ class PaperBroker:
         config_hash: str = "",
         exit_retry_interval_ms: int = 1000,
         exit_retry_timeout_seconds: int = 30,
+        max_entry_slippage_bps: int = 0,
+        pool_evidence: PoolEvidenceLookup | None = None,
+        metrics: Any | None = None,
     ) -> None:
         self._quote_provider = quote_provider
         self._ledger = ledger
@@ -64,6 +91,9 @@ class PaperBroker:
         self._config_hash = config_hash
         self._exit_retry_interval_seconds = max(0, exit_retry_interval_ms) / 1000
         self._exit_retry_timeout_seconds = max(0, exit_retry_timeout_seconds)
+        self._max_entry_slippage_bps = max(0, max_entry_slippage_bps)
+        self._pool_evidence = pool_evidence
+        self._metrics = metrics
         self._clock: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
         self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
@@ -74,6 +104,9 @@ class PaperBroker:
     ) -> None:
         self._clock = clock
         self._sleep = sleep
+        risk_clock = getattr(self._risk, "set_clock", None)
+        if callable(risk_clock):
+            risk_clock(clock)
 
     async def open(
         self,
@@ -88,6 +121,7 @@ class PaperBroker:
         entry_liquidity_usd: Decimal | None = None,
         entry_pool_age_seconds: Decimal | None = None,
         round_trip_cost_pct: Decimal | None = None,
+        reference: FillReference | None = None,
     ) -> PaperExecutionResult:
         if order_id is not None:
             existing_fill = self._ledger.get_fill_by_order(order_id)
@@ -109,11 +143,46 @@ class PaperBroker:
         if decision.decision != RiskDecision.ALLOW:
             raise ExecutionBlockedError(decision.reason or "blocked")
 
+        decision_pool = self._pool_state(pool_address)
         # Confirmation delay to emulate asynchronous and adverse execution.
         await self._sleep(self._execution_delay_seconds)
         quote = await self._quote_provider.get_buy_quote(self._base_quote_mint, token_mint, usdc_amount)
-        token_amount = quote.out_amount * self._adverse_factor
         order_id = order_id or self._id_factory()
+        evidence: dict[str, Any] = {
+            "execution_delay_ms": int(self._execution_delay_seconds * 1000),
+            "decision_pool": decision_pool,
+            "fill_pool": self._pool_state(pool_address),
+            "quote": _quote_evidence(quote),
+        }
+        if reference is not None and reference.tokens_per_usd > 0:
+            expected_tokens = reference.tokens_per_usd * usdc_amount
+            slippage_bps = (
+                (Decimal("1") - quote.out_amount / expected_tokens) * Decimal("10000")
+            ).quantize(Decimal("0.01"))
+            evidence["reference"] = {
+                "tokens_per_usd": str(reference.tokens_per_usd),
+                "quoted_at": reference.quoted_at.isoformat(),
+            }
+            evidence["slippage_bps"] = str(slippage_bps)
+            if self._metrics is not None:
+                self._metrics.paper_fill_slippage_bps.observe(float(slippage_bps))
+            if (
+                self._max_entry_slippage_bps > 0
+                and slippage_bps > self._max_entry_slippage_bps
+            ):
+                await self._fail_entry(
+                    token_mint=token_mint,
+                    usdc_amount=usdc_amount,
+                    order_id=order_id,
+                    candidate_id=candidate_id,
+                    quote=quote,
+                    evidence=evidence,
+                )
+                raise EntrySlippageExceededError(
+                    f"entry fill moved {slippage_bps} bps against the decision "
+                    f"(limit {self._max_entry_slippage_bps})"
+                )
+        token_amount = quote.out_amount * self._adverse_factor
         quote_id = f"quote-{order_id}"
         position_id = self._id_factory()
         fill_id = self._id_factory()
@@ -148,6 +217,7 @@ class PaperBroker:
                     risk_day_key=limits.day_key,
                     risk_day_start=limits.day_start,
                     risk_day_end=limits.day_end,
+                    evidence=evidence,
                 )
             except RuntimeError as error:
                 if str(error).startswith("risk limit:"):
@@ -204,6 +274,41 @@ class PaperBroker:
             direction="entry",
         )
 
+    def _pool_state(self, pool_address: str | None) -> dict[str, str] | None:
+        if self._pool_evidence is None or not pool_address:
+            return None
+        return self._pool_evidence(pool_address)
+
+    async def _fail_entry(
+        self,
+        *,
+        token_mint: str,
+        usdc_amount: Decimal,
+        order_id: str,
+        candidate_id: str | None,
+        quote: QuoteResponse,
+        evidence: dict[str, Any],
+    ) -> None:
+        """Book a failed swap: no position, only the network fee it burned."""
+        fee = quote.estimated_network_fee_usd
+        failed_at = self._clock()
+        if self._metrics is not None:
+            self._metrics.paper_orders.labels(status="failed_slippage").inc()
+        if self._database is not None:
+            await self._database.record_failed_entry(
+                account_id=self._account_id,
+                candidate_id=candidate_id,
+                mint=token_mint,
+                order_id=order_id,
+                quote=quote,
+                requested_usd=usdc_amount,
+                network_fee_usd=fee,
+                failed_at=failed_at,
+                evidence=evidence,
+            )
+        if isinstance(self._ledger, PaperLedger):
+            self._ledger.charge_trading_cost(fee, at=failed_at)
+
     async def close_half(
         self,
         token_mint: str,
@@ -252,6 +357,10 @@ class PaperBroker:
         if token_amount > position.remaining_token_amount:
             raise ValueError("token_amount exceeds remaining position")
 
+        decision_pool = self._pool_state(position.pool_address)
+        # Exits land after the same latency as entries: the decision was made
+        # on an earlier mark, the sell is priced when it would execute.
+        await self._sleep(self._execution_delay_seconds)
         elapsed = 0.0
         quote = None
         while quote is None:
@@ -279,6 +388,12 @@ class PaperBroker:
         close_fill_id = self._id_factory()
         filled_at = self._clock()
         final_reason = "UNRECOVERABLE" if quote is None else (exit_reason or "UNKNOWN_EXIT")
+        exit_evidence: dict[str, Any] = {
+            "execution_delay_ms": int(self._execution_delay_seconds * 1000),
+            "decision_pool": decision_pool,
+            "fill_pool": self._pool_state(position.pool_address),
+            "quote": _quote_evidence(quote) if quote is not None else None,
+        }
         if self._database is not None:
             committed = await self._database.commit_paper_exit(
                 account_id=self._account_id,
@@ -296,6 +411,7 @@ class PaperBroker:
                 outbox_text=(
                     f"paper exit | mint={token_mint} | reason={final_reason} | value={sell_price_usd}"
                 ),
+                evidence=exit_evidence,
             )
             close_fill_id = str(committed["fill_id"])
             quote_id = str(committed["quote_id"])

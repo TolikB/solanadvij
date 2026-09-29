@@ -3396,6 +3396,7 @@ class Database:
         risk_day_key: str | None = None,
         risk_day_start: datetime | None = None,
         risk_day_end: datetime | None = None,
+        evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Atomically commit order, fill, position, account, risk audit and outbox."""
         risk_day_key = risk_day_key or filled_at.date().isoformat()
@@ -3535,6 +3536,7 @@ class Database:
                     strategy_version_id=strategy_version_id,
                     config_hash=config_hash,
                     filled_at=filled_at,
+                    evidence_json=evidence,
                 )
             )
             session.add(
@@ -3584,6 +3586,83 @@ class Database:
                 "filled_at": filled_at,
             }
 
+    async def record_failed_entry(
+        self,
+        *,
+        account_id: str,
+        candidate_id: str | None,
+        mint: str,
+        order_id: str,
+        quote: QuoteResponse,
+        requested_usd: Decimal,
+        network_fee_usd: Decimal,
+        failed_at: datetime,
+        evidence: dict[str, Any],
+    ) -> bool:
+        """Book an entry whose swap would have failed its minimum output.
+
+        No position opens; the rejected order keeps the quote as provenance
+        and the account pays the network fee the failed transaction burned.
+        """
+        async with self.sessions.begin() as session:
+            existing = await session.scalar(
+                select(PaperOrderRow.id).where(PaperOrderRow.idempotency_key == order_id)
+            )
+            if existing is not None:
+                return False
+            account = await session.get(PaperAccountRow, account_id, with_for_update=True)
+            if account is None:
+                raise RuntimeError("paper account is not initialized")
+            await self._assert_transaction_runtime_owner(session)
+            quote_id = str(uuid4())
+            session.add(_external_quote_row(quote_id, quote))
+            session.add(
+                PaperOrderRow(
+                    id=order_id,
+                    idempotency_key=order_id,
+                    candidate_id=candidate_id,
+                    position_id=None,
+                    side="BUY",
+                    status="REJECTED",
+                    requested_usd=requested_usd,
+                    requested_token_raw=None,
+                    quote_request_id=quote_id,
+                    created_at=quote.requested_at,
+                    filled_at=None,
+                    rejected_at=failed_at,
+                    reject_reason="SLIPPAGE_EXCEEDED",
+                )
+            )
+            if network_fee_usd > 0:
+                account.cash_balance -= network_fee_usd
+                account.equity -= network_fee_usd
+                account.simulated_costs += network_fee_usd
+                account.drawdown_pct = (
+                    (account.peak_equity - account.equity) / account.peak_equity
+                    if account.peak_equity > 0
+                    else Decimal("0")
+                )
+                account.updated_at = failed_at
+                self._add_paper_equity_mark(session, account, failed_at)
+            session.add(
+                RiskEventRow(
+                    id=str(uuid4()),
+                    event_type="ENTRY_FILL_FAILED",
+                    severity="INFO",
+                    position_id=None,
+                    candidate_id=candidate_id,
+                    details_json={
+                        "mint": mint,
+                        "requested_usd": str(requested_usd),
+                        "network_fee_usd": str(network_fee_usd),
+                        **{key: value for key, value in evidence.items() if value is not None},
+                    },
+                    created_at=failed_at,
+                    resolved_at=failed_at,
+                )
+            )
+        return True
+
     async def commit_paper_exit(
         self,
         *,
@@ -3600,6 +3679,7 @@ class Database:
         exit_reason: str,
         filled_at: datetime,
         outbox_text: str,
+        evidence: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self.sessions.begin() as session:
             existing = await session.scalar(
@@ -3681,7 +3761,7 @@ class Database:
                     other_cost_usd=other_cost, cost_basis_usd=cost_per_token,
                     realized_pnl_usd=realized_delta, exit_reason=exit_reason,
                     strategy_version_id=strategy_version_id, config_hash=config_hash,
-                    filled_at=filled_at,
+                    filled_at=filled_at, evidence_json=evidence,
                 )
             )
             position.token_amount_raw -= token_amount

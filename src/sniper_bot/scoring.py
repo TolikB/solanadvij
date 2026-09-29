@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from .config import ScoreAnchor, ScoringConfig
 from .features import FeatureSnapshot
 
 
@@ -39,41 +40,51 @@ class ScoreBreakdown(BaseModel):
 
 
 class ScoringEngine:
+    def __init__(self, config: ScoringConfig | None = None) -> None:
+        self.config = config or ScoringConfig()
+
     def score(self, context: ScoreContext) -> ScoreBreakdown:
         f = context.features
+        a = self.config
         organic_parts = {
-            "unique_buyers_60s": _linear(Decimal(f.unique_buyers_60s), Decimal("5"), Decimal("25"), Decimal("8")),
-            "buyer_acceleration": _linear(f.buyer_acceleration, Decimal("0.8"), Decimal("1.5"), Decimal("6")),
-            "unique_buyer_ratio": _linear(f.unique_buyer_ratio, Decimal("0.2"), Decimal("0.75"), Decimal("4")),
-            "buy_sell_volume_ratio": _linear(f.buy_sell_volume_ratio, Decimal("1"), Decimal("3"), Decimal("4")),
-            "transactions_per_trader": _inverse(f.transactions_per_trader, Decimal("2"), Decimal("6"), Decimal("3")),
+            "unique_buyers_60s": _anchored(Decimal(f.unique_buyers_60s), a.unique_buyers_60s),
+            "buyer_acceleration": _anchored(f.buyer_acceleration, a.buyer_acceleration),
+            "unique_buyer_ratio": _anchored(f.unique_buyer_ratio, a.unique_buyer_ratio),
+            "buy_sell_volume_ratio": _anchored(f.buy_sell_volume_ratio, a.buy_sell_volume_ratio),
+            "transactions_per_trader": _anchored(f.transactions_per_trader, a.transactions_per_trader),
         }
         distribution_parts = {
-            "top_10_holders": _inverse(f.top_10_holders_pct, Decimal("0.15"), Decimal("0.30"), Decimal("6")),
-            "largest_related_cluster": _inverse(f.largest_related_cluster_pct, Decimal("0.05"), Decimal("0.15"), Decimal("6")),
-            "dev_cluster": _inverse(f.dev_cluster_holding_pct, Decimal("0.02"), Decimal("0.05"), Decimal("4")),
-            "top_5_buyers_share": _inverse(f.top_5_buyer_volume_share, Decimal("0.35"), Decimal("0.70"), Decimal("4")),
+            "top_10_holders": _anchored(f.top_10_holders_pct, a.top_10_holders),
+            "largest_related_cluster": _anchored(f.largest_related_cluster_pct, a.largest_related_cluster),
+            "dev_cluster": _anchored(f.dev_cluster_holding_pct, a.dev_cluster),
+            "top_5_buyers_share": _anchored(f.top_5_buyer_volume_share, a.top_5_buyers_share),
         }
         execution_parts = {
-            "round_trip_loss": _inverse(context.round_trip_loss_pct, Decimal("0.03"), Decimal("0.08"), Decimal("8")),
-            "price_impact": _inverse(
+            "round_trip_loss": _anchored(context.round_trip_loss_pct, a.round_trip_loss),
+            "price_impact": _anchored(
                 max(context.buy_price_impact_pct, context.sell_price_impact_pct),
-                Decimal("0.01"),
-                Decimal("0.035"),
-                Decimal("6"),
+                a.price_impact,
             ),
-            "sell_route_reliability": context.sell_route_reliability * Decimal("6"),
+            "sell_route_reliability": context.sell_route_reliability * a.sell_route_points,
         }
         liquidity_parts = {
-            "quote_liquidity": _linear(f.quote_liquidity_usd, Decimal("40000"), Decimal("100000"), Decimal("5")),
-            "liquidity_stability": _linear(f.quote_liquidity_change_30s, Decimal("-0.03"), Decimal("0"), Decimal("6")),
-            "market_cap_to_liquidity": _inverse(f.market_cap_to_quote_liquidity, Decimal("5"), Decimal("15"), Decimal("4")),
+            "quote_liquidity": _anchored(f.quote_liquidity_usd, a.quote_liquidity),
+            "liquidity_stability": _anchored(f.quote_liquidity_change_30s, a.liquidity_stability),
+            "market_cap_to_liquidity": _anchored(f.market_cap_to_quote_liquidity, a.market_cap_to_liquidity),
         }
         developer_parts = {"history": _developer_score(context.developer_history)}
         price_parts = {
-            "controlled_pullback": Decimal("4") if Decimal("0.10") <= f.drawdown_from_local_high <= Decimal("0.25") else Decimal("0"),
-            "vwap_reclaim": Decimal("4") if context.vwap_reclaimed else Decimal("0"),
-            "not_overextended": Decimal("2") if f.return_since_pool_creation <= Decimal("2.5") else Decimal("0"),
+            "controlled_pullback": (
+                a.pullback_points
+                if a.pullback_min <= f.drawdown_from_local_high <= a.pullback_max
+                else Decimal("0")
+            ),
+            "vwap_reclaim": a.vwap_reclaim_points if context.vwap_reclaimed else Decimal("0"),
+            "not_overextended": (
+                a.overextension_points
+                if f.return_since_pool_creation <= a.overextension_max_return
+                else Decimal("0")
+            ),
         }
         organic = _sum_cap(organic_parts, Decimal("25"))
         distribution = _sum_cap(distribution_parts, Decimal("20"))
@@ -112,6 +123,12 @@ def _developer_score(history: DeveloperHistory) -> Decimal:
     if history.tokens_created_7d >= 10:
         score -= Decimal("3")
     return _clamp(score, Decimal("0"), Decimal("10"))
+
+
+def _anchored(value: Decimal, anchor: ScoreAnchor) -> Decimal:
+    if anchor.full > anchor.zero:
+        return _linear(value, anchor.zero, anchor.full, anchor.points)
+    return _inverse(value, anchor.full, anchor.zero, anchor.points)
 
 
 def _linear(value: Decimal, low: Decimal, high: Decimal, maximum: Decimal) -> Decimal:

@@ -25,6 +25,9 @@ class PositionSizingInput(BaseModel):
     daily_loss_limit_usd: Decimal = Decimal("10")
     maximum_position_usd: Decimal = Decimal("20")
     minimum_position_usd: Decimal = Decimal("8")
+    risk_per_trade_pct: Decimal = Field(default=Decimal("0.005"), gt=0)
+    maximum_position_equity_pct: Decimal = Field(default=Decimal("0.04"), gt=0)
+    maximum_position_to_liquidity_pct: Decimal = Field(default=Decimal("0.0025"), gt=0)
 
 
 class PositionSizingResult(BaseModel):
@@ -41,7 +44,7 @@ def calculate_position_size(value: PositionSizingInput) -> PositionSizingResult:
         Decimal("0"),
         value.daily_loss_limit_usd + min(value.daily_pnl_usd, Decimal("0")),
     )
-    risk_budget = min(value.current_equity_usd * Decimal("0.005"), remaining_daily)
+    risk_budget = min(value.current_equity_usd * value.risk_per_trade_pct, remaining_daily)
     effective_loss = (
         value.hard_stop_pct
         + value.estimated_round_trip_cost_pct
@@ -68,8 +71,8 @@ def calculate_position_size(value: PositionSizingInput) -> PositionSizingResult:
         )
     size = min(
         risk_budget / effective_loss,
-        value.current_equity_usd * Decimal("0.04"),
-        value.quote_liquidity_usd * Decimal("0.0025"),
+        value.current_equity_usd * value.maximum_position_equity_pct,
+        value.quote_liquidity_usd * value.maximum_position_to_liquidity_pct,
         value.maximum_position_usd,
     ) * multiplier
     size = size.quantize(Decimal("0.01"), rounding=ROUND_DOWN)

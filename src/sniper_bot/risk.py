@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -37,9 +37,22 @@ class AtomicEntryLimits:
 
 
 class RiskManager:
-    def __init__(self, risk: "RiskConfig", ledger: "AnyLedger") -> None:
+    def __init__(
+        self,
+        risk: "RiskConfig",
+        ledger: "AnyLedger",
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self._risk = risk
         self._ledger = ledger
+        self._clock: Callable[[], datetime] = clock or (
+            lambda: datetime.now(tz=timezone.utc)
+        )
+
+    def set_clock(self, clock: Callable[[], datetime]) -> None:
+        """Use the replay clock so pauses and day boundaries replay exactly."""
+        self._clock = clock
 
     def evaluate_entry(self, notional_usdc: Decimal, token_mint: str | None = None) -> RiskDecisionResult:
         if not self._ledger:
@@ -47,7 +60,7 @@ class RiskManager:
         if notional_usdc <= 0:
             raise ExecutionBlockedError("notional must be positive")
 
-        now = datetime.now(tz=timezone.utc)
+        now = self._clock()
         today = (
             self._ledger.current_date_key(now)
             if hasattr(self._ledger, "current_date_key")
@@ -145,14 +158,13 @@ class RiskManager:
             break
         return consecutive
 
-    @staticmethod
-    def _utc_today_key() -> str:
-        return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    def _utc_today_key(self) -> str:
+        return self._clock().astimezone(timezone.utc).strftime("%Y-%m-%d")
 
     def _today_key(self) -> str:
         current_date_key = getattr(self._ledger, "current_date_key", None)
         if callable(current_date_key):
-            return str(current_date_key())
+            return str(current_date_key(self._clock()))
         return self._utc_today_key()
 
     def _date_key(self, at: datetime) -> str:

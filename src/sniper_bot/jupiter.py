@@ -55,6 +55,7 @@ class JupiterQuoteProvider:
         quote_journal_path: str | None = None,
         recorder: Callable[..., Awaitable[str]] | None = None,
         metrics: Any | None = None,
+        minimum_network_fee_lamports: int = 0,
     ) -> None:
         if (replay_mode or record_quotes) and not quote_journal_path:
             raise ValueError("quote_journal_path is required when replay or record mode is enabled")
@@ -75,6 +76,7 @@ class JupiterQuoteProvider:
         self._recorder = recorder
         self._metrics = metrics
         self._last_sol_usd_price = Decimal("0")
+        self._minimum_network_fee_lamports = Decimal(max(0, minimum_network_fee_lamports))
         self._clock: Callable[[], datetime] = lambda: datetime.now(tz=timezone.utc)
 
     def set_clock(self, clock: Callable[[], datetime]) -> None:
@@ -223,13 +225,19 @@ class JupiterQuoteProvider:
             Decimal("0"),
             self._pick_amount_usd(platform_fee, "usdValue", "amountUsd"),
         )
-        network_fee_lamports = sum(
+        reported_fee_lamports = sum(
             max(Decimal("0"), Decimal(str(response.get(key) or 0)))
             for key in (
                 "signatureFeeLamports",
                 "prioritizationFeeLamports",
                 "rentFeeLamports",
             )
+        )
+        if reported_fee_lamports <= 0 and self._metrics is not None:
+            # Quote-only orders may omit fees; the soak measures how often.
+            self._metrics.jupiter_quotes_without_network_fee.inc()
+        network_fee_lamports = max(
+            reported_fee_lamports, self._minimum_network_fee_lamports
         )
 
         quote = QuoteResponse(

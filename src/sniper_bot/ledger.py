@@ -254,6 +254,19 @@ class PaperLedger:
             self._persist()
             return unrealized, equity
 
+    def charge_trading_cost(self, amount_usd: Decimal, *, at: datetime) -> None:
+        """Pay a cost that opened no position, e.g. a failed swap's fee.
+
+        It lowers equity and the day's PnL (so daily risk limits see it) but
+        not realized trading PnL, which stays reconcilable from fills.
+        """
+        if amount_usd <= 0:
+            return
+        with self._lock:
+            self._state.equity_usd -= amount_usd
+            self._state.daily_pnl[self.current_date_key(at)] -= amount_usd
+            self._persist()
+
     def realized_base_equity(self) -> Decimal:
         # Equity excludes unrealized PnL and contains locked capital + realized PnL changes.
         return self._state.equity_usd - self._state.unrealized_pnl_usd

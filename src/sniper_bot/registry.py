@@ -88,6 +88,9 @@ class PoolState(BaseModel):
     base_supply_raw: Decimal | None = None
     source_orientation_reversed: bool = False
     data_quality_flags: list[str] = Field(default_factory=list)
+    last_update_slot: int = 0
+    # Total swap fee (LP + protocol + coin creator) from the latest trade.
+    swap_fee_bps: Decimal | None = None
 
 
 class QuoteAssetPrice(BaseModel):
@@ -416,8 +419,10 @@ class PoolStateTracker:
                 base_supply / (Decimal(10) ** pool_record.base_decimals) * marginal_price
             )
         last_trade = previous.last_trade_time if previous else None
+        swap_fee_bps = previous.swap_fee_bps if previous else None
         if event.event_type in {ChainEventType.SWAP_BUY, ChainEventType.SWAP_SELL}:
             last_trade = event.block_time
+            swap_fee_bps = _swap_fee_bps(payload) or swap_fee_bps
         state = PoolState(
             pool_address=pool_address,
             base_mint=pool_record.base_mint,
@@ -444,6 +449,8 @@ class PoolStateTracker:
             base_supply_raw=base_supply,
             source_orientation_reversed=pool_record.source_orientation_reversed,
             data_quality_flags=flags,
+            last_update_slot=max(event.slot, previous.last_update_slot if previous else 0),
+            swap_fee_bps=swap_fee_bps,
         )
         self._states[pool_address] = state
         self._pools[pool_address] = pool_record.model_copy(
@@ -469,6 +476,63 @@ def _reserve_fields(
         if reversed_orientation
         else (source_base, source_quote)
     )
+
+
+def _swap_fee_bps(payload: dict[str, Any]) -> Decimal | None:
+    parts = [
+        _decimal_or_none(payload.get(key))
+        for key in (
+            "lp_fee_basis_points",
+            "protocol_fee_basis_points",
+            "coin_creator_fee_basis_points",
+        )
+    ]
+    known = [part for part in parts if part is not None]
+    return sum(known, Decimal("0")) if known else None
+
+
+def reserve_sell_value_usd(
+    state: PoolState,
+    pool: PoolRecord,
+    token_amount_raw: Decimal,
+    *,
+    quote_price_usd: Decimal,
+) -> Decimal | None:
+    """Constant-product proceeds of selling ``token_amount_raw`` into the pool.
+
+    The executable value a PumpSwap sell would get right now from the tracked
+    reserves, after the pool's swap fee, in USD. ``None`` when the reserves or
+    the quote-asset price cannot support a mark.
+    """
+    base = state.effective_base_reserves
+    quote = state.effective_quote_reserves
+    if base <= 0 or quote <= 0 or token_amount_raw <= 0 or quote_price_usd <= 0:
+        return None
+    quote_out_raw = quote * token_amount_raw / (base + token_amount_raw)
+    fee = (state.swap_fee_bps or Decimal("0")) / Decimal("10000")
+    quote_out = quote_out_raw * (Decimal("1") - fee) / (Decimal(10) ** pool.quote_decimals)
+    return quote_out * quote_price_usd
+
+
+def pool_evidence(state: PoolState | None, pool: PoolRecord | None) -> dict[str, str] | None:
+    """The tracked pool state a fill can be re-priced from later."""
+    if state is None or pool is None:
+        return None
+    return {
+        "slot": str(state.last_update_slot),
+        "updated_at": state.last_update_time.isoformat(),
+        "base_reserves": str(state.effective_base_reserves),
+        "quote_reserves": str(state.effective_quote_reserves),
+        "base_decimals": str(pool.base_decimals),
+        "quote_decimals": str(pool.quote_decimals),
+        "quote_price_usd": str(
+            state.quote_reserve_usd
+            / (state.effective_quote_reserves / (Decimal(10) ** pool.quote_decimals))
+            if state.effective_quote_reserves > 0
+            else Decimal("0")
+        ),
+        "swap_fee_bps": str(state.swap_fee_bps) if state.swap_fee_bps is not None else "",
+    }
 
 
 def _decimal_or_none(value: object) -> Decimal | None:

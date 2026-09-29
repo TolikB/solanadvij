@@ -225,7 +225,7 @@ class ConfirmationPipeline:
                 else None
             ),
         )
-        self.scoring = ScoringEngine()
+        self.scoring = ScoringEngine(config.scoring if config else None)
         self.state_machine = CandidateStateMachine(
             collect_seconds=(config.candidate.min_observation_seconds if config else 45),
             expiry_seconds=(config.candidate.max_pool_age_seconds if config else 180),

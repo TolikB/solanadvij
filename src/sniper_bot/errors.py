@@ -23,3 +23,11 @@ class RateLimitExceededError(RuntimeError):
 
 class ExecutionBlockedError(RuntimeError):
     """Raised when a request is blocked by risk manager."""
+
+
+class EntrySlippageExceededError(ExecutionBlockedError):
+    """A paper entry whose fill moved beyond the slippage tolerance.
+
+    A real swap would have failed on its minimum output and only paid the
+    network fee, which the broker charges before raising this.
+    """
