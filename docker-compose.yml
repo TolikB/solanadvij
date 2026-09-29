@@ -37,6 +37,10 @@ services:
       # image: configs/ is baked in, so a stale-checkpoint reset during an
       # incident has to be switchable from .env.
       CHAIN: "${CHAIN:-}"
+      # End of the frozen statistical window, written by
+      # scripts/freeze_statistical_protocol.py collection-env. Part of the
+      # config hash: set it before freezing the protocol, never during it.
+      COLLECTION: "${COLLECTION:-}"
       STARTING_EQUITY_USD: ${STARTING_EQUITY_USD:-500}
       BASE_QUOTE_MINT: ${BASE_QUOTE_MINT:-EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v}
       BASE_QUOTE_DECIMALS: ${BASE_QUOTE_DECIMALS:-6}
@@ -61,6 +65,36 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Continuous soak gate against the running bot. Results are JSON lines in
+  # this service's rotated log; nothing is sent to Telegram.
+  monitor:
+    image: python:3.12-slim
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          python /monitor/soak_check.py --base-url http://sniper-bot:8080 \
+            --duration "$${MONITOR_WINDOW_SECONDS:-600}" --interval 15 \
+            --label monitor --no-candidates || true
+        done
+    environment:
+      MONITOR_WINDOW_SECONDS: ${MONITOR_WINDOW_SECONDS:-600}
+    volumes:
+      - ./scripts/soak_check.py:/monitor/soak_check.py:ro
+    depends_on:
+      sniper-bot:
+        condition: service_started
+    read_only: true
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     logging:

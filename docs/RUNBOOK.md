@@ -4,16 +4,68 @@
 
 All VM commands must run from `/opt/solanadvij` and must name the Compose
 project. Never use global Docker stop, prune, down, or container enumeration
-commands on the shared host.
+commands on the shared host. `scripts/vm_release.sh` wraps every step below with
+`docker compose -p solanadvij --env-file .env`; each failed gate prints
+`BLOCKED: ...`, leaves the bot stopped, and exits non-zero.
 
-1. Run `cd /opt/solanadvij` and confirm clock synchronization with `timedatectl status`.
-2. Populate `/opt/solanadvij/.env`; require mode `600` and keep secrets out of YAML and image layers.
-3. Set `APP_REVISION` to the exact 40-character checkout commit.
-4. Run `docker compose -p solanadvij --env-file .env config --quiet`.
-5. Run `docker compose -p solanadvij --env-file .env up --build -d postgres migrate`.
-6. Confirm PostgreSQL is healthy and Alembic is at head before starting `sniper-bot`.
-7. Run `docker compose -p solanadvij --env-file .env up --build -d sniper-bot`.
-8. Confirm `/health/ready`, `APP_MODE=paper`, `/app/REVISION`, real Helius ingestion, and Jupiter quote-only capability.
+1. Check out the release commit: `git fetch origin && git checkout --detach SHA`.
+2. Populate `/opt/solanadvij/.env` with mode `600`, `APP_MODE=paper` and `APP_REVISION=SHA`.
+   Secrets stay out of YAML and image layers.
+3. `scripts/vm_release.sh preflight SHA` checks the exact checkout, `.env`, NTP sync, green CI
+   for SHA (`GITHUB_TOKEN`, or `CI_VERIFIED_SHA=SHA` after checking `quality-gates`), and the
+   Compose configuration.
+4. `scripts/vm_release.sh build SHA` builds the image, checks `/app/REVISION`, the absence of
+   signer-capable modules, and the no-live source audit.
+5. `scripts/vm_release.sh db` starts PostgreSQL, applies migrations, starts daily backups, and
+   runs `scripts/preflight_db.py`. Existing rows are kept; the check fails only if terminally
+   failed or out-of-order unresolved events would keep the stream disabled at startup.
+6. `scripts/vm_release.sh soak 30` runs the bot in `record` mode with Telegram off: real Helius
+   stream, Jupiter quotes only, no fills. `scripts/soak_check.py` then requires zero dropped
+   events, bounded ingress, processing and ordered-stage queues, no reconnect churn, no open
+   recovery gap, no protocol layout quarantine, accumulating events, working Jupiter quotes,
+   stream lag p95 within 3 s, readiness, and candidates reaching outcomes. The JSON result is
+   kept in `artifacts/`.
+7. Freeze the statistical protocol before collection starts (see below), then
+   `scripts/vm_release.sh start` recreates the bot in `paper` mode with Telegram on, waits for
+   `/health/ready`, prints mode, strategy version and config hash, and starts the `monitor`
+   service.
+
+Telegram then carries exactly three proactive messages: bot started, bot stopped, and the human
+daily report at `00:00 Europe/Kyiv`.
+
+## Statistical collection window
+
+The window is fixed before collection: start, OOS boundary on day 15, end on day 30. It cannot
+be extended after publication.
+
+1. Pick a start at least 10 minutes ahead and print its `.env` line:
+   `docker compose -p solanadvij --env-file .env run --rm --no-deps -T --entrypoint python
+   sniper-bot scripts/freeze_statistical_protocol.py collection-env --collection-start START`.
+   Put the printed `COLLECTION=...` line into `.env`. It is part of the config hash.
+2. `scripts/vm_release.sh freeze START` writes
+   `artifacts/acceptance/statistical-protocol.json` from the release image and prints its
+   SHA-256. It refuses a checkout, mode, revision, cost, or window that does not match.
+3. Publish that exact file before START (for example as a GitHub issue in the repository),
+   then write the receipt with `freeze_statistical_protocol.py receipt --protocol ...
+   --published-at ... --reference URL`.
+4. `scripts/vm_release.sh start` before START. Confirm the printed config hash equals the
+   protocol's `config_hash`.
+
+From `COLLECTION.ends_at` minus 30 minutes the bot takes no new entry and rejects open
+candidates; open positions still close, so every pool and position finishes inside the window.
+Keep every restart during the OOS half under five minutes: the equity path allows at most 300 s
+between marks. Record the invoice-backed VPS cost with `scripts/record_operational_cost.py`
+after the window ends, with `--incurred-at` inside the OOS half, so the bot stops only once the
+path is complete. `scripts/vm_release.sh status artifacts/acceptance/statistical-protocol.json`
+shows readiness, the latest monitor verdict, and progress toward 3000 pools and 300 closed
+trades.
+
+## Monitoring
+
+The `monitor` service reruns `scripts/soak_check.py` against the bot every 10 minutes and logs
+one JSON verdict per window: `docker compose -p solanadvij logs --tail 5 monitor`. A failed
+verdict names the criterion (dropped events, queue growth, reconnect churn, layout quarantine,
+stalled stream, Jupiter errors, readiness). Nothing is sent to Telegram.
 
 ## Degraded state
 

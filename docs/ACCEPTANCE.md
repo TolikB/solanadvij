@@ -12,12 +12,18 @@ copying them from the submitted manifest invalidates the release procedure.
 Set `APP_REVISION` to the exact 40-character deployed commit so the persisted strategy cohort can
 be matched to the independently selected release revision.
 
-Create and retain a `StatisticalProtocol` JSON before collection. Start from
-`docs/examples/statistical-protocol.json`. The protocol fixes the Git revision, strategy ID, config
-hash, collection interval, entry-time OOS boundary, operational cost, and sample requirements. It
-must be externally published before collection starts and its publication receipt retained. Project
-policy strengthens the unspecified "sufficient"
-sample wording to at least 300 distinct rejected PumpSwap pools and at least 100 OOS trades.
+Create and retain a `StatisticalProtocol` JSON before collection with
+`scripts/freeze_statistical_protocol.py` (see the runbook); `docs/examples/statistical-protocol.json`
+shows the shape. The protocol fixes the Git revision, strategy ID, config hash, collection
+interval (30 days, OOS from day 15), entry-time OOS boundary, operational cost
+(`reporting.monthly_infrastructure_cost_usd` / 30 per day, 15 USD a month for the VPS), and
+sample requirements. The bot runs with the same window end in `COLLECTION`, which is part of the
+config hash, so it stops entries early enough for every pool and position to finish inside the
+window. The protocol must be externally published before collection starts and its publication
+receipt retained. Project policy strengthens the unspecified "sufficient" sample wording to at
+least 300 distinct rejected PumpSwap pools and at least 100 OOS trades; the gate also requires
+3000 discovered PumpSwap pools and 300 closed trades. The sample accumulates after launch and
+is not a precondition for starting.
 
 Run the evaluator against authoritative PostgreSQL data:
 
