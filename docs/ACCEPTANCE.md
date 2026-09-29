@@ -23,7 +23,10 @@ window. The protocol must be externally published before collection starts and i
 receipt retained. Project policy strengthens the unspecified "sufficient" sample wording to at
 least 300 distinct rejected PumpSwap pools and at least 100 OOS trades; the gate also requires
 3000 discovered PumpSwap pools and 300 closed trades. The sample accumulates after launch and
-is not a precondition for starting.
+is not a precondition for starting. The equity-mark gap is frozen at
+`exits.maximum_holding_seconds` (600 s) unless deliberately overridden at freeze time, and any
+threshold change from the pre-registered calibration rule (runbook) is committed before the
+freeze.
 
 Run the evaluator against authoritative PostgreSQL data:
 

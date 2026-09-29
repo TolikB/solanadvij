@@ -8,10 +8,10 @@ from pathlib import Path
 from typing import Any
 
 from ...events import ChainEventType, EventEnvelope, EventSource, Protocol
-from ..anchor import AnchorIdlDecoder
+from ..anchor import AnchorDecodeError, AnchorIdlDecoder, AnchorLogScan
 
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-ADAPTER_VERSION = "pump-idl-9c82f61"
+ADAPTER_VERSION = "pump-idl-cb188ce"
 
 _EVENT_TYPES = {
     "CreateEvent": ChainEventType.TOKEN_CREATED,
@@ -23,13 +23,67 @@ PUMP_EVENT_NAMES = frozenset(_EVENT_TYPES)
 # Bonding-curve trades carry no pool address, so live state never applies
 # them; they are most of the Pump volume and only dated, never decoded.
 PUMP_STATE_EVENT_NAMES = PUMP_EVENT_NAMES - {"TradeEvent"}
+# Last field of each consumed event as deployed at pump-public-docs 9c82f61.
+# Pump extends events by appending fields, so older payloads end here and
+# newer ones carry more; both decode.
+PUMP_MINIMUM_FIELDS = {
+    "CreateEvent": "virtual_quote_reserves",
+    "TradeEvent": "real_quote_reserves",
+    "CompleteEvent": "quote_mint",
+    "CompletePumpAmmMigrationEvent": "quote_mint",
+}
+# Clock timestamps outside this range can only come from a misread layout.
+_EARLIEST_TIMESTAMP = 1_577_836_800  # 2020-01-01
+_LATEST_TIMESTAMP = 4_102_444_800  # 2100-01-01
+# Every event of one transaction shares the slot's Clock; an RPC block time
+# is that same value.
+_TIMESTAMP_TOLERANCE_SECONDS = 60
 
 
 @dataclass(frozen=True)
 class DecodedTransaction:
     events: list[EventEnvelope]
     block_time: datetime | None
-    unknown_discriminators: int = 0
+    # Hex discriminators of event types the vendored IDL does not know.
+    unknown_discriminators: tuple[str, ...] = ()
+    # Consumed events that carried fields appended after the vendored IDL.
+    appended_events: tuple[str, ...] = ()
+
+
+def decoded_transaction(
+    events: list[EventEnvelope], block_time: datetime | None, scan: AnchorLogScan
+) -> DecodedTransaction:
+    return DecodedTransaction(
+        events=events,
+        block_time=block_time,
+        unknown_discriminators=tuple(item.hex() for item in scan.unknown_discriminators),
+        appended_events=scan.appended_events,
+    )
+
+
+def check_event_timestamps(transaction: dict[str, Any], scan: AnchorLogScan) -> None:
+    """Fail closed when decoded Clock timestamps cannot be real.
+
+    Appended fields decode cleanly, but a field inserted mid-struct would
+    shift everything after it; a timestamp that is implausible, disagrees
+    with the other events of the transaction, or with the RPC block time
+    exposes such a misread.
+    """
+    stamps = [
+        int(event.fields["timestamp"])
+        for event in scan.events
+        if type(event.fields.get("timestamp")) is int
+    ]
+    if scan.timestamp is not None:
+        stamps.append(int(scan.timestamp))
+    if not stamps:
+        return
+    if any(not _EARLIEST_TIMESTAMP <= stamp < _LATEST_TIMESTAMP for stamp in stamps):
+        raise AnchorDecodeError("Anchor event timestamp is implausible")
+    reference = transaction.get("blockTime")
+    anchor = int(reference) if reference is not None else stamps[0]
+    if any(abs(stamp - anchor) > _TIMESTAMP_TOLERANCE_SECONDS for stamp in stamps):
+        raise AnchorDecodeError("Anchor event timestamps disagree with the block time")
 
 
 class PumpDecoder:
@@ -62,11 +116,14 @@ class PumpDecoder:
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
         scan = self._anchor.scan_logs(
-            list(_log_messages(transaction)), event_names=self._event_names
+            list(_log_messages(transaction)),
+            event_names=self._event_names,
+            minimum_fields=PUMP_MINIMUM_FIELDS,
         )
+        check_event_timestamps(transaction, scan)
         block_time = _resolve_block_time(transaction, scan.timestamp)
         if not scan.events:
-            return DecodedTransaction([], block_time, scan.skipped_unknown_discriminators)
+            return decoded_transaction([], block_time, scan)
         signature = _signature(transaction)
         slot = int(transaction.get("slot", 0))
         observed = observed_at or datetime.now(tz=timezone.utc)
@@ -100,7 +157,7 @@ class PumpDecoder:
                     payload=fields,
                 )
             )
-        return DecodedTransaction(result, block_time, scan.skipped_unknown_discriminators)
+        return decoded_transaction(result, block_time, scan)
 
 
 def _log_messages(transaction: dict[str, Any]) -> list[str]:

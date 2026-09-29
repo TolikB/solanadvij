@@ -49,7 +49,12 @@ DEFAULT_OOS_DAY = 15
 # 3000 discovered pools and 300 closed trades over the whole window.
 DEFAULT_MINIMUM_NEGATIVE_LAUNCHES = 300
 DEFAULT_MINIMUM_OOS_TRADES = 100
-DEFAULT_MAXIMUM_EQUITY_MARK_GAP_SECONDS = 300
+# The equity path may go unobserved at most as long as a position may live
+# (exits.maximum_holding_seconds): a restart or reboot within that bound keeps
+# coverage, an outage that leaves a position unmanaged past it does not.
+MINIMUM_EQUITY_MARK_GAP_SECONDS = 120  # two flat-account heartbeats
+MAXIMUM_EQUITY_MARK_GAP_SECONDS = 3600
+COHORT_CONFIG_NAME = "default.yaml"
 # Enough time to publish the frozen file before the first counted pool.
 MINIMUM_PUBLICATION_LEAD = timedelta(minutes=10)
 
@@ -87,9 +92,19 @@ def build_protocol(
     frozen_at: datetime,
     minimum_negative_launches: int = DEFAULT_MINIMUM_NEGATIVE_LAUNCHES,
     minimum_oos_trades: int = DEFAULT_MINIMUM_OOS_TRADES,
-    maximum_equity_mark_gap_seconds: int = DEFAULT_MAXIMUM_EQUITY_MARK_GAP_SECONDS,
+    maximum_equity_mark_gap_seconds: int | None = None,
 ) -> StatisticalProtocol:
     oos_started_at, ends_at = _window(start, days, oos_day)
+    gap = (
+        config.exits.maximum_holding_seconds
+        if maximum_equity_mark_gap_seconds is None
+        else maximum_equity_mark_gap_seconds
+    )
+    if not MINIMUM_EQUITY_MARK_GAP_SECONDS <= gap <= MAXIMUM_EQUITY_MARK_GAP_SECONDS:
+        raise ValueError(
+            "the equity mark gap must be between "
+            f"{MINIMUM_EQUITY_MARK_GAP_SECONDS} and {MAXIMUM_EQUITY_MARK_GAP_SECONDS} seconds"
+        )
     if config.app_mode != AppMode.PAPER:
         raise ValueError("the statistical cohort must run in APP_MODE=paper")
     if not config.release_revision:
@@ -122,7 +137,7 @@ def build_protocol(
         collection_ended_at=ends_at,
         minimum_negative_launches=minimum_negative_launches,
         minimum_oos_trades=minimum_oos_trades,
-        maximum_equity_mark_gap_seconds=maximum_equity_mark_gap_seconds,
+        maximum_equity_mark_gap_seconds=gap,
         # Same daily allocation the reports use for infrastructure costs.
         daily_operational_cost_usd=monthly / Decimal("30"),
         negative_launch_definition="distinct_rejected_pumpswap_pool",
@@ -176,6 +191,11 @@ def _parser() -> argparse.ArgumentParser:
     freeze.add_argument(
         "--config", default=os.environ.get("CONFIG_PATH", "configs/default.yaml")
     )
+    freeze.add_argument(
+        "--max-equity-gap",
+        type=int,
+        help="seconds; default exits.maximum_holding_seconds",
+    )
     freeze.add_argument("--output")
 
     receipt = commands.add_parser("receipt", help="write the publication receipt JSON")
@@ -194,6 +214,10 @@ def main(argv: list[str] | None = None) -> int:
         print(collection_env_line(args.collection_start, args.days))
         return 0
     if args.command == "freeze":
+        if Path(args.config).name != COHORT_CONFIG_NAME:
+            raise ValueError(
+                f"the statistical cohort runs on configs/{COHORT_CONFIG_NAME}, not {args.config}"
+            )
         config = AppConfig.load(args.config)
         protocol = build_protocol(
             config,
@@ -201,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             days=args.days,
             oos_day=args.oos_day,
             frozen_at=datetime.now(tz=timezone.utc),
+            maximum_equity_mark_gap_seconds=args.max_equity_gap,
         )
         content = render(protocol)
         _emit(content, args.output)

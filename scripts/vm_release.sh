@@ -5,12 +5,16 @@
 # project only. It never lists, stops, or prunes anything outside that project.
 # Any failed gate leaves the bot stopped and prints the blocker.
 #
-#   scripts/vm_release.sh preflight SHA        exact checkout, .env, NTP, compose
-#   scripts/vm_release.sh build SHA            image at SHA, no signer modules
+#   scripts/vm_release.sh preflight SHA        exact checkout, .env, NTP, CI, compose
+#   scripts/vm_release.sh build SHA            image at SHA, no signer modules, IDL drift
 #   scripts/vm_release.sh db                   migrate, then check the stream can start
-#   scripts/vm_release.sh soak [MINUTES]       record-mode Helius/Jupiter quote-only soak
-#   scripts/vm_release.sh freeze START         protocol for START..+15d..+30d
+#   scripts/vm_release.sh soak MINUTES [calibration]
+#                                              record-mode Helius/Jupiter quote-only soak
+#   scripts/vm_release.sh funnel [HOURS]       calibration funnel and the frozen decision
+#   scripts/vm_release.sh freeze START [GAP]   protocol for START..+15d..+30d
 #   scripts/vm_release.sh start                paper bot, readiness, monitor
+#   scripts/vm_release.sh restart-drill PROTOCOL
+#                                              restart before the window, measure the gap
 #   scripts/vm_release.sh status [PROTOCOL]    readiness, recent gate, sample progress
 #   scripts/vm_release.sh stop                 stop the bot and its monitor
 set -euo pipefail
@@ -19,6 +23,8 @@ PROJECT_DIR=/opt/solanadvij
 PROJECT=solanadvij
 API=http://127.0.0.1:8080
 ARTIFACTS=artifacts
+COHORT_CONFIG=configs/default.yaml
+CALIBRATION_CONFIG=configs/calibration.yaml
 TELEGRAM_OFF='{"enabled":false,"daily_report_time":"00:00","include_all_time_with_daily":false}'
 
 cd "$PROJECT_DIR"
@@ -28,6 +34,14 @@ env_value() { sed -n "s/^$1=//p" .env | tail -n 1; }
 blocked() {
   printf 'BLOCKED: %s\n' "$*" >&2
   exit 1
+}
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+in_image() { compose run --rm --no-deps -T --entrypoint python sniper-bot "$@"; }
+cohort_config_in_env() {
+  local configured
+  configured="$(env_value CONFIG_PATH)"
+  [[ -z "$configured" || "$configured" == "$COHORT_CONFIG" ]] ||
+    blocked "CONFIG_PATH in .env must be $COHORT_CONFIG for the statistical cohort"
 }
 stop_bot() { compose stop monitor sniper-bot >/dev/null 2>&1 || true; }
 
@@ -79,7 +93,23 @@ preflight() {
     blocked "system clock is not NTP-synchronized"
   ci_green "$sha"
   compose config --quiet
+  host_warnings
   echo "preflight=ok revision=$sha"
+}
+
+host_warnings() {
+  # Read-only: host settings belong to every project on this VM, so they are
+  # reported, never changed. A reboot during the OOS half longer than the
+  # frozen equity gap fails the statistical gate.
+  if [[ "$(systemctl is-enabled docker 2>/dev/null || true)" != "enabled" ]]; then
+    warn "Docker does not start at boot; after a VM reboot the bot stays down"
+  fi
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "a reboot is pending; schedule it before the collection window, not during it"
+  fi
+  if apt-config dump Unattended-Upgrade::Automatic-Reboot 2>/dev/null | grep -qi '"true"'; then
+    warn "unattended upgrades may reboot the VM automatically during the window"
+  fi
 }
 
 build() {
@@ -98,7 +128,16 @@ assert not present, f"signer-capable modules in production image: {present}"
   # the image's interpreter rather than relying on the host Python.
   compose run --rm --no-deps -T -v "$PROJECT_DIR:/src:ro" --entrypoint python \
     sniper-bot /src/scripts/audit_no_live.py
-  echo "build=ok revision=$sha paper_only=true"
+  mkdir -p "$ARTIFACTS"
+  local drift=0
+  in_image scripts/check_idl_drift.py >"$ARTIFACTS/idl-drift.json" || drift=$?
+  cat "$ARTIFACTS/idl-drift.json"
+  case "$drift" in
+    0) ;;
+    1) blocked "a consumed Pump/PumpSwap event changed incompatibly upstream; update the vendored IDL" ;;
+    *) blocked "upstream IDLs could not be fetched to rule out layout drift" ;;
+  esac
+  echo "build=ok revision=$sha paper_only=true idl=compatible"
 }
 
 db() {
@@ -114,13 +153,21 @@ db() {
 }
 
 soak() {
-  local minutes="${1:-30}"
-  local sha result
+  local minutes="${1:-30}" profile="${2:-}"
+  local sha result config="$COHORT_CONFIG"
+  [[ "$minutes" =~ ^[0-9]+$ && "$minutes" -gt 0 ]] || blocked "soak length in minutes is required"
+  case "$profile" in
+    "") ;;
+    calibration) config="$CALIBRATION_CONFIG" ;;
+    *) blocked "unknown soak profile: $profile" ;;
+  esac
   sha="$(env_value APP_REVISION)"
   mkdir -p "$ARTIFACTS"
-  result="$ARTIFACTS/soak-record-$sha-$(date -u +%Y%m%dT%H%M%SZ).json"
-  # Record mode fills nothing; it streams Helius and quotes Jupiter only.
-  APP_MODE=record TELEGRAM="$TELEGRAM_OFF" compose up -d --no-deps --force-recreate sniper-bot
+  result="$ARTIFACTS/soak-record-${profile:-cohort}-$sha-$(date -u +%Y%m%dT%H%M%SZ).json"
+  # Record mode fills nothing; it streams Helius and quotes Jupiter only. The
+  # calibration profile runs the loosest threshold rung for the funnel.
+  CONFIG_PATH="$config" APP_MODE=record TELEGRAM="$TELEGRAM_OFF" \
+    compose up -d --no-deps --force-recreate sniper-bot
   if ! wait_ready 420; then
     compose logs --no-color --tail 200 sniper-bot >"$ARTIFACTS/soak-startup.log" 2>&1 || true
     stop_bot
@@ -137,16 +184,36 @@ soak() {
   echo "soak=ok result=$result"
 }
 
+funnel() {
+  local hours="${1:-24}"
+  local result
+  mkdir -p "$ARTIFACTS"
+  result="$ARTIFACTS/funnel-$(date -u +%Y%m%dT%H%M%SZ).json"
+  if ! in_image scripts/calibration_funnel.py --hours "$hours" >"$result"; then
+    cat "$result"
+    blocked "the calibration funnel could not decide; see $result"
+  fi
+  cat "$result"
+  python3 -c 'import json,sys
+report=json.load(open(sys.argv[1]))
+print("funnel=ok decision=%s changes=%s" % (report["decision"], json.dumps(report["config_changes"])))' "$result"
+}
+
 freeze() {
-  local start="${1:-}"
+  local start="${1:-}" gap="${2:-}"
   [[ -n "$start" ]] || blocked "collection start (UTC ISO timestamp) is required"
+  cohort_config_in_env
   local expected
+  local gap_args=()
+  if [[ -n "$gap" ]]; then
+    gap_args=(--max-equity-gap "$gap")
+  fi
   expected="$(compose run --rm --no-deps -T --entrypoint python sniper-bot \
     scripts/freeze_statistical_protocol.py collection-env --collection-start "$start")"
   grep -qxF "$expected" .env || blocked "put this line in .env first: $expected"
   mkdir -p "$ARTIFACTS/acceptance"
   compose run --rm --no-deps -T --entrypoint python sniper-bot \
-    scripts/freeze_statistical_protocol.py freeze --collection-start "$start" \
+    scripts/freeze_statistical_protocol.py freeze --collection-start "$start" "${gap_args[@]}" \
     >"$ARTIFACTS/acceptance/statistical-protocol.json"
   sha256sum "$ARTIFACTS/acceptance/statistical-protocol.json"
   echo "freeze=ok publish $ARTIFACTS/acceptance/statistical-protocol.json before $start"
@@ -154,6 +221,7 @@ freeze() {
 
 start() {
   [[ "$(env_value APP_MODE)" == "paper" ]] || blocked "APP_MODE in .env must be paper"
+  cohort_config_in_env
   compose up -d --no-deps --force-recreate sniper-bot
   if ! wait_ready 420; then
     compose logs --no-color --tail 200 sniper-bot >"$ARTIFACTS/start.log" 2>&1 || true
@@ -166,6 +234,43 @@ assert state["mode"]=="paper", state
 print("start=ok mode=%s status=%s strategy_version=%s config_hash=%s"
       % (state["mode"], state["status"], state["strategy_version"], state["config_hash"]))'
   compose up -d --no-deps monitor
+}
+
+latest_mark_epoch() {
+  in_image scripts/latest_equity_mark.py |
+    python3 -c 'import json,sys; value=json.load(sys.stdin)["epoch"]; print(0 if value is None else int(value))'
+}
+
+restart_drill() {
+  local protocol="${1:-}"
+  [[ -f "$protocol" ]] || blocked "the frozen protocol file is required"
+  local start_at limit
+  read -r start_at limit < <(python3 -c 'import json,sys
+from datetime import datetime
+protocol=json.load(open(sys.argv[1]))
+start=datetime.fromisoformat(protocol["collection_started_at"].replace("Z","+00:00"))
+print(int(start.timestamp()), protocol["maximum_equity_mark_gap_seconds"])' "$protocol")
+  # The drill itself must never cost coverage: finish well before the window.
+  (($(date -u +%s) + 900 < start_at)) ||
+    blocked "restart drill must run at least 15 minutes before the collection window"
+  curl -fsS "$API/health/ready" >/dev/null || blocked "the paper bot must be running and ready"
+  local before after deadline
+  before="$(latest_mark_epoch)"
+  ((before > 0)) || blocked "no equity mark exists yet"
+  compose stop sniper-bot
+  compose up -d --no-deps sniper-bot
+  deadline=$((SECONDS + limit))
+  after="$before"
+  while ((after <= before && SECONDS < deadline)); do
+    sleep 5
+    after="$(latest_mark_epoch)"
+  done
+  ((after > before)) || blocked "no equity mark within ${limit}s of the restart"
+  wait_ready 420 || blocked "the bot did not become ready after the restart"
+  local gap=$((after - before))
+  ((gap * 2 <= limit)) ||
+    blocked "a restart left a ${gap}s equity gap, more than half of the frozen ${limit}s"
+  echo "restart_drill=ok gap=${gap}s limit=${limit}s"
 }
 
 status() {
@@ -185,10 +290,12 @@ case "$command" in
   preflight) preflight "${1:-}" ;;
   build) build "${1:-}" ;;
   db) db ;;
-  soak) soak "${1:-30}" ;;
-  freeze) freeze "${1:-}" ;;
+  soak) soak "${1:-30}" "${2:-}" ;;
+  funnel) funnel "${1:-24}" ;;
+  freeze) freeze "${1:-}" "${2:-}" ;;
   start) start ;;
+  restart-drill) restart_drill "${1:-}" ;;
   status) status "${1:-}" ;;
   stop) stop_bot && echo "stopped" ;;
-  *) sed -n '2,17p' "$0" && exit 2 ;;
+  *) sed -n '2,21p' "$0" && exit 2 ;;
 esac

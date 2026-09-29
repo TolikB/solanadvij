@@ -80,3 +80,22 @@ async def test_equity_heartbeat_copies_the_authoritative_account(tmp_path: Path)
     with pytest.raises(RuntimeError, match="paper account is unavailable"):
         await database.record_equity_heartbeat(account_id="missing", observed_at=NOW)
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_latest_equity_mark_reports_the_newest_mark(tmp_path: Path) -> None:
+    from scripts.latest_equity_mark import latest_mark
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'latest.db'}")
+    await database.create_schema_for_tests()
+    assert await latest_mark(database, "paper-main") is None
+
+    await database.initialize_paper_account(
+        account_id="paper-main", starting_equity=Decimal("500"), now=NOW
+    )
+    await database.record_equity_heartbeat(
+        account_id="paper-main", observed_at=NOW + timedelta(seconds=90)
+    )
+
+    assert await latest_mark(database, "paper-main") == NOW + timedelta(seconds=90)
+    await database.close()

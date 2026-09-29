@@ -247,43 +247,61 @@ def test_ingest_filter_follows_the_candidate_lifecycle(tmp_path) -> None:
         assert event.pool_address not in pipeline._ingest_tracked_pools
 
 
-@pytest.mark.asyncio
-async def test_unknown_event_layout_blocks_the_protocol_without_stopping_ingestion(
-    tmp_path,
-) -> None:
-    metrics = BotMetrics()
-    pipeline = _pipeline(tmp_path, metrics=metrics)
-    swap = BorshEventEncoder(_idl_path(pumpswap_package))
-    unknown = base64.b64encode(bytes([255]) * 16).decode()
-    transaction = _notification(
+def _create_pool_notification(
+    swap: BorshEventEncoder, signature: str, pool_index: int
+) -> dict[str, Any]:
+    return _notification(
         swap,
         PUMPSWAP_PROGRAM_ID,
         "CreatePoolEvent",
-        "mixed",
+        signature,
         {
             "timestamp": int(NOW.timestamp()),
-            "pool": _address(7, 9),
-            "base_mint": _address(11, 9),
+            "pool": _address(7, pool_index),
+            "base_mint": _address(11, pool_index),
             "quote_mint": WSOL_MINT,
             "base_mint_decimals": 6,
             "quote_mint_decimals": 9,
         },
     )
-    transaction["meta"]["logMessages"].insert(2, f"Program data: {unknown}")
 
-    await pipeline.process_transactions(
-        [(Protocol.PUMPSWAP, transaction, EventSource.HELIUS_WSS)]
-    )
 
-    assert "protocol:pumpswap" in pipeline.entry_gate.reasons
-    assert (
-        metrics.protocol_layout_quarantines.labels(
-            protocol="pumpswap", kind="unknown_discriminator"
-        )._value.get()
-        == 1
-    )
+@pytest.mark.asyncio
+async def test_unknown_event_types_are_counted_and_sampled_without_blocking(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metrics = BotMetrics()
+    pipeline = _pipeline(tmp_path, metrics=metrics)
+    archived: list[str] = []
+
+    async def capture(event: EventEnvelope) -> None:
+        archived.append(str(event.payload["reason"]))
+
+    monkeypatch.setattr(pipeline.recorder, "record", capture)
+    swap = BorshEventEncoder(_idl_path(pumpswap_package))
+    unknown = base64.b64encode(bytes([255]) * 16).decode()
+    transactions = []
+    for index in (9, 10):
+        transaction = _create_pool_notification(swap, f"mixed-{index}", index)
+        transaction["meta"]["logMessages"].insert(2, f"Program data: {unknown}")
+        transactions.append((Protocol.PUMPSWAP, transaction, EventSource.HELIUS_WSS))
+
+    await pipeline.process_transactions(transactions)
+
+    assert not any(reason.startswith("protocol:") for reason in pipeline.entry_gate.reasons)
+    assert metrics.protocol_unknown_events.labels(protocol="pumpswap")._value.get() == 2
+    assert archived == ["UNKNOWN_EVENT_TYPE"]
     assert pipeline.pools.pool(_address(7, 9)) is not None
+    assert pipeline.pools.pool(_address(7, 10)) is not None
 
+
+@pytest.mark.asyncio
+async def test_consumed_event_that_breaks_its_layout_blocks_the_protocol(
+    tmp_path,
+) -> None:
+    metrics = BotMetrics()
+    pipeline = _pipeline(tmp_path, metrics=metrics)
+    swap = BorshEventEncoder(_idl_path(pumpswap_package))
     truncated = base64.b64decode(swap.encode("CreatePoolEvent", {}))[:20]
     broken = {
         "slot": 400_000_002,
@@ -297,12 +315,48 @@ async def test_unknown_event_layout_blocks_the_protocol_without_stopping_ingesti
             ],
         },
     }
+
     await pipeline.process_transactions(
-        [(Protocol.PUMPSWAP, broken, EventSource.HELIUS_WSS)]
+        [
+            (Protocol.PUMPSWAP, broken, EventSource.HELIUS_WSS),
+            (
+                Protocol.PUMPSWAP,
+                _create_pool_notification(swap, "after", 11),
+                EventSource.HELIUS_WSS,
+            ),
+        ]
     )
+
+    assert "protocol:pumpswap" in pipeline.entry_gate.reasons
     assert (
         metrics.protocol_layout_quarantines.labels(
             protocol="pumpswap", kind="decode_error"
+        )._value.get()
+        == 1
+    )
+    # Ingestion continues after the quarantined transaction.
+    assert pipeline.pools.pool(_address(7, 11)) is not None
+
+
+@pytest.mark.asyncio
+async def test_fields_appended_by_a_program_upgrade_still_decode(tmp_path) -> None:
+    metrics = BotMetrics()
+    pipeline = _pipeline(tmp_path, metrics=metrics)
+    swap = BorshEventEncoder(_idl_path(pumpswap_package))
+    transaction = _create_pool_notification(swap, "future", 12)
+    line = transaction["meta"]["logMessages"][1]
+    payload = base64.b64decode(line.removeprefix("Program data: ")) + bytes([1, 2, 3, 4, 5])
+    transaction["meta"]["logMessages"][1] = f"Program data: {base64.b64encode(payload).decode()}"
+
+    await pipeline.process_transactions(
+        [(Protocol.PUMPSWAP, transaction, EventSource.HELIUS_WSS)]
+    )
+
+    assert not any(reason.startswith("protocol:") for reason in pipeline.entry_gate.reasons)
+    assert pipeline.pools.pool(_address(7, 12)) is not None
+    assert (
+        metrics.protocol_layout_appended_events.labels(
+            protocol="pumpswap", event="CreatePoolEvent"
         )._value.get()
         == 1
     )

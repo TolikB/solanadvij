@@ -11,11 +11,17 @@ paper execution, reporting, Telegram command intake, and the read-only API.
    back to one standard `logsSubscribe` per program. Neither path calls RPC per notification:
    every Pump and PumpSwap event carries the program's `Clock::unix_timestamp`, which is the
    slot's block time, so the decoders date each transaction from it.
-2. Strict vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
+2. Vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
    `CompleteEvent` and `CompletePumpAmmMigrationEvent`, and PumpSwap pool creation, swaps and
-   liquidity changes. Bonding-curve trades and other events are only dated, never decoded. A
-   consumed event that does not match its IDL, or an unknown discriminator, blocks entries on
-   that protocol and is archived as `UNKNOWN_PROTOCOL_LAYOUT`; ingestion keeps running.
+   liquidity changes. Bonding-curve trades and other events are only dated, never decoded.
+   Programs extend events by appending fields, so a consumed event decodes from the layout
+   deployed when the IDL was first vendored through every field it carries; bytes beyond the
+   IDL are counted, not rejected. A consumed event that still does not fit, or whose Clock
+   timestamp is implausible or disagrees with the block, blocks entries on that protocol and is
+   archived as `UNKNOWN_PROTOCOL_LAYOUT`; ingestion keeps running. Event types the IDL does not
+   know are counted and archived once each: a discriminator is the hash of the event name in
+   its own log line, so a new type cannot change how consumed events decode, and blocking on it
+   would halt a collection window at every routine program upgrade.
 3. Before durable ingest, pool activity is admitted only for pools a live candidate tracks:
    from the creation event to the end of the entry window plus a margin, and for as long as a
    position is open. Everything else is what live state would discard, so it never costs

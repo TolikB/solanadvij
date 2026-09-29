@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from scripts.soak_check import Observation, Thresholds, evaluate, parse_prometheus
+from scripts.soak_check import Observation, Thresholds, evaluate, parse_prometheus, window_of
 from sniper_bot.metrics import BotMetrics
 
 
@@ -62,7 +62,7 @@ def test_prometheus_parser_keeps_labels_and_values() -> None:
 
 
 def test_healthy_real_stream_window_passes() -> None:
-    result = evaluate(_healthy_window(), Thresholds())
+    result = evaluate(window_of(_healthy_window()), Thresholds())
 
     assert result["passed"] is True, result["criteria"]
     assert result["window_seconds"] == 1800
@@ -87,7 +87,7 @@ def test_each_ingestion_failure_mode_fails_the_gate() -> None:
             **fault,
         }
         window[-1] = _observation(1800, **values)
-        result = evaluate(window, Thresholds())
+        result = evaluate(window_of(window), Thresholds())
         failed = {item["name"] for item in result["criteria"] if not item["passed"]}
         assert failed == {criterion}, (criterion, result["criteria"])
 
@@ -98,7 +98,7 @@ def test_stalled_stream_unready_runtime_and_missing_candidates_fail() -> None:
         _observation(1800, ready=False, lag=40.0, received=100, jupiter_ok=20),
     ]
 
-    result = evaluate(stalled, Thresholds())
+    result = evaluate(window_of(stalled), Thresholds())
 
     failed = {item["name"] for item in result["criteria"] if not item["passed"]}
     assert failed == {
@@ -109,5 +109,39 @@ def test_stalled_stream_unready_runtime_and_missing_candidates_fail() -> None:
     }
     assert "candidates_reach_outcomes" not in {
         item["name"]
-        for item in evaluate(stalled, Thresholds(require_candidates=False))["criteria"]
+        for item in evaluate(window_of(stalled), Thresholds(require_candidates=False))["criteria"]
     }
+
+
+def test_reconnect_tolerance_scales_with_the_soak_length() -> None:
+    day = [
+        _observation(0, received=100, jupiter_ok=10, reconnects=0),
+        _observation(86_400, received=9_000_000, jupiter_ok=90_000, reconnects=20, rejections=5_000),
+    ]
+    result = evaluate(window_of(day), Thresholds())
+    churn = next(item for item in result["criteria"] if item["name"] == "no_reconnect_churn")
+    assert churn["passed"] is True
+
+    day[-1] = _observation(
+        86_400, received=9_000_000, jupiter_ok=90_000, reconnects=40, rejections=5_000
+    )
+    churn = next(
+        item
+        for item in evaluate(window_of(day), Thresholds())["criteria"]
+        if item["name"] == "no_reconnect_churn"
+    )
+    assert churn["passed"] is False
+
+
+def test_window_keeps_peaks_not_every_sample() -> None:
+    window = window_of(
+        [
+            _observation(0, received=1, jupiter_ok=1),
+            _observation(15, received=2, jupiter_ok=2, notification_depth=700),
+            _observation(30, received=3, jupiter_ok=3, rejections=1),
+        ]
+    )
+
+    assert window.samples == 3
+    assert window.peaks["event_notification_queue_depth"] == 700
+    assert window.first.at == 0 and window.last.at == 30

@@ -28,8 +28,20 @@ class BotMetrics:
         )
         self.protocol_layout_quarantines = Counter(
             "protocol_layout_quarantines_total",
-            "Transactions whose Anchor events did not match the vendored IDL",
+            "Transactions whose consumed Anchor events did not match the vendored IDL",
             ["protocol", "kind"],
+            registry=self.registry,
+        )
+        self.protocol_unknown_events = Counter(
+            "protocol_unknown_events_total",
+            "Anchor events of types the vendored IDL does not know, counted and ignored",
+            ["protocol"],
+            registry=self.registry,
+        )
+        self.protocol_layout_appended_events = Counter(
+            "protocol_layout_appended_events_total",
+            "Consumed Anchor events carrying fields appended after the vendored IDL",
+            ["protocol", "event"],
             registry=self.registry,
         )
         self.candidate_evaluation_failures = Counter(

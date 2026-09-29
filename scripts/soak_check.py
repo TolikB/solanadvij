@@ -33,7 +33,9 @@ DEFAULT_MAX_NOTIFICATION_QUEUE = 1024
 DEFAULT_MAX_PROCESSING_QUEUE = 1000
 DEFAULT_MAX_STAGE_BACKLOG = 5000
 DEFAULT_MAX_OLDEST_EVENT_AGE_SECONDS = 5.0
-DEFAULT_MAX_RECONNECTS = 1
+# A provider-side disconnect now and then is normal on a day-long soak; churn
+# is more than about one reconnect (and its 60 s baseline) per hour.
+DEFAULT_MAX_RECONNECTS_PER_HOUR = 1.0
 DEFAULT_MAX_JUPITER_ERROR_RATIO = 0.2
 DEFAULT_MIN_READY_RATIO = 0.9
 DEFAULT_MAX_PROCESSING_LAG_SECONDS = 3.0
@@ -105,13 +107,63 @@ class Observation:
     status: dict[str, Any] = field(default_factory=dict)
 
 
+PEAK_METRICS = (
+    "event_notification_queue_depth",
+    "event_processing_queue_depth",
+    "ingestion_backlog_events",
+    "ingestion_oldest_event_age_seconds",
+)
+
+
+@dataclass
+class Window:
+    """Streaming summary of a soak: bounded memory however long it runs."""
+
+    first: Observation
+    last: Observation
+    samples: int = 1
+    ready_samples: int = 0
+    peaks: dict[str, float] = field(default_factory=dict)
+    lags: list[float] = field(default_factory=list)
+    reasons: set[str] = field(default_factory=set)
+
+    @classmethod
+    def starting_with(cls, observation: Observation) -> Window:
+        window = cls(first=observation, last=observation, samples=0)
+        window.add(observation)
+        return window
+
+    def add(self, observation: Observation) -> None:
+        if self.samples:
+            self.last = observation
+        self.samples += 1
+        self.ready_samples += 1 if observation.ready else 0
+        for name in PEAK_METRICS:
+            self.peaks[name] = max(
+                self.peaks.get(name, 0.0), metric_max(observation.metrics, name)
+            )
+        lag = observation.status.get("stream_processing_lag_seconds")
+        if isinstance(lag, (int, float)):
+            self.lags.append(float(lag))
+        self.reasons.update(
+            str(reason) for reason in observation.status.get("entry_block_reasons") or []
+        )
+
+
+def window_of(observations: list[Observation]) -> Window:
+    window = Window.starting_with(observations[0])
+    for observation in observations[1:]:
+        window.add(observation)
+    return window
+
+
 @dataclass
 class Thresholds:
     max_notification_queue: float = DEFAULT_MAX_NOTIFICATION_QUEUE
     max_processing_queue: float = DEFAULT_MAX_PROCESSING_QUEUE
     max_stage_backlog: float = DEFAULT_MAX_STAGE_BACKLOG
     max_oldest_event_age_seconds: float = DEFAULT_MAX_OLDEST_EVENT_AGE_SECONDS
-    max_reconnects: float = DEFAULT_MAX_RECONNECTS
+    max_reconnects_per_hour: float = DEFAULT_MAX_RECONNECTS_PER_HOUR
     max_jupiter_error_ratio: float = DEFAULT_MAX_JUPITER_ERROR_RATIO
     min_ready_ratio: float = DEFAULT_MIN_READY_RATIO
     max_processing_lag_seconds: float = DEFAULT_MAX_PROCESSING_LAG_SECONDS
@@ -122,39 +174,31 @@ def _criterion(name: str, passed: bool, actual: Any, expected: str) -> dict[str,
     return {"name": name, "passed": bool(passed), "actual": actual, "expected": expected}
 
 
-def evaluate(observations: list[Observation], thresholds: Thresholds) -> dict[str, Any]:
-    if len(observations) < 2:
+def evaluate(window: Window, thresholds: Thresholds) -> dict[str, Any]:
+    if window.samples < 2:
         raise ValueError("at least two observations are required")
-    first, last = observations[0].metrics, observations[-1].metrics
+    first, last = window.first.metrics, window.last.metrics
+    hours = max(0.0, window.last.at - window.first.at) / 3600
 
     def delta(name: str, predicate: Callable[[dict[str, str]], bool] | None = None) -> float:
         return metric_sum(last, name, predicate) - metric_sum(first, name, predicate)
 
     def peak(name: str) -> float:
-        return max(metric_max(item.metrics, name) for item in observations)
+        return window.peaks.get(name, 0.0)
 
     jupiter_ok = delta("jupiter_requests_total", lambda labels: labels.get("status") == "ok")
     jupiter_all = delta("jupiter_requests_total")
     jupiter_errors = jupiter_all - jupiter_ok
     error_ratio = jupiter_errors / jupiter_all if jupiter_all else 0.0
-    ready_ratio = sum(1 for item in observations if item.ready) / len(observations)
-    lags = [
-        float(item.status["stream_processing_lag_seconds"])
-        for item in observations
-        if isinstance(item.status.get("stream_processing_lag_seconds"), (int, float))
-    ]
-    lag_p95 = sorted(lags)[max(0, (len(lags) * 95 + 99) // 100 - 1)] if lags else None
-    reasons = sorted(
-        {
-            str(reason)
-            for item in observations
-            for reason in item.status.get("entry_block_reasons") or []
-        }
-    )
+    ready_ratio = window.ready_samples / window.samples
+    lags = sorted(window.lags)
+    lag_p95 = lags[max(0, (len(lags) * 95 + 99) // 100 - 1)] if lags else None
+    reasons = sorted(window.reasons)
     protocol_blocks = [reason for reason in reasons if reason.startswith("protocol:")]
     candidates_created = delta("candidate_rejections_total") + metric_sum(
         last, "candidate_count"
     )
+    allowed_reconnects = max(1.0, thresholds.max_reconnects_per_hour * hours)
 
     criteria = [
         _criterion(
@@ -190,9 +234,9 @@ def evaluate(observations: list[Observation], thresholds: Thresholds) -> dict[st
         ),
         _criterion(
             "no_reconnect_churn",
-            delta("websocket_reconnects_total") <= thresholds.max_reconnects,
+            delta("websocket_reconnects_total") <= allowed_reconnects,
             delta("websocket_reconnects_total"),
-            f"<= {thresholds.max_reconnects:g} during the window",
+            f"<= {allowed_reconnects:.0f} ({thresholds.max_reconnects_per_hour:g} per hour)",
         ),
         _criterion(
             "no_open_recovery_gap",
@@ -229,8 +273,8 @@ def evaluate(observations: list[Observation], thresholds: Thresholds) -> dict[st
         ),
         _criterion(
             "runtime_ready",
-            ready_ratio >= thresholds.min_ready_ratio and observations[-1].ready,
-            {"ready_ratio": round(ready_ratio, 4), "ready_now": observations[-1].ready},
+            ready_ratio >= thresholds.min_ready_ratio and window.last.ready,
+            {"ready_ratio": round(ready_ratio, 4), "ready_now": window.last.ready},
             f">= {thresholds.min_ready_ratio:g} of samples and ready at the end",
         ),
     ]
@@ -252,11 +296,15 @@ def evaluate(observations: list[Observation], thresholds: Thresholds) -> dict[st
             )
         )
     return {
-        "window_seconds": round(observations[-1].at - observations[0].at, 1),
-        "samples": len(observations),
+        "window_seconds": round(window.last.at - window.first.at, 1),
+        "samples": window.samples,
         "entry_block_reasons_seen": reasons,
         "filtered_before_ingest": delta("chain_events_filtered_before_ingest_total"),
         "paper_orders": delta("paper_orders_total"),
+        # Informational: the vendored IDL is behind the programs. Neither
+        # blocks trading; update the IDL between collection windows.
+        "unknown_event_types": delta("protocol_unknown_events_total"),
+        "appended_layout_events": delta("protocol_layout_appended_events_total"),
         "criteria": criteria,
         "passed": all(item["passed"] for item in criteria),
     }
@@ -306,22 +354,28 @@ def main(argv: list[str] | None = None) -> int:
 
     thresholds = Thresholds(require_candidates=not args.no_candidates)
     started = datetime.now(tz=timezone.utc)
-    observations: list[Observation] = []
+    window: Window | None = None
     deadline = time.monotonic() + args.duration
     errors: list[str] = []
     while True:
         try:
-            observations.append(observe(args.base_url))
+            observation = observe(args.base_url)
         except (OSError, ValueError) as error:
-            errors.append(f"{type(error).__name__}: {error}")
+            if len(errors) < 20:
+                errors.append(f"{type(error).__name__}: {error}")
+        else:
+            if window is None:
+                window = Window.starting_with(observation)
+            else:
+                window.add(observation)
         if time.monotonic() >= deadline:
             break
         time.sleep(min(args.interval, max(0.0, deadline - time.monotonic())))
 
-    if len(observations) < 2:
+    if window is None or window.samples < 2:
         result: dict[str, Any] = {"passed": False, "criteria": [], "errors": errors}
     else:
-        result = evaluate(observations, thresholds)
+        result = evaluate(window, thresholds)
         if errors:
             result["errors"] = errors
             result["passed"] = False

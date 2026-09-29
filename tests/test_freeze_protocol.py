@@ -63,7 +63,7 @@ def test_protocol_freezes_three_dates_cost_and_the_exact_cohort() -> None:
     assert protocol.daily_operational_cost_usd == Decimal("0.5")
     assert protocol.minimum_negative_launches == 300
     assert protocol.minimum_oos_trades == 100
-    assert protocol.maximum_equity_mark_gap_seconds == 300
+    assert protocol.maximum_equity_mark_gap_seconds == 600
     assert protocol.time_zone == "Europe/Kyiv"
     assert StatisticalProtocol.model_validate_json(render(protocol)) == protocol
 
@@ -77,6 +77,8 @@ def test_protocol_freezes_three_dates_cost_and_the_exact_cohort() -> None:
         ({"reporting": {"monthly_infrastructure_cost_usd": "0"}}, {}, "monthly_infrastructure_cost_usd"),
         ({}, {"frozen_at": START - timedelta(minutes=5)}, "before collection starts"),
         ({}, {"oos_day": 30}, "OOS boundary"),
+        ({}, {"maximum_equity_mark_gap_seconds": 60}, "equity mark gap"),
+        ({}, {"maximum_equity_mark_gap_seconds": 7200}, "equity mark gap"),
     ],
 )
 def test_protocol_refuses_an_unsound_freeze(
@@ -178,3 +180,32 @@ def test_collection_progress_reports_the_sample_against_its_targets() -> None:
     assert summary["closed_trades_target"] == 300
     assert summary["pools_without_outcome_yet"] == 2
     assert summary["oos_equity_marks"] == 1
+
+
+def test_equity_gap_follows_the_holding_limit_unless_overridden() -> None:
+    config = _config()
+    assert config.exits.maximum_holding_seconds == 600
+
+    override = build_protocol(
+        config,
+        start=START,
+        days=30,
+        oos_day=15,
+        frozen_at=FROZEN,
+        maximum_equity_mark_gap_seconds=900,
+    )
+
+    assert override.maximum_equity_mark_gap_seconds == 900
+
+
+def test_freeze_refuses_the_calibration_config() -> None:
+    with pytest.raises(ValueError, match="configs/default.yaml"):
+        main(
+            [
+                "freeze",
+                "--collection-start",
+                (datetime.now(tz=timezone.utc) + timedelta(hours=2)).isoformat(),
+                "--config",
+                "configs/calibration.yaml",
+            ]
+        )

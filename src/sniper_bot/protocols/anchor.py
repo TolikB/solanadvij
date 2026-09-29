@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,10 @@ class AnchorLogScan:
 
     events: list[AnchorEvent]
     timestamp: int | None
-    skipped_unknown_discriminators: int = 0
+    # Discriminators the vendored IDL does not know, in first-seen order.
+    unknown_discriminators: tuple[bytes, ...] = ()
+    # Selected events that carried bytes beyond every field the IDL declares.
+    appended_events: tuple[str, ...] = ()
 
 
 class _Cursor:
@@ -87,17 +91,26 @@ class AnchorIdlDecoder:
         logs: list[str],
         *,
         event_names: frozenset[str] | None = None,
+        minimum_fields: Mapping[str, str] | None = None,
     ) -> AnchorLogScan:
         """Decode the selected own events and read the transaction timestamp.
 
         With ``event_names`` only those events are decoded and every other
         discriminator, including one the vendored IDL does not know, is
-        skipped after reading at most its fixed-offset timestamp. A selected
-        event whose layout does not match the IDL still fails closed.
+        skipped after reading at most its fixed-offset timestamp.
+
+        ``minimum_fields`` names, per event, the last field of the oldest
+        layout still accepted. Such an event must decode at least through that
+        field; later fields are decoded while bytes remain and the payload ends
+        on a field boundary, and bytes beyond every declared field are reported
+        in ``appended_events`` instead of failing, because programs extend
+        events by appending fields. Anything else that does not fit the IDL
+        still fails closed.
         """
         decoded: list[AnchorEvent] = []
         timestamp: int | None = None
-        skipped_unknown = 0
+        unknown: dict[bytes, None] = {}
+        appended: list[str] = []
         for log_index, encoded in self._own_event_lines(logs):
             if event_names is None:
                 payload = _b64decode(encoded)
@@ -110,7 +123,7 @@ class AnchorIdlDecoder:
             event_name = self._events.get(discriminator)
             if event_name is None:
                 if event_names is not None:
-                    skipped_unknown += 1
+                    unknown.setdefault(discriminator, None)
                     continue
                 raise UnknownDiscriminatorError(self.program_id, discriminator)
             if event_names is not None and event_name not in event_names:
@@ -118,7 +131,15 @@ class AnchorIdlDecoder:
                     timestamp = self._peek_timestamp(event_name, encoded)
                 continue
             payload = prefix if event_names is None else _b64decode(encoded)
-            fields = self._decode_struct(event_name, payload[8:])
+            minimum_field = (minimum_fields or {}).get(event_name)
+            if minimum_field is None:
+                fields = self._decode_struct(event_name, payload[8:])
+            else:
+                fields, trailing = self._decode_struct_from_minimum(
+                    event_name, payload[8:], minimum_field
+                )
+                if trailing:
+                    appended.append(event_name)
             if timestamp is None and type(fields.get("timestamp")) is int:
                 timestamp = int(fields["timestamp"])
             decoded.append(
@@ -127,8 +148,37 @@ class AnchorIdlDecoder:
         return AnchorLogScan(
             events=decoded,
             timestamp=timestamp,
-            skipped_unknown_discriminators=skipped_unknown,
+            unknown_discriminators=tuple(unknown),
+            appended_events=tuple(appended),
         )
+
+    def declared_fields(self, event_name: str) -> list[str]:
+        definition = self._types.get(event_name)
+        if definition is None or definition.get("kind") != "struct":
+            raise AnchorDecodeError(f"missing struct definition for Anchor event {event_name}")
+        return [str(item["name"]) for item in definition.get("fields", [])]
+
+    def _decode_struct_from_minimum(
+        self, type_name: str, payload: bytes, minimum_field: str
+    ) -> tuple[dict[str, Any], int]:
+        definition = self._types.get(type_name)
+        if definition is None or definition.get("kind") != "struct":
+            raise AnchorDecodeError(f"missing struct definition for Anchor event {type_name}")
+        cursor = _Cursor(payload)
+        fields: dict[str, Any] = {}
+        required = True
+        for item in definition.get("fields", []):
+            if not required and cursor.remaining == 0:
+                # An older deployed layout ends here.
+                break
+            fields[item["name"]] = self._decode_type(item["type"], cursor)
+            if item["name"] == minimum_field:
+                required = False
+        if required:
+            raise AnchorDecodeError(
+                f"Anchor event {type_name} does not declare minimum field {minimum_field}"
+            )
+        return fields, cursor.remaining
 
     def _own_event_lines(self, logs: list[str]) -> list[tuple[int, str]]:
         lines: list[tuple[int, str]] = []

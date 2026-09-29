@@ -18,6 +18,16 @@ services:
       context: .
       args:
         APP_REVISION: ${APP_REVISION:?APP_REVISION is required}
+    # The config file is chosen per run (configs/calibration.yaml only for the
+    # record-mode calibration soak); the image default stays configs/default.yaml.
+    command:
+      - sniper-bot
+      - --config
+      - ${CONFIG_PATH:-configs/default.yaml}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
     stop_grace_period: 180s
     environment:
       APP_MODE: ${APP_MODE:?APP_MODE is required}

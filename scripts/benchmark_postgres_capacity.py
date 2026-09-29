@@ -265,8 +265,10 @@ class NotificationGenerator:
         self._sequence += 1
         protocol_name, event_name = self._plan[index % len(self._plan)]
         pool_index = index % DISTINCT_POOLS
+        block_time = self._block_time + index // TARGET_NOTIFICATIONS_PER_SECOND
         overrides: dict[str, Any] = {
-            "timestamp": self._block_time,
+            # Programs stamp events with the slot's Clock, i.e. the block time.
+            "timestamp": block_time,
             "pool": _address(7, pool_index),
             "user": _address(9, index % 512),
             "creator": _address(9, index % 512),
@@ -297,9 +299,7 @@ class NotificationGenerator:
         payload = self._encoders[protocol_name].encode(event_name, overrides)
         transaction = {
             "slot": 400_000_000 + index,
-            "blockTime": (
-                self._block_time + index // TARGET_NOTIFICATIONS_PER_SECOND
-            ),
+            "blockTime": block_time,
             "signature": f"{BENCHMARK_SIGNATURE_PREFIX}{index:012d}",
             "meta": {
                 "logMessages": [

@@ -15,10 +15,12 @@ from ..pump.decoder import (
     _require_block_time,
     _resolve_block_time,
     _signature,
+    check_event_timestamps,
+    decoded_transaction,
 )
 
 PUMPSWAP_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
-ADAPTER_VERSION = "pumpswap-idl-9c82f61"
+ADAPTER_VERSION = "pumpswap-idl-cb188ce"
 
 _EVENT_TYPES = {
     "CreatePoolEvent": ChainEventType.POOL_CREATED,
@@ -28,6 +30,15 @@ _EVENT_TYPES = {
     "WithdrawEvent": ChainEventType.LIQUIDITY_REMOVED,
 }
 PUMPSWAP_EVENT_NAMES = frozenset(_EVENT_TYPES)
+# Last field of each consumed event as deployed at pump-public-docs 9c82f61;
+# fields appended since then decode when present.
+PUMPSWAP_MINIMUM_FIELDS = {
+    "CreatePoolEvent": "is_mayhem_mode",
+    "BuyEvent": "base_supply",
+    "SellEvent": "base_supply",
+    "DepositEvent": "user_pool_token_account",
+    "WithdrawEvent": "user_pool_token_account",
+}
 
 
 class PumpSwapDecoder:
@@ -60,11 +71,14 @@ class PumpSwapDecoder:
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
         scan = self._anchor.scan_logs(
-            list(_log_messages(transaction)), event_names=self._event_names
+            list(_log_messages(transaction)),
+            event_names=self._event_names,
+            minimum_fields=PUMPSWAP_MINIMUM_FIELDS,
         )
+        check_event_timestamps(transaction, scan)
         block_time = _resolve_block_time(transaction, scan.timestamp)
         if not scan.events:
-            return DecodedTransaction([], block_time, scan.skipped_unknown_discriminators)
+            return decoded_transaction([], block_time, scan)
         signature = _signature(transaction)
         slot = int(transaction.get("slot", 0))
         observed = observed_at or datetime.now(tz=timezone.utc)
@@ -94,4 +108,4 @@ class PumpSwapDecoder:
                     payload=fields,
                 )
             )
-        return DecodedTransaction(result, block_time, scan.skipped_unknown_discriminators)
+        return decoded_transaction(result, block_time, scan)

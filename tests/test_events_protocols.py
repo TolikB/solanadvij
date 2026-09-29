@@ -103,7 +103,7 @@ def test_selective_decoding_reports_unknown_discriminator_instead_of_raising() -
     decoded = PumpDecoder().decode(_complete_event_transaction(bytes([255]) * 8))
 
     assert decoded.events == []
-    assert decoded.unknown_discriminators == 1
+    assert decoded.unknown_discriminators == ('ffffffffffffffff',)
 
 
 def _trade_event_payload(timestamp: int) -> bytes:
@@ -344,3 +344,67 @@ async def test_raw_event_recorder_holds_lock_until_cancelled_write_finishes(
             ),
             return_exceptions=True,
         )
+
+
+def test_minimum_layouts_name_real_prefix_fields_of_the_vendored_idl() -> None:
+    from sniper_bot.protocols.pump.decoder import PUMP_MINIMUM_FIELDS
+    from sniper_bot.protocols.pumpswap.decoder import PUMPSWAP_MINIMUM_FIELDS
+
+    for decoder, minimums in (
+        (PumpDecoder(), PUMP_MINIMUM_FIELDS),
+        (PumpSwapDecoder(), PUMPSWAP_MINIMUM_FIELDS),
+    ):
+        for event_name, last_field in minimums.items():
+            fields = decoder._anchor.declared_fields(event_name)
+            assert last_field in fields, (event_name, last_field)
+            assert "timestamp" in fields[: fields.index(last_field) + 1], event_name
+
+
+def _complete_with_payload_suffix(suffix: bytes, *, block_time: int = 1_776_700_000) -> dict:
+    transaction = _complete_event_transaction()
+    transaction["blockTime"] = block_time
+    line = transaction["meta"]["logMessages"][1]
+    payload = base64.b64decode(line.removeprefix("Program data: ")) + suffix
+    transaction["meta"]["logMessages"][1] = f"Program data: {base64.b64encode(payload).decode()}"
+    return transaction
+
+
+def test_trailing_bytes_after_every_declared_field_are_reported_not_rejected() -> None:
+    decoded = PumpDecoder().decode(_complete_with_payload_suffix(bytes([7, 7, 7])))
+
+    assert [event.event_type for event in decoded.events] == [
+        ChainEventType.BONDING_CURVE_COMPLETED
+    ]
+    assert decoded.appended_events == ("CompleteEvent",)
+
+
+def test_strict_decoding_still_rejects_trailing_bytes() -> None:
+    transaction = _complete_with_payload_suffix(bytes([7]))
+    decoder = AnchorIdlDecoder(Path(pump_decoder_module.__file__).with_name("idl.json"))
+
+    with pytest.raises(AnchorDecodeError, match="trailing bytes"):
+        decoder.decode_logs(transaction["meta"]["logMessages"])
+
+
+@pytest.mark.parametrize("block_time", [1_776_700_000 + 3_600, 1_776_699_000])
+def test_event_clock_that_disagrees_with_the_block_time_fails_closed(block_time: int) -> None:
+    with pytest.raises(AnchorDecodeError, match="disagree"):
+        PumpDecoder().decode(_complete_with_payload_suffix(b"", block_time=block_time))
+
+
+def test_implausible_event_clock_fails_closed() -> None:
+    user, mint, curve, quote = (bytes([n]) * 32 for n in (1, 2, 3, 4))
+    payload = (
+        bytes([95, 114, 97, 156, 212, 46, 152, 8])
+        + user
+        + mint
+        + curve
+        + struct.pack("<q", -5)
+        + quote
+    )
+    transaction = _complete_event_transaction()
+    del transaction["blockTime"]
+    transaction["meta"]["logMessages"][1] = f"Program data: {base64.b64encode(payload).decode()}"
+
+    with pytest.raises(AnchorDecodeError, match="implausible"):
+        PumpDecoder().decode(transaction)

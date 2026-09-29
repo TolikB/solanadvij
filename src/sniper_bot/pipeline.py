@@ -80,6 +80,9 @@ INGEST_TRACKING_MARGIN = timedelta(seconds=60)
 # then leave the per-second evaluation set for good.
 TERMINAL_CANDIDATE_RETENTION = timedelta(hours=1)
 UNKNOWN_LAYOUT_ARCHIVE_INTERVAL_SECONDS = 60.0
+# New event types appear with routine program upgrades; remember a bounded
+# number of them so each is logged and archived once.
+MAX_REMEMBERED_UNKNOWN_EVENT_TYPES = 256
 MARKET_PRICE_FLAGS = frozenset(
     {
         "QUOTE_PRICE_UNAVAILABLE",
@@ -227,6 +230,8 @@ class ConfirmationPipeline:
         # address: (candidate id, last block time a pre-entry swap can matter).
         self._ingest_tracked_pools: dict[str, tuple[str, datetime]] = {}
         self._layout_archived_at: dict[Protocol, float] = {}
+        self._unknown_event_types_seen: set[tuple[Protocol, str]] = set()
+        self._appended_layouts_seen: set[tuple[Protocol, str]] = set()
         self._security_results: dict[str, tuple[SecurityContext, SecurityResult]] = {}
         self._scores: dict[str, ScoreBreakdown] = {}
         self._persisted_score_totals: dict[str, Decimal] = {}
@@ -636,9 +641,11 @@ class ConfirmationPipeline:
                 )
                 continue
             if decoded.unknown_discriminators:
-                await self._quarantine_layout(
-                    protocol, transaction, source, kind="unknown_discriminator"
+                await self._note_unknown_event_types(
+                    protocol, decoded.unknown_discriminators, transaction, source
                 )
+            if decoded.appended_events:
+                self._note_appended_layouts(protocol, decoded.appended_events)
             if decoded.block_time is not None and transaction.get("blockTime") is None:
                 # Streaming notifications carry no block time; hand the
                 # program's Clock timestamp back for stream freshness.
@@ -697,6 +704,57 @@ class ConfirmationPipeline:
             extra={"protocol": protocol.value, "kind": kind},
         )
         await self._record_unknown(protocol, transaction, source)
+
+    async def _note_unknown_event_types(
+        self,
+        protocol: Protocol,
+        discriminators: tuple[str, ...],
+        transaction: dict[str, Any],
+        source: EventSource,
+    ) -> None:
+        """Count event types the vendored IDL does not know, without blocking.
+
+        An Anchor discriminator is the hash of the event name and each event
+        sits in its own log line, so a new event type cannot change how the
+        consumed events decode. Blocking on it would halt a collection window
+        at every routine program upgrade; each new type is archived once so
+        the IDL can be updated between windows.
+        """
+        self.metrics.protocol_unknown_events.labels(protocol=protocol.value).inc(
+            len(discriminators)
+        )
+        for discriminator in discriminators:
+            key = (protocol, discriminator)
+            if (
+                key in self._unknown_event_types_seen
+                or len(self._unknown_event_types_seen) >= MAX_REMEMBERED_UNKNOWN_EVENT_TYPES
+            ):
+                continue
+            self._unknown_event_types_seen.add(key)
+            logger.warning(
+                "unknown Anchor event type ignored; vendored IDL is behind the program",
+                extra={"protocol": protocol.value, "discriminator": discriminator},
+            )
+            await self._record_unknown(
+                protocol, transaction, source, reason="UNKNOWN_EVENT_TYPE"
+            )
+
+    def _note_appended_layouts(
+        self, protocol: Protocol, event_names: tuple[str, ...]
+    ) -> None:
+        for event_name in event_names:
+            self.metrics.protocol_layout_appended_events.labels(
+                protocol=protocol.value, event=event_name
+            ).inc()
+            key = (protocol, event_name)
+            if key in self._appended_layouts_seen:
+                continue
+            self._appended_layouts_seen.add(key)
+            logger.warning(
+                "Anchor event carries fields appended after the vendored IDL; "
+                "known fields decoded",
+                extra={"protocol": protocol.value, "event": event_name},
+            )
 
     def _admit_for_ingest(self, event: EventEnvelope) -> bool:
         """Keep only events that can still change live state.
@@ -1486,6 +1544,8 @@ class ConfirmationPipeline:
         protocol: Protocol,
         transaction: dict[str, Any],
         source: EventSource,
+        *,
+        reason: str = "UNKNOWN_PROTOCOL_LAYOUT",
     ) -> None:
         signature = str(transaction.get("signature") or "missing-signature")
         signatures = transaction.get("transaction", {}).get("signatures") or []
@@ -1507,7 +1567,7 @@ class ConfirmationPipeline:
             inner_instruction_index=-1,
             block_time=block_time,
             observed_at=datetime.now(tz=timezone.utc),
-            payload={"transaction": transaction, "reason": "UNKNOWN_PROTOCOL_LAYOUT"},
+            payload={"transaction": transaction, "reason": reason},
         )
         await self.recorder.record(event)
 
