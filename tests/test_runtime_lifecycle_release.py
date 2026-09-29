@@ -50,6 +50,7 @@ def _startup_database() -> SimpleNamespace:
         load_wallet_analysis=AsyncMock(return_value=([], [])),
         load_active_candidates=AsyncMock(return_value=[]),
         load_candidate_score_totals=AsyncMock(return_value={}),
+        load_open_shadow_positions=AsyncMock(return_value=[]),
         load_processed_pool_creation_events=AsyncMock(return_value=[]),
         load_quarantined_event_protocols=AsyncMock(return_value=[]),
         load_processed_events_since=AsyncMock(return_value=[]),

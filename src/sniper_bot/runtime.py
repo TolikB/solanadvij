@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional, TypeVar
+from uuid import uuid4
 
 from .broker import FillReference, PaperBroker
 from .candidates import Candidate, CandidateState
@@ -59,6 +60,7 @@ from .security import (
     SecurityContext,
     aggregate_holders,
 )
+from .shadow import SHADOW_BLOCK_REASONS, ShadowBook, ShadowEntry
 from .sizing import PositionSizingInput, SizingRejectReason, calculate_position_size
 from .solana_rpc import SolanaRpcClient
 from .stream import EntryGate, HeliusStreamGateway
@@ -224,6 +226,19 @@ class SniperRuntime:
             record_raw=not config.replay_mode,
             config=config,
         )
+        self.shadow: ShadowBook | None = None
+        if config.app_mode == AppMode.PAPER:
+            self.shadow = ShadowBook(
+                config=config,
+                quote_provider=self.quote_provider,
+                database=lambda: self.database,
+                id_factory=id_factory or (lambda: str(uuid4())),
+                pool_evidence=self._pool_evidence,
+                reserve_mark=self._reserve_mark_usd,
+                on_hold=self.pipeline.hold_pool,
+                on_release=self.pipeline.release_pool,
+                metrics=self.metrics,
+            )
         now = datetime.now(tz=timezone.utc)
         self.pipeline.pools.set_quote_price(
             QuoteAssetPrice(mint=USDC_MINT, price_usd=Decimal("1"), observed_at=now)
@@ -328,6 +343,9 @@ class SniperRuntime:
                         ],
                     )
                 )
+                shadow_pools = (
+                    set(await self.shadow.restore()) if self.shadow is not None else set()
+                )
                 tracked_pool_addresses = {
                     candidate.pool_address
                     for candidate in restored_candidates
@@ -336,7 +354,7 @@ class SniperRuntime:
                         CandidateState.CLOSED,
                         CandidateState.REJECTED,
                     }
-                }
+                } | shadow_pools
                 pool_bootstrap_events = (
                     await self.database.load_processed_pool_creation_events(
                         tracked_pool_addresses
@@ -440,6 +458,7 @@ class SniperRuntime:
         self._background_tasks = [
             asyncio.create_task(self._candidate_loop(), name="candidate-loop"),
             asyncio.create_task(self._exit_loop(), name="exit-loop"),
+            asyncio.create_task(self._shadow_exit_loop(), name="shadow-exit-loop"),
             asyncio.create_task(self._freshness_loop(), name="freshness-loop"),
             asyncio.create_task(self._quote_asset_loop(), name="quote-asset-loop"),
             asyncio.create_task(self._enrichment_loop(), name="enrichment-loop"),
@@ -673,6 +692,8 @@ class SniperRuntime:
             execution.update(summary["execution_quality"])
             report["execution_quality"] = execution
             report["exit_reasons"] = summary["exit_reasons"]
+            report["shadow"] = summary.get("shadow")
+            report["failed_entries"] = summary.get("failed_entries", 0)
             report["rejections"] = summary["rejections"]
             report["open_positions"] = summary["open_positions"]
             capital_value = report.get("capital")
@@ -959,6 +980,109 @@ class SniperRuntime:
         except OSError:
             logger.warning("mark comparison log unavailable", exc_info=True)
 
+    def _size_entry(
+        self, security: SecurityContext, score: ScoreBreakdown, *, fresh_day: bool
+    ) -> Any:
+        account = self.ledger.snapshot()
+        return calculate_position_size(
+            PositionSizingInput(
+                current_equity_usd=Decimal(str(account["equity_usd"])),
+                # A shadow trade sizes as on a fresh day: the signal is what it
+                # measures, not what the account has left to risk today.
+                daily_pnl_usd=(
+                    Decimal("0")
+                    if fresh_day
+                    else self.ledger.daily_pnl(self.ledger.current_date_key())
+                ),
+                quote_liquidity_usd=security.quote_liquidity_usd,
+                estimated_round_trip_cost_pct=security.execution.round_trip_loss_pct,
+                score=score.total_score,
+                hard_stop_pct=self.config.risk.hard_stop_pct,
+                adverse_execution_buffer_pct=self.config.risk.adverse_execution_buffer_pct,
+                daily_loss_limit_usd=self.config.risk.daily_loss_limit_usdc,
+                maximum_position_usd=self.config.risk.max_position_usdc,
+                minimum_position_usd=self.config.risk.min_position_usdc,
+                risk_per_trade_pct=self.config.risk.risk_per_trade_pct,
+                maximum_position_equity_pct=self.config.risk.max_position_equity_pct,
+                maximum_position_to_liquidity_pct=(
+                    self.config.liquidity.max_position_to_quote_liquidity_pct
+                ),
+            )
+        )
+
+    async def _open_shadow(
+        self,
+        candidate: Candidate,
+        security: SecurityContext,
+        score: ScoreBreakdown,
+        reference: FillReference | None,
+        *,
+        block_reason: str,
+    ) -> None:
+        """Take a risk-blocked entry in the shadow book (signal sample)."""
+        if self.shadow is None:
+            return
+        sizing = self._size_entry(security, score, fresh_day=True)
+        if not sizing.allowed:
+            return
+        try:
+            await self.shadow.open(
+                ShadowEntry(
+                    candidate_id=candidate.candidate_id,
+                    mint=candidate.mint,
+                    pool_address=candidate.pool_address,
+                    size_usd=sizing.position_size_usd,
+                    block_reason=block_reason,
+                    tokens_per_usd=reference.tokens_per_usd if reference else None,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "shadow entry failed", extra={"candidate_id": candidate.candidate_id}
+            )
+
+    async def evaluate_shadow_exits(self, *, now: datetime | None = None) -> list[ExitDecision]:
+        if self.shadow is None:
+            return []
+        now = now or datetime.now(tz=timezone.utc)
+
+        def features(pool_address: str, at: datetime) -> FeatureSnapshot | None:
+            if not pool_address or self.pipeline.pools.pool(pool_address) is None:
+                return None
+            return self.pipeline.features.snapshot(pool_address, at)
+
+        def dev_sold(position: PositionRecord, at: datetime) -> bool:
+            token = self.pipeline.tokens.get(position.token_mint)
+            dev_wallet = token.creator_address if token else None
+            return bool(
+                dev_wallet
+                and position.pool_address
+                and any(
+                    trade.wallet == dev_wallet
+                    and trade.side.value == "sell"
+                    and trade.event_time >= position.opened_at
+                    for trade in self.pipeline.features.trades(position.pool_address, at=at)
+                )
+            )
+
+        return await self.shadow.evaluate_exits(
+            now, policy=self._exit_policy(), features=features, dev_sold=dev_sold
+        )
+
+    def _exit_policy(self) -> ExitPolicy:
+        return ExitPolicy(
+            tp1_return=self.config.exits.take_profit_1_pct,
+            tp1_size=self.config.exits.take_profit_1_size_pct,
+            tp2_return=self.config.exits.take_profit_2_pct,
+            tp2_size_of_initial=self.config.exits.take_profit_2_size_pct,
+            stop_loss_return=-abs(self.config.risk.hard_stop_pct),
+            trailing_stop_pct=self.config.exits.trailing_stop_pct,
+            max_hold_seconds=self.config.exits.maximum_holding_seconds,
+            no_new_high_seconds=self.config.exits.no_new_high_timeout_seconds,
+        )
+
     def _pool_evidence(self, pool_address: str) -> dict[str, str] | None:
         return pool_evidence(
             self.pipeline.pools.state(pool_address),
@@ -1003,6 +1127,18 @@ class SniperRuntime:
             except Exception:
                 logger.exception("candidate evaluation loop failed")
                 self.entry_gate.block("security_data_unavailable")
+            await asyncio.sleep(1)
+
+    async def _shadow_exit_loop(self) -> None:
+        # Separate from the account's exit loop: a shadow sell's execution
+        # delay must never hold up a real position's stop.
+        while True:
+            try:
+                await self.evaluate_shadow_exits()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("shadow exit loop failed")
             await asyncio.sleep(1)
 
     async def _exit_loop(self) -> None:
@@ -1382,32 +1518,30 @@ class SniperRuntime:
     ) -> RejectReason | None:
         if self.broker is None:
             return RejectReason.RISK_MANAGER_BLOCKED
-        account = self.ledger.snapshot()
-        sizing = calculate_position_size(
-            PositionSizingInput(
-                current_equity_usd=Decimal(str(account["equity_usd"])),
-                daily_pnl_usd=self.ledger.daily_pnl(self.ledger.current_date_key()),
-                quote_liquidity_usd=security.quote_liquidity_usd,
-                estimated_round_trip_cost_pct=security.execution.round_trip_loss_pct,
-                score=score.total_score,
-                hard_stop_pct=self.config.risk.hard_stop_pct,
-                adverse_execution_buffer_pct=self.config.risk.adverse_execution_buffer_pct,
-                daily_loss_limit_usd=self.config.risk.daily_loss_limit_usdc,
-                maximum_position_usd=self.config.risk.max_position_usdc,
-                minimum_position_usd=self.config.risk.min_position_usdc,
-                risk_per_trade_pct=self.config.risk.risk_per_trade_pct,
-                maximum_position_equity_pct=self.config.risk.max_position_equity_pct,
-                maximum_position_to_liquidity_pct=(
-                    self.config.liquidity.max_position_to_quote_liquidity_pct
-                ),
+        sizing = self._size_entry(security, score, fresh_day=False)
+        inputs = self._security_inputs.get(candidate.candidate_id)
+        reference = (
+            FillReference(
+                tokens_per_usd=inputs.round_trip.buy.out_amount
+                / inputs.round_trip.starting_usd,
+                quoted_at=inputs.round_trip.buy.received_at,
             )
+            if inputs is not None and inputs.round_trip.starting_usd > 0
+            else None
         )
         if not sizing.allowed:
             if sizing.reject_reason == SizingRejectReason.POSITION_TOO_SMALL_AFTER_COSTS:
                 return RejectReason.POSITION_TOO_SMALL_AFTER_COSTS
+            await self._open_shadow(
+                candidate, security, score, reference, block_reason="NO_DAILY_RISK_BUDGET"
+            )
             return RejectReason.DAILY_RISK_LIMIT
         risk = self.risk_manager.evaluate_entry(sizing.position_size_usd, candidate.mint)
         if risk.decision.value != "allow":
+            if risk.reason in SHADOW_BLOCK_REASONS:
+                await self._open_shadow(
+                    candidate, security, score, reference, block_reason=str(risk.reason)
+                )
             if self.database is not None and self.database_available:
                 await self.database.persist_risk_state(
                     account_id="paper-main",
@@ -1421,16 +1555,6 @@ class SniperRuntime:
             if risk.reason == "DAILY_LOSS_LIMIT":
                 return RejectReason.DAILY_RISK_LIMIT
             return RejectReason.RISK_MANAGER_BLOCKED
-        inputs = self._security_inputs.get(candidate.candidate_id)
-        reference = (
-            FillReference(
-                tokens_per_usd=inputs.round_trip.buy.out_amount
-                / inputs.round_trip.starting_usd,
-                quoted_at=inputs.round_trip.buy.received_at,
-            )
-            if inputs is not None and inputs.round_trip.starting_usd > 0
-            else None
-        )
         try:
             await self.broker.open(
                 candidate.mint,
@@ -1455,6 +1579,9 @@ class SniperRuntime:
             # A limit reached between the check above and the atomic commit
             # (e.g. another entry filled meanwhile) rejects this candidate
             # instead of aborting the whole evaluation pass.
+            await self._open_shadow(
+                candidate, security, score, reference, block_reason="ATOMIC_RISK_LIMIT"
+            )
             return RejectReason.RISK_MANAGER_BLOCKED
         self.metrics.paper_orders.labels(status="filled").inc()
         self._sync_paper_metrics()
@@ -1471,16 +1598,7 @@ class SniperRuntime:
             return []
 
         now = now or datetime.now(tz=timezone.utc)
-        policy = policy or ExitPolicy(
-            tp1_return=self.config.exits.take_profit_1_pct,
-            tp1_size=self.config.exits.take_profit_1_size_pct,
-            tp2_return=self.config.exits.take_profit_2_pct,
-            tp2_size_of_initial=self.config.exits.take_profit_2_size_pct,
-            stop_loss_return=-abs(self.config.risk.hard_stop_pct),
-            trailing_stop_pct=self.config.exits.trailing_stop_pct,
-            max_hold_seconds=self.config.exits.maximum_holding_seconds,
-            no_new_high_seconds=self.config.exits.no_new_high_timeout_seconds,
-        )
+        policy = policy or self._exit_policy()
         decisions: list[ExitDecision] = []
         positions = list(self.ledger.open_positions)
         close_limit = max_positions if max_positions is not None else len(positions)

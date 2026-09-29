@@ -400,6 +400,55 @@ class PaperFillRow(Base):
     evidence_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
 
 
+class ShadowPositionRow(Base):
+    """A risk-blocked entry simulated outside the account (signal sample)."""
+
+    __tablename__ = "shadow_positions"
+    __table_args__ = (Index("ix_shadow_positions_status_opened", "status", "opened_at"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    candidate_id: Mapped[str] = mapped_column(ForeignKey("candidates.id"), nullable=False, index=True)
+    mint: Mapped[str] = mapped_column(String(64), nullable=False)
+    pool_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_version_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_versions.id"), nullable=False
+    )
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    block_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notional_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    entry_fee_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    entry_cost_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    entry_token_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    remaining_token_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    remaining_cost_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    realized_pnl_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    highest_executable_value: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    last_new_high_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tp1_taken: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    tp2_taken: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    exit_reason: Mapped[str | None] = mapped_column(String(64))
+    adverse_fill_bps: Mapped[int] = mapped_column(Integer, nullable=False)
+    evidence_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ShadowFillRow(Base):
+    __tablename__ = "shadow_fills"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    position_id: Mapped[str] = mapped_column(
+        ForeignKey("shadow_positions.id"), nullable=False, index=True
+    )
+    token_amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    gross_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    network_fee_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    realized_pnl_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    exit_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
 class PaperPositionRow(Base):
     __tablename__ = "paper_positions"
     __table_args__ = (

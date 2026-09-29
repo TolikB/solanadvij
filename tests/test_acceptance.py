@@ -63,7 +63,7 @@ OPERATIONAL_COST_RECEIPT_SHA256 = hashlib.sha256(
 
 def _protocol() -> StatisticalProtocol:
     return StatisticalProtocol(
-        schema_version=3,
+        schema_version=4,
         revision=REVISION,
         strategy_version_id="strategy-v1",
         config_hash=CONFIG_HASH,
@@ -76,6 +76,8 @@ def _protocol() -> StatisticalProtocol:
         maximum_equity_mark_gap_seconds=3600,
         daily_operational_cost_usd=Decimal("0.10"),
         negative_launch_definition="distinct_rejected_pumpswap_pool",
+        signal_sample_definition="account_and_risk_blocked_shadow_trades",
+        risk_unit_pct=Decimal("0.15"),
     )
 
 
@@ -91,6 +93,7 @@ def _passing_inputs(protocol: StatisticalProtocol) -> StatisticalInputs:
                 pnl_usd=Decimal("0"),
                 developer_cluster=f"cluster-{index % 10}",
                 cluster_evaluated=True,
+                cost_usd=Decimal("10"),
             )
         )
     for index in range(150):
@@ -103,6 +106,7 @@ def _passing_inputs(protocol: StatisticalProtocol) -> StatisticalInputs:
                 pnl_usd=Decimal("2") if index % 3 else Decimal("-1"),
                 developer_cluster=f"cluster-{index % 10}",
                 cluster_evaluated=True,
+                cost_usd=Decimal("10"),
             )
         )
     hours = int((protocol.collection_ended_at - protocol.oos_started_at).total_seconds() // 3600)

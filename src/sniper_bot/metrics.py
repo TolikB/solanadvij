@@ -44,6 +44,12 @@ class BotMetrics:
             ["protocol", "event"],
             registry=self.registry,
         )
+        self.shadow_trades = Counter(
+            "shadow_trades_total",
+            "Risk-blocked entries simulated in the shadow book, by lifecycle event",
+            ["status"],
+            registry=self.registry,
+        )
         self.security_input_requests = Counter(
             "security_input_requests_total",
             "Candidate security reads by source and outcome",

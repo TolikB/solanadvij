@@ -271,6 +271,9 @@ class ConfirmationPipeline:
         self._persisted_score_totals: dict[str, Decimal] = {}
         self._last_memory_sweep_at: datetime | None = None
         self._candidate_persisted_at: dict[str, datetime] = {}
+        # Pools of open shadow trades: their activity keeps reaching live
+        # state after the candidate itself was rejected.
+        self._held_pools: set[str] = set()
         self._state_poisoned = False
         self._durable_queue: asyncio.Queue[_StageBatch | None] = (
             asyncio.Queue(maxsize=128)
@@ -792,6 +795,22 @@ class ConfirmationPipeline:
                 extra={"protocol": protocol.value, "event": event_name},
             )
 
+    def hold_pool(self, pool_address: str) -> None:
+        self._held_pools.add(pool_address)
+
+    def release_pool(self, pool_address: str) -> None:
+        self._held_pools.discard(pool_address)
+
+    def _live_pools_and_mints(self) -> tuple[set[str], set[str]]:
+        pools = {candidate.pool_address for candidate in self.candidates.values()}
+        mints = {candidate.mint for candidate in self.candidates.values()}
+        for pool_address in self._held_pools:
+            pools.add(pool_address)
+            record = self.pools.pool(pool_address)
+            if record is not None:
+                mints.add(record.base_mint)
+        return pools, mints
+
     def _admit_for_ingest(self, event: EventEnvelope) -> bool:
         """Keep only events that can still change live state.
 
@@ -803,6 +822,8 @@ class ConfirmationPipeline:
             self._track_new_pool(event)
             return True
         if event.event_type not in POOL_ACTIVITY_EVENT_TYPES:
+            return True
+        if event.pool_address in self._held_pools:
             return True
         tracked = (
             self._ingest_tracked_pools.get(event.pool_address)
@@ -983,6 +1004,8 @@ class ConfirmationPipeline:
         pool = self.pools.pool(event.pool_address)
         if pool is None:
             return "unknown_pool"
+        if event.pool_address in self._held_pools:
+            return None
         candidate = self.candidates.get(
             _candidate_id(pool.base_mint, pool.pool_address, self.strategy_version)
         )
@@ -1354,8 +1377,7 @@ class ConfirmationPipeline:
                 self._candidate_persisted_at.pop(candidate_id, None)
                 forgotten.append(candidate)
         if forgotten:
-            live_pools = {candidate.pool_address for candidate in self.candidates.values()}
-            live_mints = {candidate.mint for candidate in self.candidates.values()}
+            live_pools, live_mints = self._live_pools_and_mints()
             for candidate in forgotten:
                 if candidate.pool_address not in live_pools:
                     self.pools.forget(candidate.pool_address)
@@ -1372,8 +1394,7 @@ class ConfirmationPipeline:
     def sweep_memory(self, at: datetime) -> None:
         """Release tokens and pools that no candidate can still need."""
         self._last_memory_sweep_at = at
-        live_pools = {candidate.pool_address for candidate in self.candidates.values()}
-        live_mints = {candidate.mint for candidate in self.candidates.values()}
+        live_pools, live_mints = self._live_pools_and_mints()
         for pool_address in self.pools.sweep(at - POOL_MEMORY_RETENTION, keep=live_pools):
             self.features.forget_pool(pool_address)
         self.tokens.sweep(at - TOKEN_MEMORY_RETENTION, keep=live_mints)

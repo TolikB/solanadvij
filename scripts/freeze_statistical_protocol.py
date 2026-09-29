@@ -127,7 +127,7 @@ def build_protocol(
             "included cost before the config hash is frozen"
         )
     return StatisticalProtocol(
-        schema_version=3,
+        schema_version=4,
         revision=config.release_revision,
         strategy_version_id=config.strategy_version,
         config_hash=config.config_hash,
@@ -141,6 +141,9 @@ def build_protocol(
         # Same daily allocation the reports use for infrastructure costs.
         daily_operational_cost_usd=monthly / Decimal("30"),
         negative_launch_definition="distinct_rejected_pumpswap_pool",
+        signal_sample_definition="account_and_risk_blocked_shadow_trades",
+        # One R is the planned loss at the hard stop.
+        risk_unit_pct=config.risk.hard_stop_pct,
         time_zone=config.time_zone,
     )
 

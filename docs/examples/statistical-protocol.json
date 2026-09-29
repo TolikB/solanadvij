@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "revision": "0000000000000000000000000000000000000000",
   "strategy_version_id": "REPLACE_BEFORE_COLLECTION",
   "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -9,8 +9,10 @@
   "collection_ended_at": "2026-10-31T00:00:00Z",
   "minimum_negative_launches": 300,
   "minimum_oos_trades": 100,
-  "maximum_equity_mark_gap_seconds": 300,
+  "maximum_equity_mark_gap_seconds": 600,
   "daily_operational_cost_usd": "0.5",
   "negative_launch_definition": "distinct_rejected_pumpswap_pool",
+  "signal_sample_definition": "account_and_risk_blocked_shadow_trades",
+  "risk_unit_pct": "0.15",
   "time_zone": "Europe/Kyiv"
 }

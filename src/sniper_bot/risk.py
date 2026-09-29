@@ -10,7 +10,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from .errors import ExecutionBlockedError
-from .models import FillRecord, FillType, PositionRecord
+from .models import FillRecord, FillType, PositionRecord, PositionStatus
 
 
 class RiskDecision(StrEnum):
@@ -144,15 +144,29 @@ class RiskManager:
         )
 
     def consecutive_losses(self) -> int:
+        """Losing streak counted per closed position, newest first.
+
+        A position that took a profitable TP1 and then closed the rest below
+        entry is one trade with its net result, not a win and a loss.
+        """
         if not hasattr(self._ledger, "iter_fills"):
             return 0
-        fills = self._ledger.iter_fills()
-        consecutive = 0
-        for fill in reversed(list(fills)):
+        positions = getattr(getattr(self._ledger, "state", None), "positions", {}) or {}
+        results: dict[str, Decimal] = {}
+        closed_at: dict[str, tuple[datetime, int]] = {}
+        for index, fill in enumerate(self._ledger.iter_fills()):
             if fill.fill_type != FillType.EXIT:
                 continue
+            key = fill.position_id or f"fill:{index}"
+            position = positions.get(fill.position_id) if fill.position_id else None
+            if position is not None and getattr(position, "status", None) == PositionStatus.OPEN:
+                continue
             realized_delta = fill.usd_notional - (fill.cost_basis_usd * fill.token_amount)
-            if realized_delta < 0:
+            results[key] = results.get(key, Decimal("0")) + realized_delta
+            closed_at[key] = max(closed_at.get(key, (fill.created_at, index)), (fill.created_at, index))
+        consecutive = 0
+        for key in sorted(results, key=lambda item: closed_at[item], reverse=True):
+            if results[key] < 0:
                 consecutive += 1
                 continue
             break

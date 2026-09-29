@@ -206,6 +206,8 @@ class ReplayRunner:
         self.runtime.rpc.set_clock(lambda: self._clock.now)
         if self.runtime.broker is not None:
             self.runtime.broker.set_clock(lambda: self._clock.now, self._clock.sleep)
+        if self.runtime.shadow is not None:
+            self.runtime.shadow.set_clock(lambda: self._clock.now, self._clock.sleep)
 
     async def run(self, actions: list[ReplayAction]) -> ReplayRunResult:
         from .service import PaperService
@@ -384,6 +386,8 @@ class RawEventReplayRunner:
         self.runtime.rpc.set_clock(lambda: clock.now)
         if self.runtime.broker is not None:
             self.runtime.broker.set_clock(lambda: clock.now, clock.sleep)
+        if self.runtime.shadow is not None:
+            self.runtime.shadow.set_clock(lambda: clock.now, clock.sleep)
         for reason in (
             "startup",
             "warmup",

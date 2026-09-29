@@ -50,6 +50,8 @@ from .db_models import (
     ReplayRunRow,
     RiskEventRow,
     RuntimeCheckpointRow,
+    ShadowFillRow,
+    ShadowPositionRow,
     SignalEvaluationRow,
     StrategyVersionRow,
     StreamProtocolCheckpointRow,
@@ -3663,6 +3665,149 @@ class Database:
             )
         return True
 
+    async def record_shadow_entry(
+        self,
+        *,
+        position_id: str,
+        candidate_id: str,
+        mint: str,
+        pool_address: str,
+        notional_usd: Decimal,
+        block_reason: str,
+        status: str,
+        opened_at: datetime,
+        token_amount: Decimal,
+        network_fee_usd: Decimal,
+        adverse_fill_bps: int,
+        strategy_version_id: str,
+        config_hash: str,
+        evidence: dict[str, Any],
+    ) -> None:
+        """Record a shadow entry; a FAILED one is closed at the fee it paid."""
+        failed = status == "FAILED"
+        cost = notional_usd + network_fee_usd
+        async with self._write_session() as session:
+            session.add(
+                ShadowPositionRow(
+                    id=position_id,
+                    candidate_id=candidate_id,
+                    mint=mint,
+                    pool_address=pool_address,
+                    strategy_version_id=strategy_version_id,
+                    config_hash=config_hash,
+                    block_reason=block_reason,
+                    status=status,
+                    opened_at=opened_at,
+                    closed_at=opened_at if failed else None,
+                    notional_usd=notional_usd,
+                    entry_fee_usd=network_fee_usd,
+                    entry_cost_usd=Decimal("0") if failed else cost,
+                    entry_token_amount=token_amount,
+                    remaining_token_amount=token_amount,
+                    remaining_cost_usd=Decimal("0") if failed else cost,
+                    realized_pnl_usd=-network_fee_usd if failed else Decimal("0"),
+                    highest_executable_value=Decimal("0") if failed else cost,
+                    last_new_high_at=opened_at,
+                    tp1_taken=False,
+                    tp2_taken=False,
+                    exit_reason="SLIPPAGE_EXCEEDED" if failed else None,
+                    adverse_fill_bps=adverse_fill_bps,
+                    evidence_json=evidence,
+                    updated_at=opened_at,
+                )
+            )
+
+    async def record_shadow_exit(
+        self,
+        *,
+        position: Any,
+        fill_id: str,
+        token_amount: Decimal,
+        gross_usd: Decimal,
+        network_fee_usd: Decimal,
+        realized_pnl_usd: Decimal,
+        exit_reason: str,
+        closed: bool,
+        filled_at: datetime,
+        evidence: dict[str, Any],
+    ) -> None:
+        async with self._write_session() as session:
+            row = await session.get(ShadowPositionRow, position.position_id, with_for_update=True)
+            if row is None:
+                raise RuntimeError("shadow position is unavailable")
+            session.add(
+                ShadowFillRow(
+                    id=fill_id,
+                    position_id=row.id,
+                    token_amount=token_amount,
+                    gross_usd=gross_usd,
+                    network_fee_usd=network_fee_usd,
+                    realized_pnl_usd=realized_pnl_usd,
+                    exit_reason=exit_reason,
+                    filled_at=filled_at,
+                    evidence_json=evidence,
+                )
+            )
+            row.remaining_token_amount = position.remaining_token_amount
+            row.remaining_cost_usd = position.remaining_cost_usd
+            row.realized_pnl_usd = position.realized_pnl_usd
+            row.highest_executable_value = position.highest_executable_value_usd
+            row.last_new_high_at = position.last_new_high_at
+            row.tp1_taken = position.tp1_taken
+            row.tp2_taken = position.tp2_taken
+            row.updated_at = filled_at
+            if closed:
+                row.status = "CLOSED"
+                row.closed_at = filled_at
+                row.exit_reason = exit_reason
+
+    async def load_open_shadow_positions(
+        self, *, strategy_version_id: str
+    ) -> list[tuple[Any, str]]:
+        from .models import PositionRecord
+
+        async with self.sessions() as session:
+            rows = list(
+                (
+                    await session.scalars(
+                        select(ShadowPositionRow).where(
+                            ShadowPositionRow.status == "OPEN",
+                            ShadowPositionRow.strategy_version_id == strategy_version_id,
+                        )
+                    )
+                ).all()
+            )
+        restored: list[tuple[Any, str]] = []
+        for row in rows:
+            opened_at = _aware(row.opened_at) or datetime.now(tz=timezone.utc)
+            restored.append(
+                (
+                    PositionRecord(
+                        position_id=row.id,
+                        token_mint=row.mint,
+                        open_fill_id=f"shadow-entry:{row.id}",
+                        entry_token_amount=Decimal(row.entry_token_amount),
+                        entry_cost_usd=Decimal(row.entry_cost_usd),
+                        open_ratio=Decimal("1"),
+                        opened_at=opened_at,
+                        locked_usd=Decimal(row.entry_cost_usd),
+                        remaining_token_amount=Decimal(row.remaining_token_amount),
+                        remaining_cost_usd=Decimal(row.remaining_cost_usd),
+                        realized_pnl_usd=Decimal(row.realized_pnl_usd),
+                        highest_executable_value_usd=Decimal(row.highest_executable_value),
+                        last_executable_value_usd=Decimal(row.remaining_cost_usd),
+                        last_new_high_at=_aware(row.last_new_high_at) or opened_at,
+                        tp1_taken=row.tp1_taken,
+                        tp2_taken=row.tp2_taken,
+                        candidate_id=row.candidate_id,
+                        pool_address=row.pool_address,
+                        strategy_version=row.strategy_version_id,
+                    ),
+                    row.block_reason,
+                )
+            )
+        return restored
+
     async def commit_paper_exit(
         self,
         *,
@@ -3927,6 +4072,40 @@ class Database:
                 )
                 or 0
             )
+            shadow_closed = (
+                await session.execute(
+                    select(ShadowPositionRow.realized_pnl_usd, ShadowPositionRow.entry_cost_usd)
+                    .where(
+                        ShadowPositionRow.status == "CLOSED",
+                        ShadowPositionRow.closed_at >= start_utc,
+                        ShadowPositionRow.closed_at < end_utc,
+                    )
+                )
+            ).all()
+            shadow_opened = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(ShadowPositionRow)
+                    .where(
+                        ShadowPositionRow.opened_at >= start_utc,
+                        ShadowPositionRow.opened_at < end_utc,
+                        ShadowPositionRow.status != "FAILED",
+                    )
+                )
+                or 0
+            )
+            failed_entries = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(PaperOrderRow)
+                    .where(
+                        PaperOrderRow.reject_reason == "SLIPPAGE_EXCEEDED",
+                        PaperOrderRow.rejected_at >= start_utc,
+                        PaperOrderRow.rejected_at < end_utc,
+                    )
+                )
+                or 0
+            )
             closed_pnl = list(
                 (
                     await session.scalars(
@@ -4072,7 +4251,22 @@ class Database:
         wins = sum(Decimal(str(value)) > 0 for value in closed_pnl)
         losses = sum(Decimal(str(value)) < 0 for value in closed_pnl)
         closed = len(closed_pnl)
+        shadow_pnls = [Decimal(str(pnl)) for pnl, _ in shadow_closed]
         return {
+            # Entries the account's risk rules refused, simulated outside it:
+            # together with the account's trades they are the signal sample.
+            "shadow": {
+                "opened": shadow_opened,
+                "closed": len(shadow_pnls),
+                "profitable": sum(1 for pnl in shadow_pnls if pnl > 0),
+                "net_pnl_usd": str(sum(shadow_pnls, Decimal("0"))),
+                "signal_closed": closed + len(shadow_pnls),
+                "signal_net_pnl_usd": str(
+                    sum(shadow_pnls, Decimal("0"))
+                    + sum((Decimal(str(value)) for value in closed_pnl), Decimal("0"))
+                ),
+            },
+            "failed_entries": failed_entries,
             "signals": {
                 "new_pools": new_pools,
                 "tokens_checked": tokens_checked,
@@ -4469,10 +4663,25 @@ def _daily_telegram_report_text(report: dict[str, Any]) -> str:
         f"{_report_int(execution.get('no_route_rejects'))}, "
         "невдалих виходів: "
         f"{_report_int(execution.get('exit_route_failures'))}",
+        "Невдалих входів (прослизання понад допуск): "
+        f"{_report_int(report.get('failed_entries'))}",
         "",
         f"Причини виходу: {exit_summary}",
         "",
     ]
+    shadow = report.get("shadow")
+    if isinstance(shadow, dict):
+        lines[-1:-1] = [
+            "Тіньові угоди (вхід заблокували ліміти ризику)",
+            f"Відкрито: {_report_int(shadow.get('opened'))}, "
+            f"закрито: {_report_int(shadow.get('closed'))}, "
+            f"прибуткових: {_report_int(shadow.get('profitable'))}",
+            f"Результат: {_format_usd(shadow.get('net_pnl_usd'), signed=True)}",
+            "Разом по сигналах: закрито "
+            f"{_report_int(shadow.get('signal_closed'))}, результат "
+            f"{_format_usd(shadow.get('signal_net_pnl_usd'), signed=True)}",
+            "",
+        ]
     lines.extend(_open_positions_lines(report.get("open_positions")))
     return "\n".join(lines)
 

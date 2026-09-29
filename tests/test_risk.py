@@ -244,3 +244,32 @@ def test_risk_manual_halt_can_be_resumed() -> None:
     assert state.is_halted
     assert risk_manager.clear_halt() is True
     assert not state.is_halted
+
+
+def test_loss_streak_counts_each_closed_position_once() -> None:
+    now = _now_utc().replace(hour=10, minute=0, second=0, microsecond=0)
+
+    def exit_fill(position: str, fill: str, usd: str, at: datetime) -> FillRecord:
+        return FillRecord(
+            fill_id=fill,
+            position_id=position,
+            token_mint=position,
+            order_id=f"order-{fill}",
+            quote_id=f"quote-{fill}",
+            fill_type=FillType.EXIT,
+            token_amount=Decimal("1"),
+            usd_notional=Decimal(usd),
+            cost_basis_usd=Decimal("10"),
+            created_at=at,
+        )
+
+    fills = [
+        # A: TP1 +5, remainder -2 -> a winning trade despite its losing last fill.
+        exit_fill("A", "a1", "15", now),
+        exit_fill("A", "a2", "8", now + timedelta(minutes=1)),
+        exit_fill("B", "b1", "7", now + timedelta(minutes=2)),
+        exit_fill("C", "c1", "9", now + timedelta(minutes=3)),
+    ]
+    manager = _build_risk(trade_limit=10, loss_limit=3, fills=fills)
+    assert manager.consecutive_losses() == 2
+    assert manager.evaluate_entry(Decimal("5")).decision == RiskDecision.ALLOW

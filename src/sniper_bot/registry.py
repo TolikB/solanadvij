@@ -14,6 +14,8 @@ from .events import ChainEventType, EventEnvelope
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SUPPORTED_QUOTE_MINTS = frozenset({WSOL_MINT, USDC_MINT})
+# The all-zero public key an unset Anchor Pubkey field decodes to.
+SYSTEM_PROGRAM_ADDRESS = "11111111111111111111111111111111"
 
 
 def target_mint_for_pool(base_mint: str | None, quote_mint: str | None) -> str | None:
@@ -217,6 +219,12 @@ class TokenRegistry:
         elif event.event_type == ChainEventType.POOL_CREATED and not token_record.first_pool_address:
             update["first_pool_address"] = event.pool_address
             update["first_pool_time"] = event.block_time
+        if event.event_type == ChainEventType.POOL_CREATED and not token_record.creator_address:
+            # A token created before this process saw it still names its
+            # creator in the PumpSwap pool it migrates to.
+            coin_creator = _text(payload.get("coin_creator"))
+            if coin_creator and coin_creator != SYSTEM_PROGRAM_ADDRESS:
+                update["creator_address"] = coin_creator
         changed = created or any(
             getattr(token_record, key) != value
             for key, value in update.items()

@@ -28,17 +28,19 @@ from .db_models import (
     PaperPositionRow,
     PoolRow,
     RawChainEventRow,
+    ShadowPositionRow,
     StrategyVersionRow,
     TokenRow,
     WalletProfileRow,
 )
 
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
-# Open positions are marked every second and a flat account once a minute. A
-# 15-day OOS half at the 12-trade daily cap and the 600 s holding limit writes
-# at most about 15 * (12 * 600 + 1440) = 129,600 marks, so the bound keeps
-# headroom for that worst case while staying a small in-memory path.
-MAX_STATISTICAL_EQUITY_MARKS = 250_000
+# Open positions are marked every 5 seconds and a flat account once a minute,
+# plus one mark per fill. A 15-day OOS half with positions open around the
+# clock writes about 15 * 17,280 = 259,200 marks; the realistic load (24
+# trades a day at the 600 s holding limit) is 15 * (24 * 120 + 1440) = 64,800.
+# The bound covers even the round-the-clock case with headroom.
+MAX_STATISTICAL_EQUITY_MARKS = 400_000
 REQUIRED_CI_GATES = frozenset(
     {
         "archive_rebuild",
@@ -170,8 +172,12 @@ REQUIRED_STATISTICAL_CRITERIA = frozenset(
         "day_independence",
         "cluster_attribution_complete",
         "developer_cluster_independence",
+        "signal_positive_expectancy",
+        "signal_expectancy_confidence",
     }
 )
+# One-sided 95 % normal quantile for the lower confidence bound of the mean R.
+SIGNAL_CONFIDENCE_Z = Decimal("1.6449")
 _SENSITIVE_FIELD_ALTERNATION = "|".join(
     ("api_key", "bot_token", "password", "private" + "_" + "key", "secret", "chat_id", "user_id")
 )
@@ -504,7 +510,7 @@ class RuntimeAcceptanceArtifact(BaseModel):
 class StatisticalProtocol(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     strategy_version_id: str = Field(min_length=1)
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -517,6 +523,12 @@ class StatisticalProtocol(BaseModel):
     maximum_equity_mark_gap_seconds: int = Field(ge=1, le=3600)
     daily_operational_cost_usd: Decimal = Field(gt=0)
     negative_launch_definition: Literal["distinct_rejected_pumpswap_pool"]
+    # The primary result is per signal: account trades plus the shadow trades
+    # of entries the account's risk rules refused, in R (PnL over the planned
+    # loss at the hard stop). Sample-size criteria count this signal sample;
+    # net PnL, profit factor, drawdown and concentration stay account-level.
+    signal_sample_definition: Literal["account_and_risk_blocked_shadow_trades"]
+    risk_unit_pct: Decimal = Field(gt=0, le=1)
     time_zone: str = "Europe/Kyiv"
 
     @field_validator("frozen_at", "collection_started_at", "oos_started_at", "collection_ended_at")
@@ -585,12 +597,19 @@ class StatisticalMetrics(BaseModel):
     net_pnl_without_best_day_usd: Decimal
     net_pnl_without_best_developer_cluster_usd: Decimal
     missing_developer_cluster_trades: int = Field(ge=0)
+    shadow_trade_count: int = Field(ge=0)
+    censored_shadow_position_count: int = Field(ge=0)
+    signal_trade_count: int = Field(ge=0)
+    signal_in_sample_trade_count: int = Field(ge=0)
+    signal_oos_trade_count: int = Field(ge=0)
+    signal_oos_mean_r: Decimal | None
+    signal_oos_r_lower_bound_95: Decimal | None
 
 
 class StatisticalReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     generated_at: datetime
     protocol_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -636,6 +655,9 @@ class ClosedTrade:
     pnl_usd: Decimal
     developer_cluster: str | None
     cluster_evaluated: bool
+    # Entry cost including its fees; the unit a trade's R is measured in.
+    cost_usd: Decimal = Decimal("0")
+    shadow: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,6 +681,8 @@ class StatisticalInputs:
     closed_trades: Sequence[ClosedTrade]
     equity_points: Sequence[EquityPoint]
     operational_costs: Sequence[OperationalCostEvidence] = ()
+    shadow_trades: Sequence[ClosedTrade] = ()
+    censored_shadow_position_count: int = 0
 
 
 def _profit_factor_value(value: str) -> Decimal:
@@ -713,11 +737,13 @@ def _statistical_pass_map(
         "pool_retention_complete": metrics.missing_materialized_pool_count == 0,
         "all_discovered_pools_evaluated": metrics.missing_final_pool_outcome_count == 0,
         "minimum_new_pools": metrics.discovered_pumpswap_pool_count >= 3000,
-        "minimum_closed_trades": metrics.closed_trade_count >= 300,
+        "minimum_closed_trades": metrics.signal_trade_count >= 300,
         "minimum_negative_launches": metrics.negative_launch_count >= protocol.minimum_negative_launches,
-        "minimum_oos_trades": metrics.oos_trade_count >= protocol.minimum_oos_trades,
-        "no_censored_positions": metrics.censored_position_count == 0,
-        "separate_oos_period": metrics.in_sample_trade_count > 0 and metrics.oos_trade_count > 0,
+        "minimum_oos_trades": metrics.signal_oos_trade_count >= protocol.minimum_oos_trades,
+        "no_censored_positions": metrics.censored_position_count == 0
+        and metrics.censored_shadow_position_count == 0,
+        "separate_oos_period": metrics.signal_in_sample_trade_count > 0
+        and metrics.signal_oos_trade_count > 0,
         "equity_mark_coverage": metrics.oos_equity_mark_coverage,
         "operational_costs_reconciled": metrics.operational_costs_reconciled,
         "oos_net_pnl_after_all_costs_positive": metrics.oos_net_pnl_after_all_costs_usd > 0,
@@ -728,6 +754,10 @@ def _statistical_pass_map(
         "day_independence": metrics.net_pnl_without_best_day_usd > 0,
         "cluster_attribution_complete": metrics.missing_developer_cluster_trades == 0,
         "developer_cluster_independence": metrics.net_pnl_without_best_developer_cluster_usd > 0,
+        "signal_positive_expectancy": metrics.signal_oos_mean_r is not None
+        and metrics.signal_oos_mean_r > 0,
+        "signal_expectancy_confidence": metrics.signal_oos_r_lower_bound_95 is not None
+        and metrics.signal_oos_r_lower_bound_95 > 0,
     }
 
 
@@ -757,9 +787,15 @@ def _statistical_input_digest(inputs: StatisticalInputs) -> str:
                 "pnl_usd": str(trade.pnl_usd),
                 "developer_cluster": trade.developer_cluster,
                 "cluster_evaluated": trade.cluster_evaluated,
+                "cost_usd": str(trade.cost_usd),
+                "shadow": trade.shadow,
             }
-            for trade in sorted(inputs.closed_trades, key=lambda item: item.position_id)
+            for trade in sorted(
+                [*inputs.closed_trades, *inputs.shadow_trades],
+                key=lambda item: (item.shadow, item.position_id),
+            )
         ],
+        "censored_shadow_position_count": inputs.censored_shadow_position_count,
         "equity_points": [
             {
                 "observed_at": _as_utc(point.observed_at).isoformat(),
@@ -786,11 +822,13 @@ def _criterion_details(
         "pool_retention_complete": metrics.missing_materialized_pool_count,
         "all_discovered_pools_evaluated": metrics.missing_final_pool_outcome_count,
         "minimum_new_pools": metrics.discovered_pumpswap_pool_count,
-        "minimum_closed_trades": metrics.closed_trade_count,
+        "minimum_closed_trades": metrics.signal_trade_count,
         "minimum_negative_launches": metrics.negative_launch_count,
-        "minimum_oos_trades": metrics.oos_trade_count,
-        "no_censored_positions": metrics.censored_position_count,
-        "separate_oos_period": metrics.in_sample_trade_count > 0 and metrics.oos_trade_count > 0,
+        "minimum_oos_trades": metrics.signal_oos_trade_count,
+        "no_censored_positions": metrics.censored_position_count
+        + metrics.censored_shadow_position_count,
+        "separate_oos_period": metrics.signal_in_sample_trade_count > 0
+        and metrics.signal_oos_trade_count > 0,
         "equity_mark_coverage": metrics.oos_equity_mark_coverage,
         "operational_costs_reconciled": metrics.operational_costs_reconciled,
         "oos_net_pnl_after_all_costs_positive": str(metrics.oos_net_pnl_after_all_costs_usd),
@@ -801,6 +839,14 @@ def _criterion_details(
         "day_independence": str(metrics.net_pnl_without_best_day_usd),
         "cluster_attribution_complete": metrics.missing_developer_cluster_trades,
         "developer_cluster_independence": str(metrics.net_pnl_without_best_developer_cluster_usd),
+        "signal_positive_expectancy": (
+            None if metrics.signal_oos_mean_r is None else str(metrics.signal_oos_mean_r)
+        ),
+        "signal_expectancy_confidence": (
+            None
+            if metrics.signal_oos_r_lower_bound_95 is None
+            else str(metrics.signal_oos_r_lower_bound_95)
+        ),
     }
     expected = {
         "fixed_revision_strategy_cohort": "strategy/config/revision match the frozen protocol",
@@ -809,11 +855,11 @@ def _criterion_details(
         "pool_retention_complete": "0 discovered PumpSwap pools missing from pools",
         "all_discovered_pools_evaluated": "0 discovered PumpSwap pools without a terminal candidate outcome",
         "minimum_new_pools": ">= 3000 distinct discovered PumpSwap pools",
-        "minimum_closed_trades": ">= 300",
+        "minimum_closed_trades": ">= 300 signal trades (account and shadow)",
         "minimum_negative_launches": f">= {protocol.minimum_negative_launches}",
-        "minimum_oos_trades": f">= {protocol.minimum_oos_trades}",
-        "no_censored_positions": "0 cohort positions unresolved at collection cutoff",
-        "separate_oos_period": "both entry-time IS and OOS trades",
+        "minimum_oos_trades": f">= {protocol.minimum_oos_trades} OOS signal trades",
+        "no_censored_positions": "0 account or shadow positions unresolved at collection cutoff",
+        "separate_oos_period": "both entry-time IS and OOS signal trades",
         "equity_mark_coverage": f"full OOS executable-equity path with gaps <= {protocol.maximum_equity_mark_gap_seconds}s",
         "operational_costs_reconciled": "ledger operational costs cover the frozen cost floor",
         "oos_net_pnl_after_all_costs_positive": "> 0 USDC after simulated and operational costs",
@@ -824,8 +870,27 @@ def _criterion_details(
         "day_independence": "economic net PnL remains > 0 without the best day",
         "cluster_attribution_complete": "0 trades without a known funding cluster",
         "developer_cluster_independence": "economic net PnL remains > 0 without the best cluster",
+        "signal_positive_expectancy": "mean OOS signal R > 0 (R = PnL / (entry cost * risk unit))",
+        "signal_expectancy_confidence": "one-sided 95% lower bound of the mean OOS signal R > 0",
     }
     return actuals, expected
+
+
+def _signal_r(trade: ClosedTrade, risk_unit_pct: Decimal) -> Decimal | None:
+    risk = trade.cost_usd * risk_unit_pct
+    return trade.pnl_usd / risk if risk > 0 else None
+
+
+def _mean_and_lower_bound(values: Sequence[Decimal]) -> tuple[Decimal | None, Decimal | None]:
+    if not values:
+        return None, None
+    count = Decimal(len(values))
+    mean = sum(values, Decimal("0")) / count
+    if len(values) < 2:
+        return mean.quantize(Decimal("0.0001")), None
+    variance = sum(((value - mean) ** 2 for value in values), Decimal("0")) / (count - 1)
+    lower = mean - SIGNAL_CONFIDENCE_Z * variance.sqrt() / count.sqrt()
+    return mean.quantize(Decimal("0.0001")), lower.quantize(Decimal("0.0001"))
 
 
 def evaluate_statistical_stage(
@@ -837,7 +902,10 @@ def evaluate_statistical_stage(
     if generated_at < protocol.collection_ended_at:
         raise ValueError("statistical collection has not ended")
     trades = sorted(inputs.closed_trades, key=lambda trade: (_as_utc(trade.entry_time), trade.position_id))
-    for trade in trades:
+    shadow_trades = sorted(
+        inputs.shadow_trades, key=lambda trade: (_as_utc(trade.entry_time), trade.position_id)
+    )
+    for trade in [*trades, *shadow_trades]:
         entry_time = _as_utc(trade.entry_time)
         closed_at = _as_utc(trade.closed_at)
         if not protocol.collection_started_at <= entry_time <= protocol.collection_ended_at:
@@ -900,6 +968,19 @@ def evaluate_statistical_stage(
     without_best_cluster = (
         net_pnl - max(pnl_by_cluster.values()) if len(pnl_by_cluster) >= 2 else Decimal("0")
     )
+    signal_trades = [*trades, *shadow_trades]
+    signal_in_sample = [
+        trade for trade in signal_trades if _as_utc(trade.entry_time) < protocol.oos_started_at
+    ]
+    signal_oos = [
+        trade for trade in signal_trades if _as_utc(trade.entry_time) >= protocol.oos_started_at
+    ]
+    signal_r_values = [
+        value
+        for value in (_signal_r(trade, protocol.risk_unit_pct) for trade in signal_oos)
+        if value is not None
+    ]
+    signal_mean_r, signal_lower_bound = _mean_and_lower_bound(signal_r_values)
     equity_coverage, max_drawdown, equity_mark_count = _equity_drawdown(inputs.equity_points, protocol)
     starting_equity = inputs.starting_equities[0] if len(inputs.starting_equities) == 1 else None
     metrics = StatisticalMetrics(
@@ -930,6 +1011,13 @@ def evaluate_statistical_stage(
         net_pnl_without_best_day_usd=without_best_day,
         net_pnl_without_best_developer_cluster_usd=without_best_cluster,
         missing_developer_cluster_trades=missing_cluster_count,
+        shadow_trade_count=len(shadow_trades),
+        censored_shadow_position_count=inputs.censored_shadow_position_count,
+        signal_trade_count=len(signal_trades),
+        signal_in_sample_trade_count=len(signal_in_sample),
+        signal_oos_trade_count=len(signal_oos),
+        signal_oos_mean_r=signal_mean_r,
+        signal_oos_r_lower_bound_95=signal_lower_bound,
     )
     pass_map = _statistical_pass_map(metrics, protocol)
     actuals, expected = _criterion_details(metrics, protocol)
@@ -938,7 +1026,7 @@ def evaluate_statistical_stage(
         for name in sorted(REQUIRED_STATISTICAL_CRITERIA)
     ]
     return StatisticalReport(
-        schema_version=4,
+        schema_version=5,
         revision=protocol.revision,
         generated_at=generated_at,
         protocol_sha256=protocol_sha256,
@@ -1076,6 +1164,7 @@ async def load_statistical_stage_data(database: Database, protocol: StatisticalP
                     PaperPositionRow.closed_at,
                     PaperPositionRow.realized_pnl,
                     PaperPositionRow.status,
+                    PaperPositionRow.initial_cost_usd,
                     TokenRow.creator_address,
                     WalletProfileRow.wallet_address,
                     WalletProfileRow.known_funding_cluster,
@@ -1091,6 +1180,18 @@ async def load_statistical_stage_data(database: Database, protocol: StatisticalP
                 .order_by(PaperPositionRow.entry_time, PaperPositionRow.id)
             )
         ).all()
+        shadow_rows = list(
+            (
+                await session.scalars(
+                    select(ShadowPositionRow).where(
+                        ShadowPositionRow.strategy_version_id == protocol.strategy_version_id,
+                        ShadowPositionRow.config_hash == protocol.config_hash,
+                        ShadowPositionRow.opened_at >= protocol.collection_started_at,
+                        ShadowPositionRow.opened_at <= protocol.collection_ended_at,
+                    )
+                )
+            ).all()
+        )
         equity_points: list[EquityPoint] = []
         if len(account_ids) == 1:
             baseline = await session.scalar(
@@ -1129,13 +1230,26 @@ async def load_statistical_stage_data(database: Database, protocol: StatisticalP
     trades = []
     closed_pool_addresses: set[str] = set()
     censored_position_count = 0
-    for position_id, pool_address, entry_time, closed_at, pnl, status, creator, profile_wallet, known_cluster in rows:
+    for (
+        position_id,
+        pool_address,
+        entry_time,
+        closed_at,
+        pnl,
+        status,
+        initial_cost,
+        creator,
+        _profile_wallet,
+        known_cluster,
+    ) in rows:
         if status != "CLOSED" or closed_at is None or _as_utc(closed_at) > protocol.collection_ended_at:
             censored_position_count += 1
             continue
         closed_pool_addresses.add(str(pool_address))
-        clustering_evaluated = bool(creator and profile_wallet and known_cluster)
-        cluster = known_cluster if clustering_evaluated else None
+        # A developer's funding cluster when one is known, otherwise the
+        # creator wallet itself: no single developer may carry the result.
+        cluster = known_cluster or creator
+        clustering_evaluated = bool(cluster)
         trades.append(
             ClosedTrade(
                 position_id=str(position_id),
@@ -1144,6 +1258,37 @@ async def load_statistical_stage_data(database: Database, protocol: StatisticalP
                 pnl_usd=Decimal(pnl),
                 developer_cluster=cluster,
                 cluster_evaluated=clustering_evaluated,
+                cost_usd=Decimal(initial_cost),
+            )
+        )
+    shadow_trades: list[ClosedTrade] = []
+    censored_shadow_count = 0
+    sqlite = database.engine.dialect.name == "sqlite"
+
+    def stored_time(value: datetime) -> datetime:
+        # SQLite drops the offset of timezone-aware columns; PostgreSQL keeps it.
+        return value.replace(tzinfo=timezone.utc) if sqlite and value.tzinfo is None else value
+
+    for shadow in shadow_rows:
+        if shadow.status == "FAILED":
+            continue  # a failed swap is a cost, not a trade
+        if (
+            shadow.status != "CLOSED"
+            or shadow.closed_at is None
+            or _as_utc(stored_time(shadow.closed_at)) > protocol.collection_ended_at
+        ):
+            censored_shadow_count += 1
+            continue
+        shadow_trades.append(
+            ClosedTrade(
+                position_id=str(shadow.id),
+                entry_time=stored_time(shadow.opened_at),
+                closed_at=stored_time(shadow.closed_at),
+                pnl_usd=Decimal(shadow.realized_pnl_usd),
+                developer_cluster=None,
+                cluster_evaluated=False,
+                cost_usd=Decimal(shadow.entry_cost_usd),
+                shadow=True,
             )
         )
     final_pool_addresses = rejected_pool_addresses | (
@@ -1162,6 +1307,8 @@ async def load_statistical_stage_data(database: Database, protocol: StatisticalP
         closed_trades=trades,
         equity_points=equity_points,
         operational_costs=operational_costs,
+        shadow_trades=shadow_trades,
+        censored_shadow_position_count=censored_shadow_count,
     )
 
 
