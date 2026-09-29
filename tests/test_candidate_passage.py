@@ -527,3 +527,58 @@ async def test_restart_loads_open_and_recent_terminal_candidates_only(tmp_path) 
     pipeline.restore_candidates(resumable)
     assert set(pipeline._ingest_tracked_pools) == {"pool-old-open"}
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_streamed_logs_without_block_time_keep_the_stream_fresh(tmp_path) -> None:
+    from sniper_bot.solana_rpc import SolanaRpcClient
+    from sniper_bot.stream import HeliusStreamGateway
+
+    metrics = BotMetrics()
+    pipeline = _pipeline(tmp_path, metrics=metrics)
+    gateway = HeliusStreamGateway(
+        websocket_url="wss://example.invalid",
+        rpc=SolanaRpcClient("https://example.invalid"),
+        handler=pipeline.process_transaction,
+        batch_handler=pipeline.process_transactions,
+        entry_gate=pipeline.entry_gate,
+        metrics=metrics,
+    )
+    pump = BorshEventEncoder(_idl_path(pump_package))
+    now = datetime.now(tz=timezone.utc).replace(microsecond=0)
+    received_at = now + timedelta(milliseconds=600)
+    gateway._baseline_started_at = received_at - gateway.LIVE_BASELINE_WARMUP
+    payload = pump.encode(
+        "TradeEvent",
+        {"timestamp": int(now.timestamp()), "mint": _address(11, 3), "is_buy": True},
+    )
+    await gateway.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "logsNotification",
+            "params": {
+                "result": {
+                    "context": {"slot": 400_000_010},
+                    "value": {
+                        "signature": "curve-trade",
+                        "err": None,
+                        "logs": [
+                            f"Program {PUMP_PROGRAM_ID} invoke [1]",
+                            f"Program data: {payload}",
+                            f"Program {PUMP_PROGRAM_ID} success",
+                        ],
+                    },
+                }
+            },
+        }
+    )
+    await gateway._notification_queue.join()
+    gateway._queue.put_nowait(None)
+    await gateway._worker()
+
+    # The decoded Clock timestamp reaches the stream even though nothing from
+    # this transaction is ingested, so freshness follows the live chain.
+    assert gateway.last_processed_block_time == now
+    assert gateway.refresh_freshness(received_at) is True
+    assert "stream_stale" not in pipeline.entry_gate.reasons
+    assert metrics.chain_events_received._value.get() == 0

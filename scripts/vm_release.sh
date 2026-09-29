@@ -94,7 +94,10 @@ blocked = ("anchorpy", "eth_account", "solana", "solders", "web3")
 present = [name for name in blocked if util.find_spec(name) is not None]
 assert not present, f"signer-capable modules in production image: {present}"
 '
-  compose run --rm --no-deps -T --entrypoint python sniper-bot scripts/audit_no_live.py
+  # The audit reads the checkout's manifests, so run it on the source tree with
+  # the image's interpreter rather than relying on the host Python.
+  compose run --rm --no-deps -T -v "$PROJECT_DIR:/src:ro" --entrypoint python \
+    sniper-bot /src/scripts/audit_no_live.py
   echo "build=ok revision=$sha paper_only=true"
 }
 
