@@ -20,6 +20,24 @@ class BotMetrics:
             ["reason"],
             registry=self.registry,
         )
+        self.chain_events_filtered_before_ingest = Counter(
+            "chain_events_filtered_before_ingest_total",
+            "Decoded pool activity dropped before durable ingest because no live candidate tracks the pool",
+            ["reason"],
+            registry=self.registry,
+        )
+        self.protocol_layout_quarantines = Counter(
+            "protocol_layout_quarantines_total",
+            "Transactions whose Anchor events did not match the vendored IDL",
+            ["protocol", "kind"],
+            registry=self.registry,
+        )
+        self.candidate_evaluation_failures = Counter(
+            "candidate_evaluation_failures_total",
+            "Candidate evaluations skipped because security or market data was unavailable",
+            ["stage"],
+            registry=self.registry,
+        )
         self.chain_event_processing_lag_ms = Histogram(
             "chain_event_processing_lag_ms",
             "Observed processing lag for chain events",

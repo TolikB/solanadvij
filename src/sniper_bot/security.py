@@ -66,6 +66,12 @@ class RejectReason(StrEnum):
     MAX_OPEN_POSITIONS = "MAX_OPEN_POSITIONS"
     POSITION_TOO_SMALL_AFTER_COSTS = "POSITION_TOO_SMALL_AFTER_COSTS"
     RISK_MANAGER_BLOCKED = "RISK_MANAGER_BLOCKED"
+    # The pool was first seen while the stream was not tradable (live baseline
+    # or gap backfill), so it can never become an entry candidate.
+    STREAM_NOT_TRADABLE = "STREAM_NOT_TRADABLE"
+    # The frozen statistical collection window is closing: every pool must
+    # reach a terminal outcome and every position must close before its end.
+    COLLECTION_WINDOW_CLOSED = "COLLECTION_WINDOW_CLOSED"
 
 
 class MintInfo(BaseModel):
@@ -277,6 +283,39 @@ class SecurityEngine:
         self.maximum_return_since_creation = maximum_return_since_creation
         self.maximum_stream_age_seconds = maximum_stream_age_seconds
         self.maximum_quote_age_seconds = maximum_quote_age_seconds
+
+    def market_reject_reasons(
+        self,
+        *,
+        quote_mint: str,
+        quote_liquidity_usd: Decimal,
+        liquidity_change_30s: Decimal,
+        pool_age_seconds: Decimal,
+        external_successful_sellers: int,
+        return_since_pool_creation: Decimal,
+    ) -> list[RejectReason]:
+        """Hard rejects that follow from pool market data alone.
+
+        These are the checks of :meth:`evaluate` that need no RPC or quote, in
+        the same relative order, so a candidate that already fails one of them
+        can be rejected without spending provider quota on it.
+        """
+        reasons: list[RejectReason] = []
+        if quote_mint not in SUPPORTED_QUOTE_MINTS:
+            reasons.append(RejectReason.UNSUPPORTED_QUOTE_MINT)
+        if quote_liquidity_usd < self.minimum_quote_liquidity_usd:
+            reasons.append(RejectReason.LOW_QUOTE_LIQUIDITY)
+        if external_successful_sellers < self.minimum_external_sellers:
+            reasons.append(RejectReason.INSUFFICIENT_EXTERNAL_SELLERS)
+        if pool_age_seconds < self.minimum_pool_age_seconds:
+            reasons.append(RejectReason.POOL_TOO_NEW)
+        if pool_age_seconds > self.maximum_pool_age_seconds:
+            reasons.append(RejectReason.POOL_TOO_OLD)
+        if liquidity_change_30s < -self.maximum_liquidity_drop_pct:
+            reasons.append(RejectReason.LIQUIDITY_DECLINING)
+        if return_since_pool_creation > self.maximum_return_since_creation:
+            reasons.append(RejectReason.OVEREXTENDED_PRICE)
+        return reasons
 
     def evaluate(self, context: SecurityContext, *, now: datetime | None = None) -> SecurityResult:
         now = now or datetime.now(tz=timezone.utc)

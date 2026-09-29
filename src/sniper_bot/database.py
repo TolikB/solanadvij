@@ -2311,14 +2311,29 @@ class Database:
         }
         await self._upsert(CandidateRow, values, ["id"])
 
-    async def load_active_candidates(self, strategy_id: str) -> list[Candidate]:
+    async def load_active_candidates(
+        self,
+        strategy_id: str,
+        *,
+        terminal_since: datetime | None = None,
+    ) -> list[Candidate]:
+        """Load candidates to resume; terminal ones only when detected recently.
+
+        Every open candidate is needed to continue its lifecycle. A terminal
+        candidate is only needed while its pool events can still be rehydrated,
+        so with ``terminal_since`` older terminal rows stay in PostgreSQL.
+        """
+        conditions: list[Any] = [CandidateRow.strategy_version_id == strategy_id]
+        if terminal_since is not None:
+            conditions.append(
+                or_(
+                    CandidateRow.state.not_in(("CLOSED", "REJECTED")),
+                    CandidateRow.detected_at >= terminal_since,
+                )
+            )
         async with self.sessions() as session:
             rows = (
-                await session.scalars(
-                    select(CandidateRow).where(
-                        CandidateRow.strategy_version_id == strategy_id
-                    )
-                )
+                await session.scalars(select(CandidateRow).where(*conditions))
             ).all()
         return [
             Candidate.model_validate(row.runtime_state_json)
@@ -3078,6 +3093,20 @@ class Database:
                 row.tp1_taken = item.tp1_taken
                 row.tp2_taken = item.tp2_taken
                 row.last_new_high_at = item.last_new_high_at
+
+    async def record_equity_heartbeat(
+        self,
+        *,
+        account_id: str,
+        observed_at: datetime,
+    ) -> None:
+        """Persist the account's current executable equity as a fresh mark."""
+        async with self.sessions.begin() as session:
+            account = await session.get(PaperAccountRow, account_id, with_for_update=True)
+            if account is None:
+                raise RuntimeError("paper account is unavailable")
+            await self._assert_transaction_runtime_owner(session)
+            self._add_paper_equity_mark(session, account, observed_at)
 
     @staticmethod
     def _add_paper_equity_mark(

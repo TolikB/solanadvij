@@ -117,6 +117,20 @@ class CandidateStateMachine:
             update["reject_reason"] = reject_reason
         return candidate.model_copy(update=update)
 
+    def is_expired(self, candidate: Candidate, at: datetime) -> bool:
+        """Whether a candidate that holds no position has outlived its entry window."""
+        if candidate.state in {
+            CandidateState.POSITION_OPEN,
+            CandidateState.POSITION_PARTIAL,
+            CandidateState.EXIT_PENDING,
+            CandidateState.RETRYING_EXIT,
+            CandidateState.CLOSED,
+            CandidateState.REJECTED,
+        }:
+            return False
+        age = at.astimezone(timezone.utc) - candidate.detected_at.astimezone(timezone.utc)
+        return age > timedelta(seconds=self.expiry_seconds)
+
     def evaluate(
         self,
         candidate: Candidate,

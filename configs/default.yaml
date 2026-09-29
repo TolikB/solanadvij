@@ -108,8 +108,14 @@ storage:
   raw_retention_days: 90
 reporting:
   include_operational_costs: true
-  monthly_infrastructure_cost_usd: 0
+  # Contabo VPS (6 vCPU / 12 GB) monthly price; part of the frozen config hash.
+  monthly_infrastructure_cost_usd: 15
   minimum_sample_warning_trades: 30
 logging:
   level: "INFO"
   json_logs: true
+collection:
+  # Set per statistical protocol through COLLECTION in .env, never here:
+  # COLLECTION={"ends_at":"2026-10-30T12:00:00Z","entry_cutoff_seconds":1800}
+  ends_at: null
+  entry_cutoff_seconds: 1800

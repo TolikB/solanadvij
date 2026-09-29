@@ -33,7 +33,7 @@ from .features import (
 )
 from .metrics import BotMetrics
 from .protocols import AnchorDecodeError
-from .protocols.pump import PumpDecoder
+from .protocols.pump import PUMP_STATE_EVENT_NAMES, PumpDecoder
 from .protocols.pumpswap import PumpSwapDecoder
 from .registry import (
     SUPPORTED_QUOTE_MINTS,
@@ -49,6 +49,41 @@ NON_TRADABLE_EVENT_SOURCES = frozenset(
     {
         EventSource.BASELINE_WSS,
         EventSource.RPC_RECOVERY,
+    }
+)
+TERMINAL_CANDIDATE_STATES = frozenset(
+    {
+        CandidateState.CLOSED,
+        CandidateState.REJECTED,
+    }
+)
+POSITION_CANDIDATE_STATES = frozenset(
+    {
+        CandidateState.POSITION_OPEN,
+        CandidateState.POSITION_PARTIAL,
+        CandidateState.EXIT_PENDING,
+        CandidateState.RETRYING_EXIT,
+    }
+)
+POOL_ACTIVITY_EVENT_TYPES = frozenset(
+    {
+        ChainEventType.SWAP_BUY,
+        ChainEventType.SWAP_SELL,
+        ChainEventType.LIQUIDITY_ADDED,
+        ChainEventType.LIQUIDITY_REMOVED,
+    }
+)
+# Pool activity is admitted a little past the candidate entry window so that
+# the pre-ingest filter always keeps a superset of what live state applies.
+INGEST_TRACKING_MARGIN = timedelta(seconds=60)
+# Terminal candidates stay in memory for API listing and restart rehydration,
+# then leave the per-second evaluation set for good.
+TERMINAL_CANDIDATE_RETENTION = timedelta(hours=1)
+UNKNOWN_LAYOUT_ARCHIVE_INTERVAL_SECONDS = 60.0
+MARKET_PRICE_FLAGS = frozenset(
+    {
+        "QUOTE_PRICE_UNAVAILABLE",
+        "STALE_QUOTE_ASSET_PRICE",
     }
 )
 
@@ -182,8 +217,16 @@ class ConfirmationPipeline:
         self.event_observer = event_observer
         self.fatal_handler = fatal_handler
         self.record_raw = record_raw
-        self._pump = PumpDecoder()
+        self._pump = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES)
         self._pumpswap = PumpSwapDecoder()
+        self._maximum_pool_age = timedelta(
+            seconds=config.candidate.max_pool_age_seconds if config else 180
+        )
+        self._collection_closes_at = config.collection.closes_at if config else None
+        # Pools whose activity may still reach live state, keyed by pool
+        # address: (candidate id, last block time a pre-entry swap can matter).
+        self._ingest_tracked_pools: dict[str, tuple[str, datetime]] = {}
+        self._layout_archived_at: dict[Protocol, float] = {}
         self._security_results: dict[str, tuple[SecurityContext, SecurityResult]] = {}
         self._scores: dict[str, ScoreBreakdown] = {}
         self._persisted_score_totals: dict[str, Decimal] = {}
@@ -586,14 +629,23 @@ class ConfirmationPipeline:
         ):
             decoder = self._pump if protocol == Protocol.PUMP else self._pumpswap
             try:
-                decoded_events = decoder.decode_transaction(
-                    transaction,
-                    source=source,
-                )
+                decoded = decoder.decode(transaction, source=source)
             except AnchorDecodeError:
-                self.entry_gate.block_protocol(protocol)
-                await self._record_unknown(protocol, transaction, source)
-                raise
+                await self._quarantine_layout(
+                    protocol, transaction, source, kind="decode_error"
+                )
+                continue
+            if decoded.unknown_discriminators:
+                await self._quarantine_layout(
+                    protocol, transaction, source, kind="unknown_discriminator"
+                )
+            if decoded.block_time is not None and transaction.get("blockTime") is None:
+                # Streaming notifications carry no block time; hand the
+                # program's Clock timestamp back for stream freshness.
+                transaction["blockTime"] = int(decoded.block_time.timestamp())
+            decoded_events = [
+                event for event in decoded.events if self._admit_for_ingest(event)
+            ]
             if len(decoded_events) > MAX_EVENT_BATCH_SIZE:
                 raise RuntimeError(
                     "one decoded transaction exceeds the durable event batch limit"
@@ -615,6 +667,99 @@ class ConfirmationPipeline:
             event_batches.append(current_batch)
         for events in event_batches:
             await self._process_decoded_event_batch(events)
+
+    async def _quarantine_layout(
+        self,
+        protocol: Protocol,
+        transaction: dict[str, Any],
+        source: EventSource,
+        *,
+        kind: str,
+    ) -> None:
+        """Block entries for a protocol whose events no longer match the IDL.
+
+        Ingestion keeps running so pool discovery and the raw archive stay
+        complete; only trading on that protocol stops until an operator
+        updates the vendored IDL.
+        """
+        self.entry_gate.block_protocol(protocol)
+        self.metrics.protocol_layout_quarantines.labels(
+            protocol=protocol.value, kind=kind
+        ).inc()
+        now = time.monotonic()
+        last = self._layout_archived_at.get(protocol)
+        if last is not None and now - last < UNKNOWN_LAYOUT_ARCHIVE_INTERVAL_SECONDS:
+            return
+        self._layout_archived_at[protocol] = now
+        logger.error(
+            "Anchor event layout does not match the vendored IDL; "
+            "protocol entries blocked",
+            extra={"protocol": protocol.value, "kind": kind},
+        )
+        await self._record_unknown(protocol, transaction, source)
+
+    def _admit_for_ingest(self, event: EventEnvelope) -> bool:
+        """Keep only events that can still change live state.
+
+        Swaps and liquidity changes of pools no live candidate tracks are the
+        bulk of the stream and live state discards them anyway, so recording
+        them durably only costs capacity. Everything else is always admitted.
+        """
+        if event.event_type == ChainEventType.POOL_CREATED:
+            self._track_new_pool(event)
+            return True
+        if event.event_type not in POOL_ACTIVITY_EVENT_TYPES:
+            return True
+        tracked = (
+            self._ingest_tracked_pools.get(event.pool_address)
+            if event.pool_address
+            else None
+        )
+        if tracked is None:
+            reason = "untracked_pool"
+        else:
+            candidate_id, horizon = tracked
+            candidate = self.candidates.get(candidate_id)
+            if candidate is not None and candidate.state in POSITION_CANDIDATE_STATES:
+                return True
+            if candidate is not None and candidate.state in TERMINAL_CANDIDATE_STATES:
+                reason = "terminal"
+            elif event.block_time > horizon:
+                reason = "expired"
+            else:
+                return True
+        self.metrics.chain_events_filtered_before_ingest.labels(reason=reason).inc()
+        return False
+
+    def _track_new_pool(self, event: EventEnvelope) -> None:
+        self._sweep_ingest_tracking(event.block_time)
+        if (
+            not event.pool_address
+            or not event.mint
+            or event.source in NON_TRADABLE_EVENT_SOURCES
+            or self._collection_closed(event.block_time)
+        ):
+            return
+        self._ingest_tracked_pools[event.pool_address] = (
+            _candidate_id(event.mint, event.pool_address, self.strategy_version),
+            event.block_time + self._maximum_pool_age + INGEST_TRACKING_MARGIN,
+        )
+
+    def _sweep_ingest_tracking(self, now: datetime) -> None:
+        for pool_address, (candidate_id, horizon) in list(
+            self._ingest_tracked_pools.items()
+        ):
+            candidate = self.candidates.get(candidate_id)
+            if candidate is not None and candidate.state in POSITION_CANDIDATE_STATES:
+                continue
+            if (
+                candidate is not None and candidate.state in TERMINAL_CANDIDATE_STATES
+            ) or now > horizon:
+                del self._ingest_tracked_pools[pool_address]
+
+    def _collection_closed(self, at: datetime) -> bool:
+        closes_at = self._collection_closes_at
+        return closes_at is not None and at >= closes_at
 
     async def _process_decoded_event_batch(
         self,
@@ -913,6 +1058,13 @@ class ConfirmationPipeline:
     def restore_candidates(self, candidates: list[Candidate]) -> None:
         for candidate in candidates:
             self.candidates[candidate.candidate_id] = candidate
+            if candidate.state not in TERMINAL_CANDIDATE_STATES:
+                self._ingest_tracked_pools[candidate.pool_address] = (
+                    candidate.candidate_id,
+                    candidate.detected_at
+                    + self._maximum_pool_age
+                    + INGEST_TRACKING_MARGIN,
+                )
         self.metrics.candidate_count.set(len(self.candidates))
 
     def restore_score_totals(self, scores: dict[str, Decimal]) -> None:
@@ -952,12 +1104,20 @@ class ConfirmationPipeline:
                 effective_event.pool_address, effective_event.block_time
             )
         if (
-            allow_candidate
-            and supported_quote_pair
-            and effective_event.event_type == ChainEventType.POOL_CREATED
+            effective_event.event_type == ChainEventType.POOL_CREATED
             and effective_event.pool_address
             and effective_event.mint
         ):
+            # Every discovered pool gets a candidate so that it reaches a
+            # terminal outcome; pools that can never be traded are rejected on
+            # sight, dated at their creation block.
+            creation_reject_reason: RejectReason | None = None
+            if not supported_quote_pair:
+                creation_reject_reason = RejectReason.UNSUPPORTED_QUOTE_MINT
+            elif not allow_candidate:
+                creation_reject_reason = RejectReason.STREAM_NOT_TRADABLE
+            elif self._collection_closed(effective_event.block_time):
+                creation_reject_reason = RejectReason.COLLECTION_WINDOW_CLOSED
             candidate = Candidate(
                 candidate_id=_candidate_id(
                     effective_event.mint,
@@ -971,10 +1131,21 @@ class ConfirmationPipeline:
                 strategy_version=self.strategy_version,
                 config_hash=self.config_hash,
             )
-            self.candidates.setdefault(candidate.candidate_id, candidate)
+            if creation_reject_reason is not None:
+                candidate = self.state_machine.transition(
+                    candidate,
+                    CandidateState.REJECTED,
+                    effective_event.block_time,
+                    reject_reason=creation_reject_reason,
+                )
+            stored = self.candidates.setdefault(candidate.candidate_id, candidate)
             self.metrics.candidate_count.set(len(self.candidates))
+            if stored is candidate and creation_reject_reason is not None:
+                self.metrics.candidate_rejections.labels(
+                    reason=creation_reject_reason.value
+                ).inc()
             if persist and self.database is not None:
-                await self.database.upsert_candidate(candidate, self.strategy_version)
+                await self.database.upsert_candidate(stored, self.strategy_version)
         if pool_state is not None:
             self._ingest_pool_features(effective_event, pool_state)
         if token is not None and effective_event.mint and effective_event.pool_address:
@@ -992,118 +1163,229 @@ class ConfirmationPipeline:
 
     async def evaluate_candidates(self, at: datetime | None = None) -> list[Candidate]:
         at = at or datetime.now(tz=timezone.utc)
+        self._forget_settled_candidates(at)
         changed: list[Candidate] = []
         for candidate_id, candidate in list(self.candidates.items()):
-            snapshot = self.features.snapshot(candidate.pool_address, at)
-            if self.database is not None and self.pools.pool(candidate.pool_address) is not None:
-                await self.database.record_snapshot(snapshot)
-            security_context: SecurityContext | None = None
-            security_result: SecurityResult | None = None
-            score: ScoreBreakdown | None = None
-            if self.security_provider is not None and candidate.state in {
-                CandidateState.SECURITY_CHECK,
-                CandidateState.ELIGIBLE,
-                CandidateState.WAITING_PULLBACK,
-                CandidateState.ARMED,
-                CandidateState.ENTRY_PENDING,
-            }:
-                security_context = await self.security_provider(candidate, snapshot)
-                snapshot = self.features.snapshot(candidate.pool_address, at)
-                security_result = self.security.evaluate(security_context, now=at)
-                self._security_results[candidate_id] = (security_context, security_result)
-                if self.database is not None:
-                    await self.database.record_security(security_context, security_result)
-                score = self.scoring.score(
-                    ScoreContext(
-                        features=snapshot,
-                        round_trip_loss_pct=security_context.execution.round_trip_loss_pct,
-                        buy_price_impact_pct=security_context.execution.buy_price_impact_pct,
-                        sell_price_impact_pct=security_context.execution.sell_price_impact_pct,
-                        sell_route_reliability=Decimal("1") if security_context.execution.sell_route_available else Decimal("0"),
-                        developer_history=DeveloperHistory(
-                            known=security_context.developer_history_known,
-                            previous_rugs=security_context.previous_rugs,
-                            previous_dev_dumps_5m=security_context.previous_dev_dumps_5m,
-                            tokens_created_7d=security_context.developer_tokens_created_7d,
-                            successful_tokens=security_context.developer_successful_tokens,
-                        ),
-                        vwap_reclaimed=snapshot.current_price_usd > snapshot.rolling_vwap_30s,
-                    )
-                )
-                self._scores[candidate_id] = score
-                self._persisted_score_totals[candidate_id] = score.total_score
-                if self.database is not None:
-                    await self.database.record_signal(candidate, snapshot, score)
-            before = candidate.state
-            if candidate.state == CandidateState.ENTRY_PENDING:
-                if not self.entry_gate.enabled:
-                    candidate = self.state_machine.transition(
-                        candidate,
-                        CandidateState.REJECTED,
-                        at,
-                        reject_reason=RejectReason.API_UNAVAILABLE,
-                    )
-                elif (
-                    not score
-                    or not security_context
-                    or security_result is None
-                    or not _entry_rules(
-                        snapshot,
-                        score,
-                        security_context,
-                        security_result,
-                        self.config,
-                    )
-                ):
-                    candidate = self.state_machine.transition(
-                        candidate,
-                        CandidateState.REJECTED,
-                        at,
-                        reject_reason=RejectReason.SCORE_TOO_LOW,
-                    )
-                elif self.entry_handler is not None:
-                    reject_reason = await self.entry_handler(candidate, snapshot, score, security_context)
-                    if reject_reason is None:
-                        candidate = self.state_machine.transition(
-                            candidate, CandidateState.POSITION_OPEN, at
-                        )
-                    else:
-                        candidate = self.state_machine.transition(
-                            candidate,
-                            CandidateState.REJECTED,
-                            at,
-                            reject_reason=reject_reason,
-                        )
-                self.candidates[candidate_id] = candidate
-                if self.database is not None:
-                    await self.database.upsert_candidate(candidate, self.strategy_version)
-                if candidate.state != before:
-                    changed.append(candidate)
-                    if candidate.state == CandidateState.REJECTED:
-                        reason = candidate.reject_reason or RejectReason.API_UNAVAILABLE
-                        self.metrics.candidate_rejections.labels(reason=reason.value).inc()
+            if candidate.state in TERMINAL_CANDIDATE_STATES:
                 continue
-            candidate = self.state_machine.evaluate(
-                candidate,
-                snapshot,
-                security=security_result,
-                score=score,
-                sell_route_available=(
-                    security_context.execution.sell_route_available if security_context else False
-                ),
-                dev_sold=security_context.dev_sold if security_context else False,
-            )
-            self.candidates[candidate_id] = candidate
-            if self.database is not None:
-                await self.database.upsert_candidate(candidate, self.strategy_version)
-            if candidate.state != before:
-                changed.append(candidate)
-                if candidate.state == CandidateState.REJECTED:
-                    reason = candidate.reject_reason or RejectReason.API_UNAVAILABLE
-                    self.metrics.candidate_rejections.labels(reason=reason.value).inc()
-                if candidate.state == CandidateState.ENTRY_PENDING:
-                    self.metrics.signals.inc()
+            updated = await self._evaluate_candidate(candidate_id, candidate, at)
+            if updated.state != candidate.state:
+                changed.append(updated)
         return changed
+
+    def _forget_settled_candidates(self, at: datetime) -> None:
+        cutoff = at - TERMINAL_CANDIDATE_RETENTION
+        for candidate_id, candidate in list(self.candidates.items()):
+            if (
+                candidate.state in TERMINAL_CANDIDATE_STATES
+                and candidate.updated_at < cutoff
+            ):
+                del self.candidates[candidate_id]
+                self._security_results.pop(candidate_id, None)
+                self._scores.pop(candidate_id, None)
+                self._persisted_score_totals.pop(candidate_id, None)
+        self.metrics.candidate_count.set(len(self.candidates))
+
+    async def _store_candidate(
+        self,
+        candidate_id: str,
+        before: CandidateState,
+        candidate: Candidate,
+    ) -> Candidate:
+        self.candidates[candidate_id] = candidate
+        if self.database is not None:
+            await self.database.upsert_candidate(candidate, self.strategy_version)
+        if candidate.state != before:
+            if candidate.state == CandidateState.REJECTED:
+                reason = candidate.reject_reason or RejectReason.API_UNAVAILABLE
+                self.metrics.candidate_rejections.labels(reason=reason.value).inc()
+            if candidate.state == CandidateState.ENTRY_PENDING:
+                self.metrics.signals.inc()
+        return candidate
+
+    def _market_reject_reason(
+        self,
+        candidate: Candidate,
+        snapshot: FeatureSnapshot,
+    ) -> tuple[bool, RejectReason | None]:
+        """Judge the market-only hard filters before spending provider quota.
+
+        Returns whether the pool's market data is usable at all, and the first
+        market-only hard reject if there is one.
+        """
+        pool = self.pools.pool(candidate.pool_address)
+        state = self.pools.state(candidate.pool_address)
+        if pool is None or state is None:
+            return False, None
+        if MARKET_PRICE_FLAGS.intersection(state.data_quality_flags):
+            return False, None
+        reasons = self.security.market_reject_reasons(
+            quote_mint=pool.quote_mint,
+            quote_liquidity_usd=snapshot.quote_liquidity_usd,
+            liquidity_change_30s=snapshot.quote_liquidity_change_30s,
+            pool_age_seconds=snapshot.pool_age_seconds,
+            external_successful_sellers=snapshot.external_successful_sellers,
+            return_since_pool_creation=snapshot.return_since_pool_creation,
+        )
+        return True, (reasons[0] if reasons else None)
+
+    async def _evaluate_candidate(
+        self,
+        candidate_id: str,
+        candidate: Candidate,
+        at: datetime,
+    ) -> Candidate:
+        before = candidate.state
+        snapshot = self.features.snapshot(candidate.pool_address, at)
+        if self.database is not None and self.pools.pool(candidate.pool_address) is not None:
+            await self.database.record_snapshot(snapshot)
+        if candidate.state not in POSITION_CANDIDATE_STATES:
+            if self._collection_closed(at):
+                return await self._store_candidate(
+                    candidate_id,
+                    before,
+                    self.state_machine.transition(
+                        candidate,
+                        CandidateState.REJECTED,
+                        at,
+                        reject_reason=RejectReason.COLLECTION_WINDOW_CLOSED,
+                    ),
+                )
+            if self.state_machine.is_expired(candidate, at):
+                # Expiry never waits on provider data, so a candidate whose
+                # security inputs keep failing still reaches an outcome.
+                return await self._store_candidate(
+                    candidate_id,
+                    before,
+                    self.state_machine.transition(
+                        candidate,
+                        CandidateState.REJECTED,
+                        at,
+                        reject_reason=RejectReason.ENTRY_WINDOW_EXPIRED,
+                    ),
+                )
+        security_context: SecurityContext | None = None
+        security_result: SecurityResult | None = None
+        score: ScoreBreakdown | None = None
+        if self.security_provider is not None and candidate.state in {
+            CandidateState.SECURITY_CHECK,
+            CandidateState.ELIGIBLE,
+            CandidateState.WAITING_PULLBACK,
+            CandidateState.ARMED,
+            CandidateState.ENTRY_PENDING,
+        }:
+            market_usable, market_reject = self._market_reject_reason(
+                candidate, snapshot
+            )
+            if not market_usable:
+                self.metrics.candidate_evaluation_failures.labels(
+                    stage="market_data"
+                ).inc()
+                return candidate
+            if market_reject is not None and candidate.state == CandidateState.SECURITY_CHECK:
+                return await self._store_candidate(
+                    candidate_id,
+                    before,
+                    self.state_machine.transition(
+                        candidate,
+                        CandidateState.REJECTED,
+                        at,
+                        reject_reason=market_reject,
+                    ),
+                )
+            try:
+                security_context = await self.security_provider(candidate, snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # One token's holder index or quote failing must not stall
+                # every other candidate; this one simply cannot progress now.
+                self.metrics.candidate_evaluation_failures.labels(
+                    stage="security"
+                ).inc()
+                logger.warning(
+                    "candidate security data unavailable; retrying next evaluation",
+                    extra={"candidate_id": candidate_id},
+                    exc_info=True,
+                )
+                return candidate
+            snapshot = self.features.snapshot(candidate.pool_address, at)
+            security_result = self.security.evaluate(security_context, now=at)
+            self._security_results[candidate_id] = (security_context, security_result)
+            if self.database is not None:
+                await self.database.record_security(security_context, security_result)
+            score = self.scoring.score(
+                ScoreContext(
+                    features=snapshot,
+                    round_trip_loss_pct=security_context.execution.round_trip_loss_pct,
+                    buy_price_impact_pct=security_context.execution.buy_price_impact_pct,
+                    sell_price_impact_pct=security_context.execution.sell_price_impact_pct,
+                    sell_route_reliability=Decimal("1") if security_context.execution.sell_route_available else Decimal("0"),
+                    developer_history=DeveloperHistory(
+                        known=security_context.developer_history_known,
+                        previous_rugs=security_context.previous_rugs,
+                        previous_dev_dumps_5m=security_context.previous_dev_dumps_5m,
+                        tokens_created_7d=security_context.developer_tokens_created_7d,
+                        successful_tokens=security_context.developer_successful_tokens,
+                    ),
+                    vwap_reclaimed=snapshot.current_price_usd > snapshot.rolling_vwap_30s,
+                )
+            )
+            self._scores[candidate_id] = score
+            self._persisted_score_totals[candidate_id] = score.total_score
+            if self.database is not None:
+                await self.database.record_signal(candidate, snapshot, score)
+        if candidate.state == CandidateState.ENTRY_PENDING:
+            if not self.entry_gate.enabled:
+                candidate = self.state_machine.transition(
+                    candidate,
+                    CandidateState.REJECTED,
+                    at,
+                    reject_reason=RejectReason.API_UNAVAILABLE,
+                )
+            elif (
+                not score
+                or not security_context
+                or security_result is None
+                or not _entry_rules(
+                    snapshot,
+                    score,
+                    security_context,
+                    security_result,
+                    self.config,
+                )
+            ):
+                candidate = self.state_machine.transition(
+                    candidate,
+                    CandidateState.REJECTED,
+                    at,
+                    reject_reason=RejectReason.SCORE_TOO_LOW,
+                )
+            elif self.entry_handler is not None:
+                reject_reason = await self.entry_handler(candidate, snapshot, score, security_context)
+                if reject_reason is None:
+                    candidate = self.state_machine.transition(
+                        candidate, CandidateState.POSITION_OPEN, at
+                    )
+                else:
+                    candidate = self.state_machine.transition(
+                        candidate,
+                        CandidateState.REJECTED,
+                        at,
+                        reject_reason=reject_reason,
+                    )
+            return await self._store_candidate(candidate_id, before, candidate)
+        candidate = self.state_machine.evaluate(
+            candidate,
+            snapshot,
+            security=security_result,
+            score=score,
+            sell_route_available=(
+                security_context.execution.sell_route_available if security_context else False
+            ),
+            dev_sold=security_context.dev_sold if security_context else False,
+        )
+        return await self._store_candidate(candidate_id, before, candidate)
 
     def list_candidates(self) -> list[Candidate]:
         return list(self.candidates.values())

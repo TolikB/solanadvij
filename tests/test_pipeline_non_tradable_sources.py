@@ -8,6 +8,7 @@ from sniper_bot.candidates import CandidateState
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.pipeline import ConfirmationPipeline
+from sniper_bot.security import RejectReason
 from sniper_bot.stream import EntryGate
 
 
@@ -16,7 +17,7 @@ from sniper_bot.stream import EntryGate
     "source",
     [EventSource.BASELINE_WSS, EventSource.RPC_RECOVERY],
 )
-async def test_non_tradable_sources_materialize_state_without_candidate(
+async def test_non_tradable_sources_materialize_state_with_rejected_candidate(
     tmp_path,
     source: EventSource,
 ) -> None:
@@ -60,7 +61,9 @@ async def test_non_tradable_sources_materialize_state_without_candidate(
 
     assert accepted is True
     assert observed == [event.event_id]
-    assert pipeline.candidates == {}
+    [candidate] = pipeline.candidates.values()
+    assert candidate.state == CandidateState.REJECTED
+    assert candidate.reject_reason == RejectReason.STREAM_NOT_TRADABLE
     assert pipeline.pools.pool("POOL") is not None
 
 

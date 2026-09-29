@@ -20,9 +20,10 @@ from sniper_bot.events import (
     RawEventReader,
     RawEventRecorder,
 )
-from sniper_bot.protocols import UnknownDiscriminatorError
+from sniper_bot.protocols import AnchorDecodeError, AnchorIdlDecoder, UnknownDiscriminatorError
 from sniper_bot.protocols.anchor import _base58_encode
-from sniper_bot.protocols.pump import PUMP_PROGRAM_ID, PumpDecoder
+from sniper_bot.protocols.pump import PUMP_PROGRAM_ID, PUMP_STATE_EVENT_NAMES, PumpDecoder
+from sniper_bot.protocols.pump import decoder as pump_decoder_module
 from sniper_bot.protocols.pumpswap import PumpSwapDecoder
 
 
@@ -90,9 +91,74 @@ def test_pumpswap_decoder_uses_real_reversed_create_pool_event() -> None:
     assert event.pool_address == "3NPBqdz22Xz4xhomduRcC8QTCcHnqBGVgLXB8sWWPRpp"
 
 
-def test_unknown_anchor_discriminator_fails_closed() -> None:
+def test_unknown_anchor_discriminator_fails_closed_in_strict_decoding() -> None:
+    transaction = _complete_event_transaction(bytes([255]) * 8)
+    decoder = AnchorIdlDecoder(Path(pump_decoder_module.__file__).with_name("idl.json"))
+
     with pytest.raises(UnknownDiscriminatorError):
-        PumpDecoder().decode_transaction(_complete_event_transaction(bytes([255]) * 8))
+        decoder.decode_logs(transaction["meta"]["logMessages"])
+
+
+def test_selective_decoding_reports_unknown_discriminator_instead_of_raising() -> None:
+    decoded = PumpDecoder().decode(_complete_event_transaction(bytes([255]) * 8))
+
+    assert decoded.events == []
+    assert decoded.unknown_discriminators == 1
+
+
+def _trade_event_payload(timestamp: int) -> bytes:
+    discriminator = bytes([189, 219, 127, 211, 78, 230, 97, 238])
+    return (
+        discriminator
+        + bytes([2]) * 32
+        + struct.pack("<Q", 1)
+        + struct.pack("<Q", 2)
+        + b"\x01"
+        + bytes([5]) * 32
+        + struct.pack("<q", timestamp)
+    )
+
+
+def test_block_time_comes_from_event_clock_when_the_stream_omits_it() -> None:
+    transaction = _complete_event_transaction()
+    del transaction["blockTime"]
+
+    decoded = PumpDecoder().decode(transaction)
+
+    assert decoded.block_time == datetime.fromtimestamp(1_776_700_000, tz=timezone.utc)
+    assert decoded.events[0].block_time == decoded.block_time
+
+
+def test_skipped_trade_event_still_dates_the_transaction() -> None:
+    payload = _trade_event_payload(1_776_700_123)
+    transaction = {
+        "slot": 5,
+        "signature": "trade-only",
+        "meta": {
+            "logMessages": [
+                f"Program {PUMP_PROGRAM_ID} invoke [1]",
+                f"Program data: {base64.b64encode(payload).decode()}",
+                f"Program {PUMP_PROGRAM_ID} success",
+            ]
+        },
+    }
+
+    decoded = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(transaction)
+
+    assert decoded.events == []
+    assert decoded.block_time == datetime.fromtimestamp(1_776_700_123, tz=timezone.utc)
+
+
+def test_truncated_consumed_event_still_fails_closed() -> None:
+    transaction = _complete_event_transaction()
+    del transaction["blockTime"]
+    payload = bytes([95, 114, 97, 156, 212, 46, 152, 8]) + bytes([1]) * 96
+    transaction["meta"]["logMessages"][1] = (
+        f"Program data: {base64.b64encode(payload).decode()}"
+    )
+
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder().decode(transaction)
 
 
 @pytest.mark.asyncio

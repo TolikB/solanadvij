@@ -5,11 +5,13 @@ from decimal import Decimal
 
 import pytest
 
+from sniper_bot.candidates import CandidateState
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.features import TradeSide
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.pipeline import ConfirmationPipeline
 from sniper_bot.registry import WSOL_MINT, QuoteAssetPrice
+from sniper_bot.security import RejectReason
 from sniper_bot.stream import EntryGate
 
 TOKEN_MINT = "2r8hyN4p3uTtTjGkkyzhNt4Ygxe3J1JnQPqCoi3pyyvu"
@@ -55,7 +57,7 @@ def _pool_event(source: EventSource, now: datetime) -> EventEnvelope:
     "source",
     [EventSource.BASELINE_WSS, EventSource.RPC_RECOVERY],
 )
-async def test_non_tradable_sources_materialize_pool_without_candidate(
+async def test_non_tradable_sources_reject_the_pool_at_its_creation_block(
     tmp_path,
     source: EventSource,
 ) -> None:
@@ -68,7 +70,11 @@ async def test_non_tradable_sources_materialize_pool_without_candidate(
     assert pool is not None
     assert pool.base_mint == TOKEN_MINT
     assert pipeline.tokens.get(TOKEN_MINT) is not None
-    assert pipeline.list_candidates() == []
+    [candidate] = pipeline.list_candidates()
+    assert candidate.state == CandidateState.REJECTED
+    assert candidate.reject_reason == RejectReason.STREAM_NOT_TRADABLE
+    assert candidate.rejected_at == now
+    assert await pipeline.evaluate_candidates(now + timedelta(seconds=1)) == []
 
 
 @pytest.mark.asyncio
@@ -112,7 +118,7 @@ async def test_reversed_pool_flips_trade_side_and_uses_wsol_volume(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_live_pool_without_unique_supported_quote_has_no_candidate(tmp_path) -> None:
+async def test_live_pool_without_unique_supported_quote_is_rejected_on_sight(tmp_path) -> None:
     now = datetime(2026, 8, 25, 8, 35, tzinfo=timezone.utc)
     pipeline = _pipeline(tmp_path)
     event = EventEnvelope(
@@ -139,4 +145,7 @@ async def test_live_pool_without_unique_supported_quote_has_no_candidate(tmp_pat
     assert await pipeline.process_event(event) is True
 
     assert pipeline.pools.pool("UNSUPPORTED") is not None
-    assert pipeline.list_candidates() == []
+    [candidate] = pipeline.list_candidates()
+    assert candidate.state == CandidateState.REJECTED
+    assert candidate.reject_reason == RejectReason.UNSUPPORTED_QUOTE_MINT
+    assert candidate.rejected_at == now

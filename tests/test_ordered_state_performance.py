@@ -265,7 +265,7 @@ async def test_stream_stop_cleans_up_even_if_notification_queue_times_out() -> N
     with pytest.raises(RuntimeError, match="Solana ingress queues did not drain within"):
         await gateway.stop()
 
-    # Verify worker task and fetch tasks are cancelled and cleaned up
+    # Verify worker task and dispatcher are cancelled and cleaned up
     assert gateway._worker_task is None
     assert gateway._notification_dispatch_task is None
-    assert len(gateway._log_fetch_tasks) == 0
+    assert gateway._notification_in_flight is False

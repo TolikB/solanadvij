@@ -30,6 +30,21 @@ class AnchorEvent:
     log_index: int
 
 
+@dataclass(frozen=True)
+class AnchorLogScan:
+    """Selected events of one transaction plus its on-chain clock timestamp.
+
+    ``timestamp`` is the ``Clock::unix_timestamp`` the program wrote into the
+    first own event that carries one. It is the value ``getBlockTime`` returns
+    for the slot, so it dates a transaction without an RPC round trip, and it is
+    read even from events that are skipped rather than decoded.
+    """
+
+    events: list[AnchorEvent]
+    timestamp: int | None
+    skipped_unknown_discriminators: int = 0
+
+
 class _Cursor:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
@@ -57,9 +72,66 @@ class AnchorIdlDecoder:
         self._events: dict[bytes, str] = {
             bytes(item["discriminator"]): item["name"] for item in self.idl.get("events", [])
         }
+        self._timestamp_offsets: dict[str, int] = {}
+        for event_name in self._events.values():
+            offset = self._fixed_field_offset(event_name, "timestamp")
+            if offset is not None:
+                self._timestamp_offsets[event_name] = offset
 
     def decode_logs(self, logs: list[str]) -> list[AnchorEvent]:
+        """Decode every own event strictly; unknown discriminators fail closed."""
+        return self.scan_logs(logs).events
+
+    def scan_logs(
+        self,
+        logs: list[str],
+        *,
+        event_names: frozenset[str] | None = None,
+    ) -> AnchorLogScan:
+        """Decode the selected own events and read the transaction timestamp.
+
+        With ``event_names`` only those events are decoded and every other
+        discriminator, including one the vendored IDL does not know, is
+        skipped after reading at most its fixed-offset timestamp. A selected
+        event whose layout does not match the IDL still fails closed.
+        """
         decoded: list[AnchorEvent] = []
+        timestamp: int | None = None
+        skipped_unknown = 0
+        for log_index, encoded in self._own_event_lines(logs):
+            if event_names is None:
+                payload = _b64decode(encoded)
+                prefix = payload
+            else:
+                prefix = _b64decode_prefix(encoded, 8)
+            if len(prefix) < 8:
+                raise AnchorDecodeError("Anchor event payload is shorter than discriminator")
+            discriminator = prefix[:8]
+            event_name = self._events.get(discriminator)
+            if event_name is None:
+                if event_names is not None:
+                    skipped_unknown += 1
+                    continue
+                raise UnknownDiscriminatorError(self.program_id, discriminator)
+            if event_names is not None and event_name not in event_names:
+                if timestamp is None:
+                    timestamp = self._peek_timestamp(event_name, encoded)
+                continue
+            payload = prefix if event_names is None else _b64decode(encoded)
+            fields = self._decode_struct(event_name, payload[8:])
+            if timestamp is None and type(fields.get("timestamp")) is int:
+                timestamp = int(fields["timestamp"])
+            decoded.append(
+                AnchorEvent(name=event_name, fields=fields, log_index=log_index)
+            )
+        return AnchorLogScan(
+            events=decoded,
+            timestamp=timestamp,
+            skipped_unknown_discriminators=skipped_unknown,
+        )
+
+    def _own_event_lines(self, logs: list[str]) -> list[tuple[int, str]]:
+        lines: list[tuple[int, str]] = []
         program_stack: list[str] = []
         own_invocation_seen = False
 
@@ -81,25 +153,56 @@ class AnchorIdlDecoder:
                 continue
             if not program_stack and not own_invocation_seen:
                 continue
-            encoded = line.removeprefix("Program data: ").strip()
-            try:
-                payload = base64.b64decode(encoded, validate=True)
-            except Exception as exc:
-                raise AnchorDecodeError("invalid base64 in Anchor event log") from exc
-            if len(payload) < 8:
-                raise AnchorDecodeError("Anchor event payload is shorter than discriminator")
-            discriminator = payload[:8]
-            event_name = self._events.get(discriminator)
-            if event_name is None:
-                raise UnknownDiscriminatorError(self.program_id, discriminator)
-            decoded.append(
-                AnchorEvent(
-                    name=event_name,
-                    fields=self._decode_struct(event_name, payload[8:]),
-                    log_index=log_index,
-                )
-            )
-        return decoded
+            lines.append((log_index, line.removeprefix("Program data: ").strip()))
+        return lines
+
+    def _peek_timestamp(self, event_name: str, encoded: str) -> int | None:
+        offset = self._timestamp_offsets.get(event_name)
+        if offset is None:
+            return None
+        start = 8 + offset
+        payload = _b64decode_prefix(encoded, start + 8)
+        if len(payload) < start + 8:
+            return None
+        return int(struct.unpack("<q", payload[start : start + 8])[0])
+
+    def _fixed_field_offset(self, type_name: str, field_name: str) -> int | None:
+        definition = self._types.get(type_name)
+        if definition is None or definition.get("kind") != "struct":
+            return None
+        offset = 0
+        for field in definition.get("fields", []):
+            if field["name"] == field_name:
+                return offset if field["type"] == "i64" else None
+            size = self._fixed_size(field["type"])
+            if size is None:
+                return None
+            offset += size
+        return None
+
+    def _fixed_size(self, type_spec: Any) -> int | None:
+        if isinstance(type_spec, str):
+            return _FIXED_PRIMITIVE_SIZES.get(type_spec)
+        if not isinstance(type_spec, dict):
+            return None
+        if "array" in type_spec:
+            item_type, length = type_spec["array"]
+            item_size = self._fixed_size(item_type)
+            return None if item_size is None else item_size * int(length)
+        if "defined" in type_spec:
+            defined = type_spec["defined"]
+            name = defined["name"] if isinstance(defined, dict) else str(defined)
+            definition = self._types.get(name)
+            if definition is None or definition.get("kind") != "struct":
+                return None
+            total = 0
+            for field in definition.get("fields", []):
+                size = self._fixed_size(field["type"])
+                if size is None:
+                    return None
+                total += size
+            return total
+        return None
 
     def _decode_struct(self, type_name: str, payload: bytes) -> dict[str, Any]:
         definition = self._types.get(type_name)
@@ -194,6 +297,37 @@ class AnchorIdlDecoder:
             length = self._decode_primitive("u32", cursor)
             return cursor.take(length).hex()
         raise AnchorDecodeError(f"unsupported primitive IDL type {name}")
+
+
+_FIXED_PRIMITIVE_SIZES = {
+    "u8": 1,
+    "i8": 1,
+    "bool": 1,
+    "u16": 2,
+    "i16": 2,
+    "u32": 4,
+    "i32": 4,
+    "u64": 8,
+    "i64": 8,
+    "u128": 16,
+    "i128": 16,
+    "pubkey": 32,
+}
+
+
+def _b64decode(encoded: str) -> bytes:
+    try:
+        return base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise AnchorDecodeError("invalid base64 in Anchor event log") from exc
+
+
+def _b64decode_prefix(encoded: str, byte_count: int) -> bytes:
+    """Decode only the leading base64 groups that cover ``byte_count`` bytes."""
+    characters = -(-byte_count // 3) * 4
+    if len(encoded) <= characters:
+        return _b64decode(encoded)
+    return _b64decode(encoded[:characters])
 
 
 _BASE58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"

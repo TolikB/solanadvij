@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -167,6 +168,35 @@ class LoggingConfig(BaseModel):
     json_logs: bool = True
 
 
+class CollectionConfig(BaseModel):
+    """End of the frozen statistical collection window.
+
+    The statistical gate needs every discovered pool to reach a terminal
+    outcome and every position to close by ``ends_at``. From ``ends_at`` minus
+    ``entry_cutoff_seconds`` new pools are rejected on sight, open candidates
+    are rejected, and no entry is taken, while open positions keep being
+    managed until they close. ``None`` means no window is frozen.
+    """
+
+    ends_at: datetime | None = None
+    entry_cutoff_seconds: int = Field(default=1800, ge=0)
+
+    @field_validator("ends_at")
+    @classmethod
+    def validate_ends_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("collection.ends_at must include a UTC offset")
+        return value.astimezone(timezone.utc)
+
+    @property
+    def closes_at(self) -> datetime | None:
+        if self.ends_at is None:
+            return None
+        return self.ends_at - timedelta(seconds=self.entry_cutoff_seconds)
+
+
 class AppConfig(BaseSettings):
     """Application settings loaded from YAML + environment."""
 
@@ -224,6 +254,7 @@ class AppConfig(BaseSettings):
     storage: StorageConfig = StorageConfig(raw_retention_days=90)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    collection: CollectionConfig = Field(default_factory=CollectionConfig)
 
     # Runtime fields
     config_hash: str = Field(default="", exclude=True)
@@ -351,6 +382,19 @@ class AppConfig(BaseSettings):
             raise ValueError("candidate min pool age cannot be shorter than observation window")
         if self.candidate.max_pool_age_seconds <= self.candidate.min_pool_age_seconds:
             raise ValueError("candidate max pool age must exceed min pool age")
+        minimum_cutoff = (
+            self.candidate.max_pool_age_seconds
+            + self.exits.maximum_holding_seconds
+            + self.paper.exit_retry_timeout_seconds
+        )
+        if (
+            self.collection.ends_at is not None
+            and self.collection.entry_cutoff_seconds < minimum_cutoff
+        ):
+            raise ValueError(
+                "collection.entry_cutoff_seconds must leave room for the last "
+                f"candidate and position to finish ({minimum_cutoff} s)"
+            )
         self.config_hash = self._compute_hash()
         self.strategy_version = (
             f"{self.config_hash[:16]}-{self.release_revision[:12]}"
@@ -395,6 +439,10 @@ class AppConfig(BaseSettings):
             # Operational recovery switch: toggling it during an incident must
             # not fork the strategy identity, report keys, or replay evidence.
             chain.pop("halt_on_unrecoverable_gap", None)
+        if self.collection.ends_at is None:
+            # No frozen window changes no decision, so it keeps the identity
+            # of configurations that predate the setting.
+            data.pop("collection", None)
         data["risk"] = data.get("risk", {})
         return data
 

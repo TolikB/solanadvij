@@ -16,7 +16,7 @@ from .events import EventSource, Protocol
 from .metrics import BotMetrics
 from .protocols.pump import PUMP_PROGRAM_ID
 from .protocols.pumpswap import PUMPSWAP_PROGRAM_ID
-from .solana_rpc import SolanaRpcClient, SolanaRpcError
+from .solana_rpc import SolanaRpcClient
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +114,6 @@ class HeliusStreamGateway:
     GAP_RECOVERY_TIMEOUT_SECONDS = 15.0
     LIVE_BASELINE_WARMUP = timedelta(seconds=60)
     LOG_FETCH_CONCURRENCY = 20
-    SLOT_BLOCK_TIME_CACHE_SIZE = 512
-    BLOCK_TIME_RETRY_DELAYS = (0.25, 0.5, 1.0)
     PROCESSING_BATCH_SIZE = 1024
     PROCESSING_BATCH_WINDOW_SECONDS = 0.02
     SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 120.0
@@ -176,16 +174,10 @@ class HeliusStreamGateway:
         self._worker_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._stream_generation = 0
-        self._log_fetch_sequence = 0
-        self._log_fetch_semaphore = asyncio.Semaphore(log_fetch_concurrency)
         self._gap_recovery_semaphore = asyncio.Semaphore(log_fetch_concurrency)
-        self._log_fetch_tasks: set[asyncio.Task[None]] = set()
-        self._log_fetch_tail: asyncio.Task[None] | None = None
-        self._fetch_error_sequences: set[int] = set()
         self._reconnect_requested = asyncio.Event()
         self._dispatch_recovery_pending = False
-        self._slot_block_times: dict[int, int] = {}
-        self._slot_block_time_tasks: dict[int, asyncio.Task[int | None]] = {}
+        self._notification_in_flight = False
 
     async def start(self) -> None:
         if self._run_task is not None:
@@ -220,10 +212,6 @@ class HeliusStreamGateway:
                 self.SHUTDOWN_DRAIN_TIMEOUT_SECONDS
             ):
                 await self._notification_queue.join()
-                if self._log_fetch_tasks:
-                    await asyncio.gather(
-                        *tuple(self._log_fetch_tasks)
-                    )
         except TimeoutError as exc:
             self.entry_gate.block("stream_recovery_gap")
             self.metrics.stream_recovery_gap_active.set(1)
@@ -238,7 +226,7 @@ class HeliusStreamGateway:
             ).observe(
                 asyncio.get_running_loop().time() - started
             )
-            await self._cancel_log_fetch_tasks()
+            await self._cancel_ingress_dispatch()
             if self._notification_dispatch_task is not None:
                 if not self._notification_dispatch_task.done():
                     self._notification_dispatch_task.cancel()
@@ -409,7 +397,7 @@ class HeliusStreamGateway:
                     finally:
                         self.entry_gate.block("stream_disconnected")
                         if not self._stopping.is_set():
-                            await self._cancel_log_fetch_tasks()
+                            await self._cancel_ingress_dispatch()
             except _UseLogsFallback as exc:
                 if not self._extend_handshake_buffer(
                     pending_handshake_messages, exc.buffered_messages
@@ -474,7 +462,10 @@ class HeliusStreamGateway:
                                 },
                                 {
                                     "commitment": "confirmed",
-                                    "encoding": "jsonParsed",
+                                    # Only meta.logMessages is decoded, so the
+                                    # compact encoding saves parse time on
+                                    # every notification.
+                                    "encoding": "base64",
                                     "transactionDetails": "full",
                                     "maxSupportedTransactionVersion": 0,
                                 },
@@ -619,8 +610,15 @@ class HeliusStreamGateway:
         transaction = result.get("transaction") if isinstance(result, dict) else None
         context = result.get("context") if isinstance(result, dict) else None
         if isinstance(transaction, dict):
-            if "slot" not in transaction and isinstance(context, dict):
-                transaction["slot"] = context.get("slot", 0)
+            # Helius puts the signature and slot beside the transaction, not
+            # inside it, and sends no block time at all.
+            if "signature" not in transaction and isinstance(result.get("signature"), str):
+                transaction["signature"] = result["signature"]
+            if "slot" not in transaction:
+                if type(result.get("slot")) is int:
+                    transaction["slot"] = result["slot"]
+                elif isinstance(context, dict):
+                    transaction["slot"] = context.get("slot", 0)
             self._enqueue_notification_dispatch(
                 _TransactionNotification(
                     transaction=transaction,
@@ -702,22 +700,30 @@ class HeliusStreamGateway:
     async def _dispatch_notifications(self) -> None:
         while True:
             item = await self._notification_queue.get()
+            self._notification_in_flight = True
             try:
                 if isinstance(item, _TransactionNotification):
-                    await self._queue_transaction(
-                        item.transaction,
-                        EventSource.HELIUS_WSS,
-                        received_at=item.received_at,
-                        generation=item.generation,
-                    )
+                    transaction = item.transaction
+                    source = EventSource.HELIUS_WSS
                 else:
-                    await self._spawn_ordered_log_dispatch(
-                        signature=item.signature,
-                        slot=item.slot,
-                        logs=item.logs,
-                        received_at=item.received_at,
-                        generation=item.generation,
-                    )
+                    # The decoders date the transaction from the program's
+                    # Clock timestamp, so no getBlockTime round trip is needed
+                    # and dispatch stays in receive order at stream speed.
+                    transaction = {
+                        "slot": item.slot,
+                        "signature": item.signature,
+                        "meta": {
+                            "err": None,
+                            "logMessages": item.logs,
+                        },
+                    }
+                    source = EventSource.SOLANA_WSS
+                await self._queue_transaction(
+                    transaction,
+                    source,
+                    received_at=item.received_at,
+                    generation=item.generation,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -729,258 +735,9 @@ class HeliusStreamGateway:
                 )
                 raise
             finally:
+                self._notification_in_flight = False
                 self._notification_queue.task_done()
                 self._sync_queue_depth()
-
-    async def _spawn_ordered_log_dispatch(
-        self,
-        *,
-        signature: str,
-        slot: int,
-        logs: list[str],
-        received_at: datetime,
-        generation: int,
-    ) -> None:
-        await self._acquire_log_fetch_permit()
-        sequence = self._log_fetch_sequence
-        self._log_fetch_sequence += 1
-        previous = self._log_fetch_tail
-        task = asyncio.create_task(
-            self._fetch_block_time_and_dispatch_logs(
-                sequence=sequence,
-                signature=signature,
-                slot=slot,
-                logs=logs,
-                received_at=received_at,
-                generation=generation,
-                previous=previous,
-            ),
-            name=f"solana-log-dispatch-{sequence}",
-        )
-        self._log_fetch_tail = task
-        self._log_fetch_tasks.add(task)
-        task.add_done_callback(self._forget_log_fetch_task)
-        self._sync_queue_depth()
-
-    async def _fetch_block_time_and_dispatch_logs(
-        self,
-        *,
-        sequence: int,
-        signature: str,
-        slot: int,
-        logs: list[str],
-        received_at: datetime,
-        generation: int,
-        previous: asyncio.Task[None] | None,
-    ) -> None:
-        dispatched = False
-        try:
-            block_time = await self._get_slot_block_time(slot)
-            if previous is not None:
-                await previous
-            if any(failed < sequence for failed in self._fetch_error_sequences):
-                raise RuntimeError("an earlier ordered transaction dispatch failed")
-            await self._queue_transaction(
-                {
-                    "slot": slot,
-                    "blockTime": block_time,
-                    "signature": signature,
-                    "meta": {
-                        "err": None,
-                        "logMessages": logs,
-                    },
-                },
-                EventSource.SOLANA_WSS,
-                received_at=received_at,
-                generation=generation,
-            )
-            dispatched = True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self._fetch_error_sequences.add(sequence)
-            self._dispatch_recovery_pending = True
-            self.entry_gate.block("stream_fetch_error")
-            self._reconnect_requested.set()
-            logger.exception(
-                "Solana ordered logs dispatch failed; reconnect requested",
-                extra={"sequence": sequence},
-            )
-            raise
-        finally:
-            if dispatched:
-                self._fetch_error_sequences.discard(sequence)
-                if (
-                    not self._fetch_error_sequences
-                    and not self._dispatch_recovery_pending
-                ):
-                    self.entry_gate.unblock("stream_fetch_error")
-            self._log_fetch_semaphore.release()
-
-    async def _fetch_slot_block_time(self, slot: int) -> int | None:
-        for attempt in range(len(self.BLOCK_TIME_RETRY_DELAYS) + 1):
-            try:
-                return await self.rpc.get_block_time(slot)
-            except SolanaRpcError as error:
-                if (
-                    error.code != -32004
-                    or attempt >= len(self.BLOCK_TIME_RETRY_DELAYS)
-                ):
-                    raise
-                await asyncio.sleep(self.BLOCK_TIME_RETRY_DELAYS[attempt])
-        raise RuntimeError("unreachable block-time retry state")
-
-    async def _get_slot_block_time(self, slot: int) -> int:
-        if slot <= 0:
-            raise RuntimeError("Solana logs notification is missing a valid slot")
-        cached = self._slot_block_times.get(slot)
-        if cached is not None:
-            return cached
-        task = self._slot_block_time_tasks.get(slot)
-        if task is None:
-            task = asyncio.create_task(
-                self._fetch_slot_block_time(slot),
-                name=f"solana-block-time-{slot}",
-            )
-            self._slot_block_time_tasks[slot] = task
-        try:
-            block_time = await task
-        finally:
-            if self._slot_block_time_tasks.get(slot) is task:
-                del self._slot_block_time_tasks[slot]
-        if block_time is None:
-            raise RuntimeError("confirmed Solana slot block time is unavailable")
-        self._slot_block_times[slot] = block_time
-        while len(self._slot_block_times) > self.SLOT_BLOCK_TIME_CACHE_SIZE:
-            oldest_slot = next(iter(self._slot_block_times))
-            del self._slot_block_times[oldest_slot]
-        return block_time
-
-    async def _acquire_log_fetch_permit(self) -> None:
-        while True:
-            if self._reconnect_requested.is_set():
-                raise RuntimeError(
-                    "ordered Solana transaction dispatch requested reconnect"
-                )
-            try:
-                await asyncio.wait_for(
-                    self._log_fetch_semaphore.acquire(),
-                    timeout=0.25,
-                )
-            except TimeoutError:
-                continue
-            if self._reconnect_requested.is_set():
-                self._log_fetch_semaphore.release()
-                raise RuntimeError(
-                    "ordered Solana transaction dispatch requested reconnect"
-                )
-            return
-
-    async def _spawn_ordered_log_fetch(
-        self,
-        *,
-        signature: str,
-        slot: int,
-        received_at: datetime,
-        generation: int,
-    ) -> None:
-        await self._acquire_log_fetch_permit()
-        sequence = self._log_fetch_sequence
-        self._log_fetch_sequence += 1
-        previous = self._log_fetch_tail
-        task = asyncio.create_task(
-            self._fetch_and_dispatch_log_transaction(
-                sequence=sequence,
-                signature=signature,
-                slot=slot,
-                received_at=received_at,
-                generation=generation,
-                previous=previous,
-            ),
-            name=f"solana-log-fetch-{sequence}",
-        )
-        self._log_fetch_tail = task
-        self._log_fetch_tasks.add(task)
-        task.add_done_callback(self._forget_log_fetch_task)
-        self._sync_queue_depth()
-
-    async def _fetch_and_dispatch_log_transaction(
-        self,
-        *,
-        sequence: int,
-        signature: str,
-        slot: int,
-        received_at: datetime,
-        generation: int,
-        previous: asyncio.Task[None] | None,
-    ) -> None:
-        attempt = 0
-        dispatched = False
-        try:
-            while True:
-                try:
-                    transaction = await self.rpc.get_transaction(signature)
-                    if transaction is None:
-                        raise RuntimeError(
-                            "confirmed transaction is temporarily unavailable"
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    attempt += 1
-                    self._fetch_error_sequences.add(sequence)
-                    self.entry_gate.block("stream_fetch_error")
-                    logger.warning(
-                        "Solana transaction fetch failed; retrying in receive order",
-                        extra={"attempt": attempt},
-                    )
-                    await asyncio.sleep(min(5, 0.25 * (2 ** min(attempt - 1, 5))))
-                    continue
-                break
-
-            if previous is not None:
-                await previous
-            if any(failed < sequence for failed in self._fetch_error_sequences):
-                raise RuntimeError("an earlier ordered transaction dispatch failed")
-            transaction.setdefault("slot", slot)
-            await self._queue_transaction(
-                transaction,
-                EventSource.SOLANA_WSS,
-                received_at=received_at,
-                generation=generation,
-            )
-            dispatched = True
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self._fetch_error_sequences.add(sequence)
-            self._dispatch_recovery_pending = True
-            self.entry_gate.block("stream_fetch_error")
-            self._reconnect_requested.set()
-            logger.exception(
-                "Solana ordered transaction dispatch failed; reconnect requested",
-                extra={"sequence": sequence},
-            )
-            raise
-        finally:
-            if dispatched:
-                self._fetch_error_sequences.discard(sequence)
-                if (
-                    not self._fetch_error_sequences
-                    and not self._dispatch_recovery_pending
-                ):
-                    self.entry_gate.unblock("stream_fetch_error")
-            self._log_fetch_semaphore.release()
-
-    def _forget_log_fetch_task(self, task: asyncio.Task[None]) -> None:
-        try:
-            task.exception()
-        except asyncio.CancelledError:
-            pass
-        self._log_fetch_tasks.discard(task)
-        if self._log_fetch_tail is task:
-            self._log_fetch_tail = None
-        self._sync_queue_depth()
 
     async def _cancel_notification_dispatcher(self) -> None:
         dispatch_task = self._notification_dispatch_task
@@ -988,26 +745,15 @@ class HeliusStreamGateway:
             dispatch_task.cancel()
             await asyncio.gather(dispatch_task, return_exceptions=True)
             self._notification_dispatch_task = None
-    async def _cancel_log_fetch_tasks(self) -> None:
+
+    async def _cancel_ingress_dispatch(self) -> None:
+        interrupted = self._notification_in_flight
         await self._cancel_notification_dispatcher()
-        fetch_tasks = tuple(self._log_fetch_tasks)
-        if fetch_tasks or not self._notification_queue.empty():
+        if interrupted or not self._notification_queue.empty():
             self._dispatch_recovery_pending = True
             self.entry_gate.block("stream_recovery_gap")
             self.metrics.stream_recovery_gap_active.set(1)
-        for task in fetch_tasks:
-            task.cancel()
-        if fetch_tasks:
-            await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        self._log_fetch_tasks.clear()
-        block_time_tasks = tuple(set(self._slot_block_time_tasks.values()))
-        for block_time_task in block_time_tasks:
-            block_time_task.cancel()
-        if block_time_tasks:
-            await asyncio.gather(*block_time_tasks, return_exceptions=True)
-        self._slot_block_time_tasks.clear()
-        self._log_fetch_tail = None
-        self._fetch_error_sequences.clear()
+        self._notification_in_flight = False
         self._sync_queue_depth()
 
     async def _queue_transaction(
@@ -1314,7 +1060,6 @@ class HeliusStreamGateway:
                 self._dispatch_recovery_pending
                 and not stale
                 and not self._reconnect_requested.is_set()
-                and not self._fetch_error_sequences
             ):
                 self._dispatch_recovery_pending = False
                 self.entry_gate.unblock("stream_fetch_error")
@@ -1325,13 +1070,9 @@ class HeliusStreamGateway:
     def _sync_queue_depth(self) -> None:
         processing_depth = self._queue.qsize()
         notification_depth = self._notification_queue.qsize()
-        dispatch_depth = len(self._log_fetch_tasks)
         self.metrics.event_processing_queue_depth.set(processing_depth)
         self.metrics.event_notification_queue_depth.set(notification_depth)
-        self.metrics.event_log_dispatch_tasks.set(dispatch_depth)
-        self.metrics.event_queue_depth.set(
-            processing_depth + notification_depth + dispatch_depth
-        )
+        self.metrics.event_queue_depth.set(processing_depth + notification_depth)
 
 
 def _transaction_protocols(transaction: dict[str, Any]) -> list[Protocol]:

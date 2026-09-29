@@ -9,7 +9,7 @@ import pytest
 
 from sniper_bot.events import EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
-from sniper_bot.solana_rpc import SolanaRpcClient, SolanaRpcError
+from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import (
     EntryGate,
     HeliusStreamGateway,
@@ -673,21 +673,32 @@ async def test_failed_buffer_handler_retries_only_unconfirmed_message(
             await run_task
 
 
+def _logs_notification(signature: str, slot: int) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "logsNotification",
+        "params": {
+            "result": {
+                "context": {"slot": slot},
+                "value": {
+                    "signature": signature,
+                    "err": None,
+                    "logs": [f"Program data: {signature}"],
+                },
+            }
+        },
+    }
+
+
 @pytest.mark.asyncio
-async def test_logs_notification_uses_cached_block_time_without_transaction_fetch(
+async def test_logs_notification_dispatches_in_order_without_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _gateway()
-    gateway.SLOT_BLOCK_TIME_CACHE_SIZE = 2
-    block_time_calls: list[int] = []
     queued: list[tuple[dict[str, Any], EventSource, dict[str, Any]]] = []
 
-    async def get_block_time(slot: int) -> int:
-        block_time_calls.append(slot)
-        return 1_787_646_900 + slot
-
-    async def unexpected_get_transaction(_signature: str) -> dict[str, Any]:
-        pytest.fail("logsNotification must not fetch the full transaction")
+    async def unexpected_rpc(*_args: Any) -> Any:
+        pytest.fail("logsNotification dispatch must not call Solana RPC")
 
     async def queue_transaction(
         transaction: dict[str, Any],
@@ -696,120 +707,89 @@ async def test_logs_notification_uses_cached_block_time_without_transaction_fetc
     ) -> None:
         queued.append((transaction, source, kwargs))
 
-    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
-    monkeypatch.setattr(gateway.rpc, "get_transaction", unexpected_get_transaction)
+    monkeypatch.setattr(gateway.rpc, "get_block_time", unexpected_rpc)
+    monkeypatch.setattr(gateway.rpc, "get_transaction", unexpected_rpc)
     monkeypatch.setattr(gateway, "_queue_transaction", queue_transaction)
 
-    def notification(signature: str, slot: int) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "method": "logsNotification",
-            "params": {
-                "result": {
-                    "context": {"slot": slot},
-                    "value": {
-                        "signature": signature,
-                        "err": None,
-                        "logs": ["Program data: example"],
-                    },
-                }
-            },
-        }
-
-    await gateway.handle_message(notification("first", 1))
-    await gateway.handle_message(notification("second", 1))
-    await gateway.handle_message(notification("third", 2))
-    await gateway.handle_message(notification("fourth", 3))
+    for signature, slot in (("first", 1), ("second", 1), ("third", 2), ("fourth", 3)):
+        await gateway.handle_message(_logs_notification(signature, slot))
     await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
-    tasks = tuple(gateway._log_fetch_tasks)
-    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
-    await asyncio.sleep(0)
 
-    assert block_time_calls == [1, 2, 3]
     assert [row[0]["signature"] for row in queued] == [
         "first",
         "second",
         "third",
         "fourth",
     ]
-    assert queued[0][0]["blockTime"] == 1_787_646_901
-    assert queued[0][0]["meta"]["logMessages"] == ["Program data: example"]
+    assert [row[0]["slot"] for row in queued] == [1, 1, 2, 3]
+    assert "blockTime" not in queued[0][0]
+    assert queued[0][0]["meta"] == {"err": None, "logMessages": ["Program data: first"]}
     assert all(row[1] == EventSource.SOLANA_WSS for row in queued)
-    assert list(gateway._slot_block_times) == [2, 3]
-    assert gateway._log_fetch_tasks == set()
+    assert all(row[2]["generation"] == gateway._stream_generation for row in queued)
 
 
 @pytest.mark.asyncio
-async def test_logs_notification_retries_transient_unavailable_block_time(
+async def test_helius_transaction_notification_takes_signature_and_slot_from_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gateway = _gateway()
-    gateway.BLOCK_TIME_RETRY_DELAYS = (0.0, 0.0)
-    calls = 0
-
-    async def transient_block_time(_slot: int) -> int:
-        nonlocal calls
-        calls += 1
-        if calls < 3:
-            raise SolanaRpcError(
-                "Solana RPC getBlockTime failed with code -32004",
-                code=-32004,
-            )
-        return 1_787_646_900
-
-    monkeypatch.setattr(gateway.rpc, "get_block_time", transient_block_time)
-
-    assert await gateway._get_slot_block_time(123) == 1_787_646_900
-    assert calls == 3
-
-
-@pytest.mark.asyncio
-async def test_logs_notification_block_time_failure_is_fail_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _gateway()
-
-    async def missing_block_time(_slot: int) -> None:
-        return None
+    queued: list[tuple[dict[str, Any], EventSource]] = []
 
     async def queue_transaction(
-        _transaction: dict[str, Any],
-        _source: EventSource,
+        transaction: dict[str, Any],
+        source: EventSource,
         **_kwargs: Any,
     ) -> None:
-        pytest.fail("unavailable block time must not dispatch a transaction")
+        queued.append((transaction, source))
 
-    monkeypatch.setattr(gateway.rpc, "get_block_time", missing_block_time)
     monkeypatch.setattr(gateway, "_queue_transaction", queue_transaction)
-    notification = {
-        "jsonrpc": "2.0",
-        "method": "logsNotification",
-        "params": {
-            "result": {
-                "context": {"slot": 123},
-                "value": {
-                    "signature": "missing-time",
-                    "err": None,
-                    "logs": ["Program data: example"],
+    logs = ["Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA invoke [1]"]
+    await gateway.handle_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "transactionNotification",
+            "params": {
+                "subscription": 11,
+                "result": {
+                    "transaction": {
+                        "transaction": ["AQID", "base64"],
+                        "meta": {"err": None, "logMessages": logs},
+                    },
+                    "signature": "helius-signature",
+                    "slot": 412_345_678,
+                    "transactionIndex": 7,
                 },
-            }
-        },
-    }
-
-    await gateway.handle_message(notification)
+            },
+        }
+    )
     await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
-    tasks = tuple(gateway._log_fetch_tasks)
-    results = await asyncio.wait_for(
-        asyncio.gather(*tasks, return_exceptions=True),
-        timeout=1,
+
+    assert len(queued) == 1
+    transaction, source = queued[0]
+    assert source == EventSource.HELIUS_WSS
+    assert transaction["signature"] == "helius-signature"
+    assert transaction["slot"] == 412_345_678
+    assert transaction["meta"]["logMessages"] == logs
+
+
+@pytest.mark.asyncio
+async def test_transaction_subscription_requests_compact_encoding() -> None:
+    websocket = FakeWebSocket(
+        [
+            {"jsonrpc": "2.0", "id": 1, "result": 11},
+            {"jsonrpc": "2.0", "id": 2, "result": 12},
+        ]
     )
 
-    assert len(results) == 1
-    assert isinstance(results[0], RuntimeError)
-    assert "block time is unavailable" in str(results[0])
-    assert gateway._reconnect_requested.is_set()
-    assert gateway._dispatch_recovery_pending is True
-    assert "stream_fetch_error" in gateway.entry_gate.reasons
+    await _gateway()._subscribe(websocket)
+
+    assert [item["params"][1]["encoding"] for item in websocket.sent] == [
+        "base64",
+        "base64",
+    ]
+    assert all(
+        item["params"][1]["transactionDetails"] == "full" for item in websocket.sent
+    )
 
 
 @pytest.mark.asyncio
@@ -907,71 +887,13 @@ async def test_malformed_logs_notification_is_rejected_before_dispatch(
     with pytest.raises(RuntimeError, match=message):
         await gateway.handle_message(notification)
 
-    assert gateway._log_fetch_tasks == set()
+    assert gateway._notification_queue.empty()
 
 
 @pytest.mark.asyncio
-async def test_log_block_times_are_concurrent_but_dispatched_in_receive_order(
+async def test_notification_ingress_is_bounded_and_overflow_is_fatal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gateway = HeliusStreamGateway(
-        websocket_url="wss://example.invalid",
-        rpc=SolanaRpcClient("https://example.invalid"),
-        handler=_handler,
-        entry_gate=EntryGate(BotMetrics()),
-        metrics=BotMetrics(),
-        log_fetch_concurrency=2,
-    )
-    first_release = asyncio.Event()
-    second_fetched = asyncio.Event()
-    dispatched: list[str] = []
-
-    async def get_block_time(slot: int) -> int:
-        if slot == 1:
-            await first_release.wait()
-        else:
-            second_fetched.set()
-        return 1_787_646_900 + slot
-
-    async def dispatch(
-        transaction: dict[str, Any],
-        _source: EventSource,
-        **_kwargs: Any,
-    ) -> None:
-        dispatched.append(str(transaction["signature"]))
-
-    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
-    monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
-    def notification(signature: str, slot: int) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "method": "logsNotification",
-            "params": {
-                "result": {
-                    "context": {"slot": slot},
-                    "value": {
-                        "signature": signature,
-                        "err": None,
-                        "logs": [f"Program data: {signature}"],
-                    },
-                }
-            },
-        }
-
-    await gateway.handle_message(notification("first", 1))
-    await gateway.handle_message(notification("second", 2))
-    await asyncio.wait_for(second_fetched.wait(), timeout=1)
-    assert dispatched == []
-
-    first_release.set()
-    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
-    tasks = tuple(gateway._log_fetch_tasks)
-    await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
-    assert dispatched == ["first", "second"]
-
-
-@pytest.mark.asyncio
-async def test_notification_ingress_is_bounded_and_overflow_is_fatal() -> None:
     fatal_errors: list[BaseException] = []
     gateway = HeliusStreamGateway(
         websocket_url="wss://example.invalid",
@@ -980,116 +902,51 @@ async def test_notification_ingress_is_bounded_and_overflow_is_fatal() -> None:
         entry_gate=EntryGate(BotMetrics()),
         metrics=BotMetrics(),
         fatal_handler=fatal_errors.append,
-        log_fetch_concurrency=1,
         notification_queue_size=2,
     )
-    await gateway._log_fetch_semaphore.acquire()
+    dispatch_started = asyncio.Event()
+    release_dispatch = asyncio.Event()
 
-    def notification(signature: str) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "method": "logsNotification",
-            "params": {
-                "result": {
-                    "context": {"slot": 1},
-                    "value": {
-                        "signature": signature,
-                        "err": None,
-                        "logs": [f"Program data: {signature}"],
-                    },
-                }
-            },
-        }
+    async def blocked_queue_transaction(
+        _transaction: dict[str, Any],
+        _source: EventSource,
+        **_kwargs: Any,
+    ) -> None:
+        dispatch_started.set()
+        await release_dispatch.wait()
 
+    monkeypatch.setattr(gateway, "_queue_transaction", blocked_queue_transaction)
     try:
-        await asyncio.wait_for(
-            gateway.handle_message(notification("active")),
-            timeout=0.1,
-        )
-        for _ in range(10):
-            if gateway._notification_queue.empty():
-                break
-            await asyncio.sleep(0)
+        await gateway.handle_message(_logs_notification("active", 1))
+        await asyncio.wait_for(dispatch_started.wait(), timeout=1)
         assert gateway._notification_queue.empty()
 
-        await asyncio.wait_for(
-            gateway.handle_message(notification("queued-1")),
-            timeout=0.1,
-        )
-        await asyncio.wait_for(
-            gateway.handle_message(notification("queued-2")),
-            timeout=0.1,
-        )
+        await gateway.handle_message(_logs_notification("queued-1", 1))
+        await gateway.handle_message(_logs_notification("queued-2", 1))
         assert gateway._notification_queue.full()
 
         with pytest.raises(
             RuntimeError,
             match="notification ingress queue overflow",
         ):
-            await gateway.handle_message(notification("overflow"))
+            await gateway.handle_message(_logs_notification("overflow", 1))
 
         assert len(fatal_errors) == 1
         assert gateway._reconnect_requested.is_set()
         assert "stream_fetch_error" in gateway.entry_gate.reasons
-        assert gateway._log_fetch_tasks == set()
     finally:
-        await gateway._cancel_log_fetch_tasks()
-        gateway._log_fetch_semaphore.release()
+        await gateway._cancel_ingress_dispatch()
 
-
-@pytest.mark.asyncio
-async def test_saturated_log_fetch_wait_aborts_for_reconnect() -> None:
-    gateway = HeliusStreamGateway(
-        websocket_url="wss://example.invalid",
-        rpc=SolanaRpcClient("https://example.invalid"),
-        handler=_handler,
-        entry_gate=EntryGate(BotMetrics()),
-        metrics=BotMetrics(),
-        log_fetch_concurrency=1,
-    )
-    await gateway._log_fetch_semaphore.acquire()
-    blocked = asyncio.create_task(
-        gateway._spawn_ordered_log_dispatch(
-            signature="blocked",
-            slot=1,
-            logs=["Program data: blocked"],
-            received_at=datetime.now(tz=timezone.utc),
-            generation=0,
-        )
-    )
-    await asyncio.sleep(0)
-    gateway._reconnect_requested.set()
-
-    try:
-        with pytest.raises(
-            RuntimeError,
-            match="ordered Solana transaction dispatch requested reconnect",
-        ):
-            await asyncio.wait_for(blocked, timeout=1)
-    finally:
-        gateway._log_fetch_semaphore.release()
-
-    assert gateway._log_fetch_tasks == set()
+    assert gateway._dispatch_recovery_pending is True
+    assert "stream_recovery_gap" in gateway.entry_gate.reasons
 
 
 @pytest.mark.asyncio
 async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gateway = HeliusStreamGateway(
-        websocket_url="wss://example.invalid",
-        rpc=SolanaRpcClient("https://example.invalid"),
-        handler=_handler,
-        entry_gate=EntryGate(BotMetrics()),
-        metrics=BotMetrics(),
-        log_fetch_concurrency=2,
-    )
-    first_dispatch_started = asyncio.Event()
-    release_first_dispatch = asyncio.Event()
+    gateway = _gateway()
     dispatched: list[str] = []
-
-    async def get_block_time(slot: int) -> int:
-        return 1_787_646_900 + slot
 
     async def dispatch(
         transaction: dict[str, Any],
@@ -1098,44 +955,20 @@ async def test_dispatch_failure_is_fail_closed_and_requests_reconnect(
     ) -> None:
         signature = str(transaction["signature"])
         if signature == "first":
-            first_dispatch_started.set()
-            await release_first_dispatch.wait()
             raise RuntimeError("dispatch failed")
         dispatched.append(signature)
 
-    def notification(signature: str, slot: int) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "method": "logsNotification",
-            "params": {
-                "result": {
-                    "context": {"slot": slot},
-                    "value": {
-                        "signature": signature,
-                        "err": None,
-                        "logs": [f"Program data: {signature}"],
-                    },
-                }
-            },
-        }
-
-    monkeypatch.setattr(gateway.rpc, "get_block_time", get_block_time)
     monkeypatch.setattr(gateway, "_queue_transaction", dispatch)
 
-    await gateway.handle_message(notification("first", 1))
-    await gateway.handle_message(notification("second", 2))
-    await asyncio.wait_for(first_dispatch_started.wait(), timeout=1)
-    await asyncio.wait_for(gateway._notification_queue.join(), timeout=1)
-    tasks = tuple(gateway._log_fetch_tasks)
-    release_first_dispatch.set()
-    results = await asyncio.wait_for(
-        asyncio.gather(*tasks, return_exceptions=True),
-        timeout=1,
-    )
+    await gateway.handle_message(_logs_notification("first", 1))
+    dispatcher = gateway._notification_dispatch_task
+    assert dispatcher is not None
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        await asyncio.wait_for(dispatcher, timeout=1)
+    with pytest.raises(RuntimeError, match="requested reconnect"):
+        await gateway.handle_message(_logs_notification("second", 2))
 
-    assert all(isinstance(result, RuntimeError) for result in results)
     assert dispatched == []
-    assert gateway._fetch_error_sequences
     assert gateway._reconnect_requested.is_set()
     assert gateway._dispatch_recovery_pending is True
     assert "stream_fetch_error" in gateway.entry_gate.reasons

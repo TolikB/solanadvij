@@ -34,7 +34,11 @@ from .db_models import (
 )
 
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
-MAX_STATISTICAL_EQUITY_MARKS = 100_000
+# Open positions are marked every second and a flat account once a minute. A
+# 15-day OOS half at the 12-trade daily cap and the 600 s holding limit writes
+# at most about 15 * (12 * 600 + 1440) = 129,600 marks, so the bound keeps
+# headroom for that worst case while staying a small in-memory path.
+MAX_STATISTICAL_EQUITY_MARKS = 250_000
 REQUIRED_CI_GATES = frozenset(
     {
         "archive_rebuild",

@@ -31,7 +31,7 @@ from .maintenance import RawRetentionManager
 from .metrics import BotMetrics
 from .models import QuoteResponse
 from .outbox import TelegramOutboxWorker
-from .pipeline import ConfirmationPipeline
+from .pipeline import TERMINAL_CANDIDATE_RETENTION, ConfirmationPipeline
 from .registry import USDC_MINT, WSOL_MINT, QuoteAssetPrice
 from .reports import ReportBuilder
 from .risk import RiskManager
@@ -44,6 +44,12 @@ from .telegram import NoopTelegramNotifier, TelegramNotifier
 from .wallet_analysis import WalletAnalyzer
 
 logger = logging.getLogger(__name__)
+
+
+# The statistical gate needs a durable executable-equity path with bounded
+# gaps even while no position is open; marks otherwise only follow fills and
+# quoted open positions.
+EQUITY_MARK_HEARTBEAT = timedelta(seconds=60)
 
 
 class RecoveryStateError(RuntimeError):
@@ -68,6 +74,7 @@ class SniperRuntime:
         self._enrichment_seen: set[str] = set()
         self._momentum_windows: dict[str, int] = {}
         self._mark_quote_failures: dict[str, tuple[datetime, int]] = {}
+        self._last_equity_mark_at: datetime | None = None
         self.wallet_analyzer = WalletAnalyzer()
         id_factory = self._build_id_factory()
         self._report_runs_path = self.data_dir / "report_runs.json"
@@ -243,7 +250,12 @@ class SniperRuntime:
                 profiles, relations = await self.database.load_wallet_analysis()
                 self.wallet_analyzer.restore(profiles, relations)
                 restored_candidates = await self.database.load_active_candidates(
-                    self.config.strategy_version
+                    self.config.strategy_version,
+                    terminal_since=(
+                        datetime.now(tz=timezone.utc)
+                        - TERMINAL_CANDIDATE_RETENTION
+                        - self._rehydration_window()
+                    ),
                 )
                 self.pipeline.restore_candidates(restored_candidates)
                 self.pipeline.restore_score_totals(
@@ -286,13 +298,8 @@ class SniperRuntime:
                 quarantined_protocols = (
                     await self.database.load_quarantined_event_protocols()
                 )
-                recovery_since = datetime.now(tz=timezone.utc) - timedelta(
-                    seconds=max(
-                        300,
-                        self.config.candidate.max_pool_age_seconds
-                        + self.config.exits.maximum_holding_seconds
-                        + 60,
-                    )
+                recovery_since = (
+                    datetime.now(tz=timezone.utc) - self._rehydration_window()
                 )
                 for event in await self.database.load_processed_events_since(
                     recovery_since
@@ -651,6 +658,16 @@ class SniperRuntime:
             return False
         drawdown = (peak - equity) / peak * Decimal("100")
         return drawdown >= Decimal(str(limit))
+
+    def _rehydration_window(self) -> timedelta:
+        return timedelta(
+            seconds=max(
+                300,
+                self.config.candidate.max_pool_age_seconds
+                + self.config.exits.maximum_holding_seconds
+                + 60,
+            )
+        )
 
     def is_paper(self) -> bool:
         return self.config.app_mode == AppMode.PAPER
@@ -1277,6 +1294,19 @@ class SniperRuntime:
                     account_snapshot=self.ledger.snapshot(),
                     observed_at=now,
                 )
+                self._last_equity_mark_at = now
+        elif (
+            self.database is not None
+            and self.database_available
+            and (
+                self._last_equity_mark_at is None
+                or now - self._last_equity_mark_at >= EQUITY_MARK_HEARTBEAT
+            )
+        ):
+            await self.database.record_equity_heartbeat(
+                account_id="paper-main", observed_at=now
+            )
+            self._last_equity_mark_at = now
 
         for index, position in enumerate(positions):
             if index >= close_limit:

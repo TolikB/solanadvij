@@ -24,6 +24,7 @@ from sniper_bot.db_models import (
 from sniper_bot.events import ChainEventType, EventEnvelope, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.pipeline import ConfirmationPipeline
+from sniper_bot.protocols.pump import DecodedTransaction
 from sniper_bot.registry import WSOL_MINT, PoolRecord, TokenRecord
 from sniper_bot.stream import EntryGate
 
@@ -554,9 +555,10 @@ def _pipeline_batch_events(
 def _install_pipeline_batch_decoder(monkeypatch, pipeline, events) -> None:
     monkeypatch.setattr(
         pipeline._pumpswap,
-        "decode_transaction",
-        lambda _transaction, source: events,
+        "decode",
+        lambda _transaction, source: DecodedTransaction(events, None),
     )
+    monkeypatch.setattr(pipeline, "_admit_for_ingest", lambda _event: True)
     monkeypatch.setattr(pipeline, "_event_state_filter_reason", lambda _event: None)
 
 
@@ -629,11 +631,12 @@ async def test_pipeline_groups_transactions_without_splitting_them(
     }
     monkeypatch.setattr(
         pipeline._pumpswap,
-        "decode_transaction",
-        lambda transaction, source: decoded_by_signature[
-            str(transaction["signature"])
-        ],
+        "decode",
+        lambda transaction, source: DecodedTransaction(
+            decoded_by_signature[str(transaction["signature"])], None
+        ),
     )
+    monkeypatch.setattr(pipeline, "_admit_for_ingest", lambda _event: True)
     monkeypatch.setattr(pipeline, "_event_state_filter_reason", lambda _event: None)
     monkeypatch.setattr("sniper_bot.pipeline.MAX_EVENT_BATCH_SIZE", 3)
     original_record_events = database.record_events
@@ -1373,7 +1376,7 @@ async def test_pipeline_batch_task_cancellation_rolls_back_and_poison_restarts(
         await database.close()
 
 @pytest.mark.asyncio
-async def test_pipeline_untracked_swaps_remain_durable_raw_and_processed(
+async def test_pipeline_drops_untracked_swaps_before_durable_ingest(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -1394,43 +1397,28 @@ async def test_pipeline_untracked_swaps_remain_durable_raw_and_processed(
     )
     monkeypatch.setattr(
         pipeline._pumpswap,
-        "decode_transaction",
-        lambda _transaction, source: events,
+        "decode",
+        lambda _transaction, source: DecodedTransaction(events, None),
     )
     archived: list[str] = []
-    applied: list[str] = []
 
     async def capture_raw(batch: list[EventEnvelope]) -> None:
         archived.extend(event.event_id for event in batch)
 
-    async def capture_apply(
-        event: EventEnvelope,
-        *,
-        persist: bool,
-        observe: bool,
-        allow_candidate: bool = True,
-    ) -> None:
-        applied.append(event.event_id)
-
     monkeypatch.setattr(pipeline.recorder, "record_many", capture_raw)
-    monkeypatch.setattr(pipeline, "_apply_event", capture_apply)
 
     await _run_pipeline_batch(pipeline)
 
-    assert archived == [event.event_id for event in events]
-    assert applied == []
+    assert archived == []
     assert (
-        metrics.chain_event_state_filter_decisions.labels(
-            reason="unknown_pool"
+        metrics.chain_events_filtered_before_ingest.labels(
+            reason="untracked_pool"
         )._value.get()
         == len(events)
     )
     async with database.sessions() as session:
         for event in events:
-            claim = await session.get(EventDedupRow, event.event_id)
-            assert claim is not None
-            assert claim.processing_status == "PROCESSED"
-    assert database._event_claim_tokens == {}
+            assert await session.get(EventDedupRow, event.event_id) is None
     await database.close()
 
 @pytest.mark.asyncio
