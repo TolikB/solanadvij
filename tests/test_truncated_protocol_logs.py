@@ -4,6 +4,7 @@ import asyncio
 import base64
 import copy
 import json
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from sniper_bot.pipeline import ConfirmationPipeline
 from sniper_bot.protocols import AnchorDecodeError
 from sniper_bot.protocols.anchor import _base58_encode
 from sniper_bot.protocols.pump import PUMP_PROGRAM_ID, PumpDecoder
+from sniper_bot.protocols.pump.decoder import PUMP_STATE_EVENT_NAMES
 from sniper_bot.protocols.pumpswap import PUMPSWAP_PROGRAM_ID, PumpSwapDecoder
 from sniper_bot.solana_rpc import SolanaRpcClient
 from sniper_bot.stream import EntryGate, HeliusStreamGateway, _transaction_protocols
@@ -386,3 +388,112 @@ def test_valid_unconsumed_close_event_does_not_change_selected_prefix() -> None:
     assert [e.event_id for e in PumpSwapDecoder().decode(tx).events] == [
         e.event_id for e in PumpSwapDecoder().decode(_fixture()).events
     ]
+
+
+def _pump_trade(
+    name: str = "buy_exact_quote_in_v2", *, layout: str = "current",
+    is_buy: bool = True, reserves: int = 10,
+) -> dict[str, Any]:
+    anchor = PumpDecoder()._anchor
+    definition = next(item for item in anchor.idl["instructions"] if item["name"] == name)
+    discriminator = next(key for key, event in anchor._events.items() if event == "TradeEvent")
+    chunks = [discriminator]
+    for field in anchor._types["TradeEvent"]["fields"]:
+        kind = field["type"]
+        if kind == "pubkey":
+            value = bytes([2]) * 32
+        elif kind == "u64":
+            number = reserves if field["name"] == "real_token_reserves" else 1
+            value = struct.pack("<Q", number)
+        elif kind == "i64":
+            value = struct.pack("<q", 1_776_700_123)
+        elif kind == "bool":
+            value = bytes([is_buy if field["name"] == "is_buy" else 0])
+        elif kind == "string":
+            value = struct.pack("<I", len(name)) + name.encode()
+        elif isinstance(kind, dict) and "vec" in kind:
+            value = struct.pack("<I", 0)
+        else:
+            raise AssertionError("unexpected fixture field")
+        chunks.append(value)
+        if layout == "minimum" and field["name"] == "real_quote_reserves":
+            break
+    payload = b"".join(chunks)
+    if layout == "appended":
+        payload += bytes(16)
+    return {
+        "slot": 5, "blockTime": 1_776_700_123,
+        "transaction": {"signatures": ["pump-trade"], "message": {"instructions": [{
+            "programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes(definition["discriminator"])),
+        }]}},
+        "meta": {"err": None, "logMessages": [
+            f"Program {PUMP_PROGRAM_ID} invoke [1]",
+            "Program data: " + base64.b64encode(payload).decode(),
+            f"Program {PUMP_PROGRAM_ID} success", "Log truncated", "Program data: YWJj",
+        ], "innerInstructions": [{"index": 0, "instructions": [_cpi(payload, program_id=PUMP_PROGRAM_ID)]}]},
+    }
+
+
+@pytest.mark.parametrize("name", [
+    "buy", "buy_exact_sol_in", "buy_v2", "buy_exact_quote_in_v2", "sell", "sell_v2",
+])
+@pytest.mark.parametrize("layout", ["minimum", "current", "appended"])
+def test_verified_pump_trade_preserves_ids_payloads_and_state_filter(name: str, layout: str) -> None:
+    tx = _pump_trade(name, layout=layout, is_buy=not name.startswith("sell"))
+    complete = copy.deepcopy(tx)
+    complete["meta"]["logMessages"] = complete["meta"]["logMessages"][:3]
+    expected = PumpDecoder().decode(complete)
+    actual = PumpDecoder().decode(tx)
+    assert len(actual.events) == 1
+    assert [e.event_id for e in actual.events] == [e.event_id for e in expected.events]
+    assert actual.events[0].payload == expected.events[0].payload
+    ignored = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+    assert ignored.events == []
+    assert ignored.block_time == expected.block_time
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_cpi", "missing_log", "short_body", "partial_append", "unknown_operation",
+    "completion_cpi", "completion_without_cpi", "wrong_timestamp",
+])
+def test_pump_trade_proof_rejects_incomplete_evidence_and_completion(failure: str) -> None:
+    tx = _pump_trade(reserves=0 if failure == "completion_without_cpi" else 10,
+                     layout="minimum" if failure == "partial_append" else "current")
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if failure == "missing_cpi":
+        inner.clear()
+    elif failure == "missing_log":
+        tx["meta"]["logMessages"].pop(1)
+    elif failure in ("short_body", "partial_append"):
+        payload = base64.b64decode(tx["meta"]["logMessages"][1].removeprefix("Program data: "))
+        payload = payload[:100] if failure == "short_body" else payload + b"x"
+        inner[0] = _cpi(payload, program_id=PUMP_PROGRAM_ID)
+        tx["meta"]["logMessages"][1] = "Program data: " + base64.b64encode(payload).decode()
+    elif failure == "unknown_operation":
+        tx["transaction"]["message"]["instructions"][0]["data"] = "11111111"
+    elif failure == "completion_cpi":
+        # An extra CompleteEvent after the marker must not be dropped even
+        # when TradeEvent is not selected by live state.
+        anchor = PumpDecoder()._anchor
+        discriminator = next(key for key, event in anchor._events.items() if event == "CompleteEvent")
+        inner.append(_cpi(discriminator + bytes(136), program_id=PUMP_PROGRAM_ID))
+    elif failure == "wrong_timestamp":
+        tx["blockTime"] += 120
+    for decoder in (PumpDecoder(), PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES)):
+        with pytest.raises(AnchorDecodeError):
+            decoder.decode(tx)
+
+
+def test_nested_pump_trade_is_verified_in_its_own_parent() -> None:
+    tx = _pump_trade()
+    own = tx["transaction"]["message"]["instructions"][0]
+    tx["transaction"]["message"]["instructions"] = [{"programId": OTHER}]
+    own["stackHeight"] = 2
+    cpi = tx["meta"]["innerInstructions"][0]["instructions"][0]
+    cpi["stackHeight"] = 3
+    tx["meta"]["innerInstructions"][0]["instructions"] = [own, cpi]
+    assert len(PumpDecoder().decode(tx).events) == 1
+
+
+def test_truncated_pump_sell_at_zero_token_reserves_is_not_a_buy_completion() -> None:
+    assert len(PumpDecoder().decode(_pump_trade("sell_v2", is_buy=False, reserves=0)).events) == 1

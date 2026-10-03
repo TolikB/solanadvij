@@ -12,13 +12,17 @@ paper execution, reporting, Telegram command intake, and the read-only API.
    every Pump and PumpSwap event carries the program's `Clock::unix_timestamp`, which is the
    slot's block time, so the decoders date each transaction from it. An exact runtime
    `Log truncated` marker triggers an ordered confirmed transaction fetch, with signature,
-   slot, success and prefix checks. PumpSwap accepts the original prefix only when allowlisted
+   slot, success and prefix checks. RPC and enhanced subscriptions accept legacy/v0/v1;
+   replay also reads journals recorded with the earlier version-0 request hash without network.
+   PumpSwap and Pump trades accept the original prefix only when allowlisted
    operations each have the expected CPI event and every consumed CPI payload matches the
    prefix byte-for-byte in order, including repeated occurrences. Missing consumed events,
    unknown operations or incomplete metadata still quarantine the protocol. Original log
    indices and canonical event IDs remain unchanged; post-marker logs are never guessed.
-   Truncated transactions also route protocols found only in full instructions; Pump truncation
-   without a completeness contract stays quarantined. Failed recovery retains original evidence.
+   Truncated transactions also route protocols found only in full instructions. Pump trade CPI
+   bodies are checked through the accepted minimum layout even when live state ignores trades;
+   additional completion CPI or other Pump operations without a contract stay quarantined.
+   Failed recovery retains original evidence.
 2. Vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
    `CompleteEvent` and `CompletePumpAmmMigrationEvent`, and PumpSwap pool creation, swaps and
    liquidity changes. Bonding-curve trades and other events are only dated, never decoded.

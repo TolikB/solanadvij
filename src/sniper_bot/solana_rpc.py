@@ -106,18 +106,24 @@ class SolanaRpcClient:
         return result
 
     async def get_transaction(self, signature: str) -> dict[str, Any] | None:
+        options = {
+            "commitment": "confirmed",
+            "encoding": "jsonParsed",
+            "maxSupportedTransactionVersion": 1,
+        }
         result = await self._call(
             "getTransaction",
-            [
-                signature,
-                {
-                    "commitment": "confirmed",
-                    "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0,
-                },
+            [signature, options],
+            replay_fallback_params=[
+                signature, {**options, "maxSupportedTransactionVersion": 0},
             ],
         )
-        return result if isinstance(result, dict) else None
+        if not isinstance(result, dict):
+            return None
+        version = result.get("version", "legacy")
+        if version != "legacy" and not (type(version) is int and version in (0, 1)):
+            raise SolanaRpcError("getTransaction returned an unsupported transaction version")
+        return result
 
     async def get_signatures_for_address(
         self,
@@ -507,7 +513,8 @@ class SolanaRpcClient:
             future.set_result(_RpcResponse(response.status_code, row))
 
     async def _call(
-        self, method: str, params: Iterable[Any] | dict[str, Any]
+        self, method: str, params: Iterable[Any] | dict[str, Any],
+        *, replay_fallback_params: list[Any] | None = None,
     ) -> Any:
         if method not in _READ_METHODS:
             raise SolanaRpcError(f"RPC method is not permitted in paper release: {method}")
@@ -515,6 +522,14 @@ class SolanaRpcClient:
         params_payload = dict(params) if isinstance(params, dict) else list(params)
         journal_key = ExternalJournal.key("solana_rpc", method, params_payload)
         stored = self.journal.get(journal_key) if self.journal else None
+        if (
+            stored is None and self.replay_mode and self.journal is not None
+            and method == "getTransaction" and replay_fallback_params is not None
+        ):
+            # Old archives used the version-0 ceiling in the request hash.
+            # Preserve their response sequence without networking or rewriting them.
+            legacy_key = ExternalJournal.key("solana_rpc", method, replay_fallback_params)
+            stored = self.journal.get(legacy_key)
         if stored is not None:
             return stored.get("response")
         if self.replay_mode:

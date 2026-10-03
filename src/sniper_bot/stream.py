@@ -467,7 +467,7 @@ class HeliusStreamGateway:
                                     # every notification.
                                     "encoding": "base64",
                                     "transactionDetails": "full",
-                                    "maxSupportedTransactionVersion": 0,
+                                    "maxSupportedTransactionVersion": 1,
                                 },
                             ],
                         }

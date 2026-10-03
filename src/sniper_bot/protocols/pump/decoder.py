@@ -23,6 +23,16 @@ PUMP_EVENT_NAMES = frozenset(_EVENT_TYPES)
 # Bonding-curve trades carry no pool address, so live state never applies
 # them; they are most of the Pump volume and only dated, never decoded.
 PUMP_STATE_EVENT_NAMES = PUMP_EVENT_NAMES - {"TradeEvent"}
+# A truncated trade is verified only with exactly one TradeEvent CPI per
+# operation. Additional completion events or other operations still fail closed.
+_TRUNCATION_INSTRUCTION_EVENTS = {
+    "buy": "TradeEvent",
+    "buy_exact_sol_in": "TradeEvent",
+    "buy_v2": "TradeEvent",
+    "buy_exact_quote_in_v2": "TradeEvent",
+    "sell": "TradeEvent",
+    "sell_v2": "TradeEvent",
+}
 # Last field of each consumed event as deployed at pump-public-docs 9c82f61.
 # Pump extends events by appending fields, so older payloads end here and
 # newer ones carry more; both decode.
@@ -115,8 +125,24 @@ class PumpDecoder:
         source: EventSource = EventSource.HELIUS_WSS,
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
+        logs = list(_log_messages(transaction))
+        if "Log truncated" in logs:
+            logs = self._anchor.verified_cpi_log_prefix(
+                transaction, logs, event_names=PUMP_EVENT_NAMES,
+                instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
+            )
+            proof = self._anchor.scan_logs(
+                logs, event_names=PUMP_EVENT_NAMES, minimum_fields=PUMP_MINIMUM_FIELDS,
+            )
+            check_event_timestamps(transaction, proof)
+            if any(
+                event.name == "TradeEvent" and event.fields["is_buy"]
+                and event.fields["real_token_reserves"] == 0
+                for event in proof.events
+            ):
+                raise AnchorDecodeError("truncated Pump completion requires a separate CPI contract")
         scan = self._anchor.scan_logs(
-            list(_log_messages(transaction)),
+            logs,
             event_names=self._event_names,
             minimum_fields=PUMP_MINIMUM_FIELDS,
         )

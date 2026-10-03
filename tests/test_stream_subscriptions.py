@@ -60,6 +60,7 @@ async def test_transaction_subscription_timeout_requires_new_fallback_connection
         "transactionSubscribe",
         "transactionSubscribe",
     ]
+    assert all(item["params"][1]["maxSupportedTransactionVersion"] == 1 for item in websocket.sent)
 
 
 @pytest.mark.asyncio
