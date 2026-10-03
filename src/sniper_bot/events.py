@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import zstandard
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class EventSource(StrEnum):
@@ -43,6 +43,28 @@ class ChainEventType(StrEnum):
     LIQUIDITY_REMOVED = "liquidity_removed"
     POOL_STATE_CHANGED = "pool_state_changed"
     UNKNOWN = "unknown"
+
+
+# Confirmed getSlot measured while the paper runtime was stopped, 2026-10-03
+# 21:25:36 UTC. Never move this boundary after the first v2 event is persisted.
+EVENT_ID_V2_CUTOVER_SLOT = 453_053_813
+EVENT_IDENTITY_KEY = "_event_identity"
+_SIGNATURE_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+class _EventIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[2]
+    ordinal: int = Field(ge=0, strict=True)
+    origin: Literal["log", "cpi"]
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def require_integer_version(cls, value: Any) -> int:
+        if type(value) is not int or value != 2:
+            raise ValueError("unsupported event identity version")
+        return value
 
 
 class EventEnvelope(BaseModel):
@@ -72,12 +94,25 @@ class EventEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def populate_and_validate_event_id(self) -> "EventEnvelope":
-        expected = make_event_id(
-            self.signature,
-            self.instruction_index,
-            self.inner_instruction_index,
-            self.event_type,
-        )
+        if EVENT_IDENTITY_KEY in self.payload:
+            identity = _EventIdentity.model_validate(self.payload[EVENT_IDENTITY_KEY])
+            if not uses_event_id_v2(self.slot, self.signature):
+                raise ValueError("v2 event identity is outside its fixed chain cutover")
+            if (identity.origin == "log" and self.inner_instruction_index != -1) or (
+                identity.origin == "cpi" and self.inner_instruction_index < 0
+            ):
+                raise ValueError("event coordinates disagree with identity provenance")
+            expected = make_event_id_v2(
+                self.protocol, self.signature, self.event_type, identity.ordinal
+            )
+        else:
+            # Archives and hydrated DB rows without a descriptor always keep v1.
+            expected = make_event_id(
+                self.signature,
+                self.instruction_index,
+                self.inner_instruction_index,
+                self.event_type,
+            )
         if self.event_id and self.event_id != expected:
             raise ValueError("event_id does not match canonical deduplication key")
         self.event_id = expected
@@ -92,6 +127,36 @@ def make_event_id(
 ) -> str:
     event_name = event_type.value if isinstance(event_type, ChainEventType) else str(event_type)
     canonical = f"{signature}:{instruction_index}:{inner_instruction_index}:{event_name}"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def has_chain_signature_format(signature: str) -> bool:
+    """Recognize a base58-encoded 64-byte signature, without checking signing."""
+    if not 64 <= len(signature) <= 88:
+        return False
+    number = 0
+    for character in signature:
+        digit = _SIGNATURE_ALPHABET.find(character)
+        if digit < 0:
+            return False
+        number = number * 58 + digit
+    leading_zeroes = len(signature) - len(signature.lstrip("1"))
+    return leading_zeroes + (number.bit_length() + 7) // 8 == 64
+
+
+def uses_event_id_v2(slot: int, signature: str) -> bool:
+    # Historical synthetic acceptance inputs may have future slots. They remain
+    # v1 because their non-chain signatures cannot occur on the live ledger.
+    return slot > EVENT_ID_V2_CUTOVER_SLOT and has_chain_signature_format(signature)
+
+
+def make_event_id_v2(
+    protocol: Protocol,
+    signature: str,
+    event_type: ChainEventType,
+    ordinal: int,
+) -> str:
+    canonical = f"v2:{protocol.value}:{signature}:{event_type.value}:{ordinal}"
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

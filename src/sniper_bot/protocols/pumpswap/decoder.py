@@ -6,9 +6,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ...events import ChainEventType, EventEnvelope, EventSource, Protocol
+from ...events import (
+    EVENT_IDENTITY_KEY,
+    ChainEventType,
+    EventEnvelope,
+    EventSource,
+    Protocol,
+    uses_event_id_v2,
+)
 from ...registry import target_mint_for_pool
-from ..anchor import AnchorIdlDecoder
+from ..anchor import AnchorDecodeError, AnchorIdlDecoder
 from ..pump.decoder import (
     DecodedTransaction,
     _log_messages,
@@ -84,33 +91,51 @@ class PumpSwapDecoder:
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
         logs = list(_log_messages(transaction))
+        slot = int(transaction.get("slot", 0))
+        signature = _signature(transaction, required=False)
+        v2 = uses_event_id_v2(slot, signature)
+        # Count each event type before the caller's selection/admission filters.
+        event_names = PUMPSWAP_EVENT_NAMES if v2 else self._event_names
         if "Log truncated" in logs:
-            logs = self._anchor.verified_cpi_log_prefix(
-                transaction,
-                logs,
-                event_names=self._event_names,
+            scan = self._anchor.scan_verified_cpi_events(
+                transaction, logs, event_names=event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
+                minimum_fields=PUMPSWAP_MINIMUM_FIELDS, recover_missing=v2,
             )
-        scan = self._anchor.scan_logs(
-            logs,
-            event_names=self._event_names,
-            minimum_fields=PUMPSWAP_MINIMUM_FIELDS,
-        )
+        else:
+            scan = self._anchor.scan_logs(
+                logs, event_names=event_names, minimum_fields=PUMPSWAP_MINIMUM_FIELDS,
+            )
         check_event_timestamps(transaction, scan)
         block_time = _resolve_block_time(transaction, scan.timestamp)
         if not scan.events:
             return decoded_transaction([], block_time, scan)
         signature = _signature(transaction)
-        slot = int(transaction.get("slot", 0))
         observed = observed_at or datetime.now(tz=timezone.utc)
         confirmed_at = _require_block_time(block_time)
         result: list[EventEnvelope] = []
+        occurrences: dict[ChainEventType, int] = {}
 
         for event in scan.events:
             event_type = _EVENT_TYPES.get(event.name)
             if event_type is None:
                 continue
+            ordinal = occurrences.get(event_type, 0)
+            occurrences[event_type] = ordinal + 1
+            if event.name not in self._event_names:
+                continue
             fields = {**event.fields, "anchor_event": event.name, "adapter_version": ADAPTER_VERSION}
+            instruction_index = event.log_index
+            inner_index = -1
+            if v2:
+                origin = "log"
+                if event.log_index < 0:
+                    if event.instruction_index is None or event.inner_instruction_index < 0:
+                        raise AnchorDecodeError("recovered event has no CPI coordinates")
+                    origin = "cpi"
+                    instruction_index = event.instruction_index
+                    inner_index = event.inner_instruction_index
+                fields[EVENT_IDENTITY_KEY] = {"version": 2, "ordinal": ordinal, "origin": origin}
             result.append(
                 EventEnvelope(
                     source=source,
@@ -118,8 +143,8 @@ class PumpSwapDecoder:
                     event_type=event_type,
                     slot=slot,
                     signature=signature,
-                    instruction_index=event.log_index,
-                    inner_instruction_index=-1,
+                    instruction_index=instruction_index,
+                    inner_instruction_index=inner_index,
                     block_time=confirmed_at,
                     observed_at=observed,
                     mint=target_mint_for_pool(

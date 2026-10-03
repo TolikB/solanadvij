@@ -14,20 +14,22 @@ paper execution, reporting, Telegram command intake, and the read-only API.
    `Log truncated` marker triggers an ordered confirmed transaction fetch, with signature,
    slot, success and prefix checks. RPC and enhanced subscriptions accept legacy/v0/v1;
    replay also reads journals recorded with the earlier version-0 request hash without network.
-   PumpSwap and Pump trades accept the original prefix only when allowlisted
-   operations each have the expected CPI event and every consumed CPI payload matches the
-   prefix byte-for-byte in order, including repeated occurrences. Missing consumed events,
-   unknown operations or incomplete metadata still quarantine the protocol. Original log
-   indices and canonical event IDs remain unchanged; post-marker logs are never guessed.
-   Truncated transactions also route protocols found only in full instructions. Ignored Pump
-   trades may be absent from logs only when their CPI body, clock and non-completion reserves
-   are verified; they produce no state event or new canonical ID. The verified CPI clock can
-   date an otherwise empty transaction. Consumed trades still require their original log.
-   Additional completion CPI or other Pump operations without a contract stay quarantined.
+   Truncated PumpSwap and reviewed Pump operations require one matching event CPI per
+   own operation, verified parent/stack/cardinality, complete IDL bodies and consistent Clock
+   timestamps. Available consumed logs must exactly match the ordered CPI prefix, including
+   repeated events; unknown operations, completion branches and incomplete metadata quarantine.
+   Before the fixed event-identity cutover, missing consumed logs still fail closed because a
+   legacy ID requires the original log index. Above the cutover, a missing suffix is decoded
+   from genuine CPI bodies and carries the outer/inner CPI coordinates as explicit provenance.
+   Post-marker log boundaries are never guessed. `create_v2`/`CreateEvent` and
+   `extend_account`/`ExtendAccountEvent` are reviewed Pump contracts; the ignored Extend event
+   is validated but never applied to state. Truncated routing includes programs found only
+   in full instructions.
    Failed recovery retains original evidence.
 2. Vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
    `CompleteEvent` and `CompletePumpAmmMigrationEvent`, and PumpSwap pool creation, swaps and
-   liquidity changes. Bonding-curve trades and other events are only dated, never decoded.
+   liquidity changes. Bonding-curve trades never enter live state; v2 validates them before
+   the state subset is selected so occurrence ordinals cannot depend on caller filters.
    Programs extend events by appending fields, so a consumed event decodes from the layout
    deployed when the IDL was first vendored through every field it carries; bytes beyond the
    IDL are counted, not rejected. A consumed event that still does not fit, or whose Clock
@@ -104,3 +106,31 @@ account is flat, so the OOS equity path has bounded gaps. The JSON ledger is a d
 and is hydrated from committed DB rows after restart. Raw archives and external-response
 journals preserve repeated responses in call order and make replay independent of the live
 network. Stream and event-time momentum checkpoints are restored before entry can be enabled.
+
+
+## Event identity cutover and rollback
+
+The immutable boundary is confirmed Solana slot **453053813**, measured at
+2026-10-03T21:25:36.409466Z with the runtime stopped. A decoded transaction uses v2 only
+above that boundary and with a base58 signature encoding exactly 64 bytes. Historical
+synthetic acceptance signatures remain v1 even when their test slots exceed the boundary.
+Before the first v2 deployment, verify zero existing genuine chain signatures above this
+boundary, zero identity descriptors, zero paper orders and zero open positions. Preserve all
+old rows, raw archives, checkpoints and rollback backups. The existing stale-checkpoint path
+records the accepted archive gap and requires a fresh 60-second baseline warmup before ready.
+
+V2 is SHA256 of `v2:{protocol}:{signature}:{event_type}:{ordinal}`, where ordinal is zero-based
+within that event type in execution order, before caller/admission filters. All live and RPC
+recovery paths use the decoder policy. The reserved payload `_event_identity` has exactly
+integer `version: 2`, nonnegative integer `ordinal`, and `origin: log|cpi`; DB `payload_json`
+and raw envelopes preserve it without a schema migration. Log provenance keeps the genuine
+log index and inner index -1; CPI provenance has genuine outer and inner instruction indices.
+The ID excludes those coordinates and source, so full logs, CPI recovery and a restart share
+one durable claim. No descriptor always means v1, regardless of slot; old envelope bytes and
+archive/input hashes remain unchanged. Never recalculate or advance the cutover after v2.
+
+Once v2 rows exist, the rollback reader floor is this first v2 release image, which reads both
+versions. Older images such as de354 cannot hydrate v2 and must not be started against the new
+DB. Preserve the pre-cutover snapshot and old images as evidence; preserve a tagged compatible
+v2 image as the operational rollback floor. No ledger rewrite or destructive restore is part
+of the cutover. Calibration and collection config, thresholds and fill model are unchanged.

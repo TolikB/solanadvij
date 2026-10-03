@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ...events import ChainEventType, EventEnvelope, EventSource, Protocol
+from ...events import (
+    EVENT_IDENTITY_KEY,
+    ChainEventType,
+    EventEnvelope,
+    EventSource,
+    Protocol,
+    uses_event_id_v2,
+)
 from ..anchor import AnchorDecodeError, AnchorIdlDecoder, AnchorLogScan
 
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -23,9 +30,11 @@ PUMP_EVENT_NAMES = frozenset(_EVENT_TYPES)
 # Bonding-curve trades carry no pool address, so live state never applies
 # them; they are most of the Pump volume and only dated, never decoded.
 PUMP_STATE_EVENT_NAMES = PUMP_EVENT_NAMES - {"TradeEvent"}
-# A truncated trade is verified only with exactly one TradeEvent CPI per
-# operation. Additional completion events or other operations still fail closed.
+# Each reviewed truncated operation requires exactly its expected CPI event.
+# Additional completion events or other operations still fail closed.
 _TRUNCATION_INSTRUCTION_EVENTS = {
+    "create_v2": "CreateEvent",
+    "extend_account": "ExtendAccountEvent",
     "buy": "TradeEvent",
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",
@@ -88,6 +97,7 @@ def check_event_timestamps(
     ]
     if scan.timestamp is not None:
         stamps.append(int(scan.timestamp))
+    stamps.extend(scan.verified_timestamps)
     stamps.extend(extra_timestamps or [])
     if not stamps:
         return
@@ -129,35 +139,35 @@ class PumpDecoder:
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
         logs = list(_log_messages(transaction))
-        cpi_timestamps: list[int] = []
+        slot = int(transaction.get("slot", 0))
+        signature = _signature(transaction, required=False)
+        v2 = uses_event_id_v2(slot, signature)
+        # Count each event type before the caller's selection/admission filters.
+        event_names = PUMP_EVENT_NAMES if v2 else self._event_names
         if "Log truncated" in logs:
-            def validate_trade(_name: str, fields: dict[str, Any]) -> None:
-                if fields["is_buy"] and fields["real_token_reserves"] == 0:
+            def validate_event(name: str, fields: dict[str, Any]) -> None:
+                if name == "TradeEvent" and fields["is_buy"] and fields["real_token_reserves"] == 0:
                     raise AnchorDecodeError("truncated Pump completion requires a separate CPI contract")
-                cpi_timestamps.append(fields["timestamp"])
 
-            logs = self._anchor.verified_cpi_log_prefix(
-                transaction, logs, event_names=self._event_names,
+            scan = self._anchor.scan_verified_cpi_events(
+                transaction, logs, event_names=event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
-                minimum_fields=PUMP_MINIMUM_FIELDS, event_validator=validate_trade,
+                minimum_fields=PUMP_MINIMUM_FIELDS, recover_missing=v2,
+                event_validator=validate_event,
             )
-        scan = self._anchor.scan_logs(
-            logs,
-            event_names=self._event_names,
-            minimum_fields=PUMP_MINIMUM_FIELDS,
-        )
-        check_event_timestamps(transaction, scan, extra_timestamps=cpi_timestamps)
-        timestamp = scan.timestamp
-        if timestamp is None and cpi_timestamps:
-            timestamp = cpi_timestamps[0]
-        block_time = _resolve_block_time(transaction, timestamp)
+        else:
+            scan = self._anchor.scan_logs(
+                logs, event_names=event_names, minimum_fields=PUMP_MINIMUM_FIELDS,
+            )
+        check_event_timestamps(transaction, scan)
+        block_time = _resolve_block_time(transaction, scan.timestamp)
         if not scan.events:
             return decoded_transaction([], block_time, scan)
         signature = _signature(transaction)
-        slot = int(transaction.get("slot", 0))
         observed = observed_at or datetime.now(tz=timezone.utc)
         confirmed_at = _require_block_time(block_time)
         result: list[EventEnvelope] = []
+        occurrences: dict[ChainEventType, int] = {}
 
         for event in scan.events:
             event_type = _EVENT_TYPES.get(event.name)
@@ -169,7 +179,22 @@ class PumpDecoder:
                 )
             if event_type is None:
                 continue
+            ordinal = occurrences.get(event_type, 0)
+            occurrences[event_type] = ordinal + 1
+            if event.name not in self._event_names:
+                continue
             fields = {**event.fields, "anchor_event": event.name, "adapter_version": ADAPTER_VERSION}
+            instruction_index = event.log_index
+            inner_index = -1
+            if v2:
+                origin = "log"
+                if event.log_index < 0:
+                    if event.instruction_index is None or event.inner_instruction_index < 0:
+                        raise AnchorDecodeError("recovered event has no CPI coordinates")
+                    origin = "cpi"
+                    instruction_index = event.instruction_index
+                    inner_index = event.inner_instruction_index
+                fields[EVENT_IDENTITY_KEY] = {"version": 2, "ordinal": ordinal, "origin": origin}
             result.append(
                 EventEnvelope(
                     source=source,
@@ -177,8 +202,8 @@ class PumpDecoder:
                     event_type=event_type,
                     slot=slot,
                     signature=signature,
-                    instruction_index=event.log_index,
-                    inner_instruction_index=-1,
+                    instruction_index=instruction_index,
+                    inner_instruction_index=inner_index,
                     block_time=confirmed_at,
                     observed_at=observed,
                     mint=fields.get("mint"),
@@ -199,14 +224,16 @@ def _inner_transaction(transaction: dict[str, Any]) -> dict[str, Any]:
     return inner if isinstance(inner, dict) else {}
 
 
-def _signature(transaction: dict[str, Any]) -> str:
+def _signature(transaction: dict[str, Any], *, required: bool = True) -> str:
     signature = transaction.get("signature")
     if signature:
         return str(signature)
     signatures = _inner_transaction(transaction).get("signatures") or []
     if signatures:
         return str(signatures[0])
-    raise ValueError("transaction signature is missing")
+    if required:
+        raise ValueError("transaction signature is missing")
+    return ""
 
 
 def _resolve_block_time(

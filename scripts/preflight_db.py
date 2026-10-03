@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 
 from sniper_bot.database import Database
 from sniper_bot.db_models import EventDedupRow, RawChainEventRow
+from sniper_bot.events import EVENT_ID_V2_CUTOVER_SLOT, EVENT_IDENTITY_KEY, has_chain_signature_format
 
 
 async def inspect(database: Database) -> dict[str, Any]:
@@ -38,13 +39,24 @@ async def inspect(database: Database) -> dict[str, Any]:
         raw_events = int(
             await session.scalar(select(func.count()).select_from(RawChainEventRow)) or 0
         )
+        legacy_signatures_above_cutover = (
+            await session.scalars(
+                select(RawChainEventRow.signature).where(
+                    RawChainEventRow.slot > EVENT_ID_V2_CUTOVER_SLOT,
+                    RawChainEventRow.payload_json[EVENT_IDENTITY_KEY].as_string().is_(None),
+                ).distinct()
+            )
+        ).all()
+    identity_aliases = sum(has_chain_signature_format(value) for value in legacy_signatures_above_cutover)
     checkpoint_age = (
         (datetime.now(tz=timezone.utc) - observed_at).total_seconds()
         if observed_at is not None
         else None
     )
     return {
-        "stream_enabled_at_startup": not quarantined,
+        "stream_enabled_at_startup": not quarantined and identity_aliases == 0,
+        "event_identity_cutover_slot": EVENT_ID_V2_CUTOVER_SLOT,
+        "legacy_chain_signatures_above_cutover": identity_aliases,
         "quarantined_protocols": quarantined,
         "events_to_retry_at_startup": unprocessed,
         "event_claim_statuses": statuses,

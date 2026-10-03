@@ -29,6 +29,10 @@ class AnchorEvent:
     name: str
     fields: dict[str, Any]
     log_index: int
+    # Only recovered CPI events have these genuine ledger coordinates. Their
+    # unavailable log_index is -1; callers must never invent a log position.
+    instruction_index: int | None = None
+    inner_instruction_index: int = -1
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ class AnchorLogScan:
     unknown_discriminators: tuple[bytes, ...] = ()
     # Selected events that carried bytes beyond every field the IDL declares.
     appended_events: tuple[str, ...] = ()
+    verified_timestamps: tuple[int, ...] = ()
 
 
 class _Cursor:
@@ -164,14 +169,35 @@ class AnchorIdlDecoder:
         minimum_fields: Mapping[str, str] | None = None,
         event_validator: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> list[str]:
-        """Keep original log indices only when the ledger proves completeness.
+        """Legacy IDs require every selected event's original log index."""
+        self.scan_verified_cpi_events(
+            transaction, logs, event_names=event_names,
+            instruction_events=instruction_events, minimum_fields=minimum_fields,
+            event_validator=event_validator,
+        )
+        return logs[:logs.index("Log truncated")]
 
-        Small logs after the runtime truncation marker have lost invocation
-        boundaries. For successful jsonParsed metadata, require exactly the
-        expected event CPI inside every allowlisted own operation. All consumed
-        CPI payloads must also match the original prefix in execution order.
-        Missing events fail closed; no event key is synthesized.
+    def scan_verified_cpi_events(
+        self,
+        transaction: Mapping[str, Any],
+        logs: list[str],
+        *,
+        event_names: frozenset[str],
+        instruction_events: Mapping[str, str],
+        minimum_fields: Mapping[str, str] | None = None,
+        event_validator: Callable[[str, dict[str, Any]], None] | None = None,
+        recover_missing: bool = False,
+    ) -> AnchorLogScan:
+        """Prove ordered event completeness from successful jsonParsed metadata.
+
+        Each reviewed own operation must contain exactly its expected event CPI.
+        Every body is validated, including ignored events. Available selected
+        logs must match the ordered CPI prefix byte-for-byte with multiplicity.
+        Only a caller using v2 identity may recover a missing suffix; recovered
+        events carry genuine CPI coordinates instead of a guessed log index.
         """
+        if logs.count("Log truncated") != 1:
+            raise AnchorDecodeError("CPI completeness requires one truncation marker")
         prefix = logs[:logs.index("Log truncated")]
         inner = transaction.get("transaction")
         if not isinstance(inner, dict):
@@ -211,6 +237,9 @@ class AnchorIdlDecoder:
         expected: list[str] = []
         emitted: list[int] = []
         selected: list[bytes] = []
+        decoded: list[AnchorEvent] = []
+        timestamps: list[int] = []
+        appended: list[str] = []
         for index, root in enumerate(outer):
             stack: list[tuple[int, str, int | None]] = []
             for position, instruction in enumerate([root, *grouped.get(index, [])]):
@@ -240,17 +269,24 @@ class AnchorIdlDecoder:
                         if event_name != expected[parent] or emitted[parent]:
                             raise AnchorDecodeError("CPI event does not cover its parent operation")
                         emitted[parent] += 1
-                        if event_name not in event_names or event_validator is not None:
-                            # Ignored CPI events still require a valid body.
-                            minimum = (minimum_fields or {}).get(event_name)
-                            if minimum is None:
-                                fields = self._decode_struct(event_name, payload[16:])
-                            else:
-                                fields, _ = self._decode_struct_from_minimum(event_name, payload[16:], minimum)
-                            if event_validator is not None:
-                                event_validator(event_name, fields)
+                        minimum = (minimum_fields or {}).get(event_name)
+                        trailing = 0
+                        if minimum is None:
+                            fields = self._decode_struct(event_name, payload[16:])
+                        else:
+                            fields, trailing = self._decode_struct_from_minimum(event_name, payload[16:], minimum)
+                        if event_validator is not None:
+                            event_validator(event_name, fields)
+                        if type(fields.get("timestamp")) is int:
+                            timestamps.append(fields["timestamp"])
                         if event_name in event_names:
                             selected.append(payload[8:])
+                            decoded.append(AnchorEvent(
+                                name=event_name, fields=fields, log_index=-1,
+                                instruction_index=index, inner_instruction_index=position - 1,
+                            ))
+                            if trailing:
+                                appended.append(event_name)
                     else:
                         name = names.get(payload[:8])
                         if not isinstance(name, str) or name not in instruction_events:
@@ -268,9 +304,16 @@ class AnchorIdlDecoder:
                 raise AnchorDecodeError("Anchor event payload is shorter than discriminator")
             if self._events.get(payload[:8]) in event_names:
                 logged.append(payload)
-        if logged != selected:
+        if logged != selected[:len(logged)] or (not recover_missing and logged != selected):
             raise AnchorDecodeError("consumed events are missing from the verified log prefix")
-        return prefix
+        scan = self.scan_logs(prefix, event_names=event_names, minimum_fields=minimum_fields)
+        events = scan.events + decoded[len(logged):] if recover_missing else scan.events
+        return AnchorLogScan(
+            events=events,
+            timestamp=scan.timestamp if scan.timestamp is not None else next(iter(timestamps), None),
+            unknown_discriminators=scan.unknown_discriminators,
+            appended_events=tuple(appended), verified_timestamps=tuple(timestamps),
+        )
 
     def declared_fields(self, event_name: str) -> list[str]:
         definition = self._types.get(event_name)

@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from sniper_bot.events import EventSource, Protocol
+from sniper_bot.events import EVENT_ID_V2_CUTOVER_SLOT, EVENT_IDENTITY_KEY, EventSource, Protocol
 from sniper_bot.metrics import BotMetrics
 from sniper_bot.pipeline import ConfirmationPipeline
 from sniper_bot.protocols import AnchorDecodeError
@@ -383,7 +383,7 @@ def test_valid_unconsumed_close_event_does_not_change_selected_prefix() -> None:
                          if name == "CloseUserVolumeAccumulatorEvent")
     tx["transaction"]["message"]["instructions"].append(_instruction("close_user_volume_accumulator"))
     tx["meta"]["innerInstructions"].append({
-        "index": 1, "instructions": [_cpi(discriminator + bytes(72))],
+        "index": 1, "instructions": [_cpi(discriminator + bytes(32) + struct.pack("<q", tx["blockTime"]) + bytes(32))],
     })
     assert [e.event_id for e in PumpSwapDecoder().decode(tx).events] == [
         e.event_id for e in PumpSwapDecoder().decode(_fixture()).events
@@ -539,3 +539,175 @@ def test_unlogged_ignored_trade_cannot_hide_missing_consumed_state_event() -> No
     )
     with pytest.raises(AnchorDecodeError, match="parent operation"):
         PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+
+
+def _v2(tx: dict[str, Any]) -> dict[str, Any]:
+    tx = copy.deepcopy(tx)
+    tx["slot"] = EVENT_ID_V2_CUTOVER_SLOT + 1
+    tx["transaction"]["signatures"] = [_base58_encode(bytes([3]) * 64)]
+    return tx
+
+
+def _without_marker(tx: dict[str, Any]) -> dict[str, Any]:
+    tx = copy.deepcopy(tx)
+    logs = tx["meta"]["logMessages"]
+    tx["meta"]["logMessages"] = logs[:logs.index("Log truncated")]
+    return tx
+
+
+@pytest.mark.parametrize("prefix_available", [True, False])
+def test_v2_missing_events_use_same_id_as_full_logs_and_true_cpi_coordinates(prefix_available: bool) -> None:
+    tx = _v2(_truncated())
+    complete = _without_marker(tx)
+    if not prefix_available:
+        tx["meta"]["logMessages"] = ["Log truncated", "Program data: YWJj"]
+    expected = PumpSwapDecoder().decode(complete).events
+    recovered = PumpSwapDecoder().decode(tx, source=EventSource.RPC_RECOVERY).events
+    assert [event.event_id for event in recovered] == [event.event_id for event in expected]
+    assert len(recovered) == 1
+    assert recovered[0].payload[EVENT_IDENTITY_KEY]["origin"] == ("log" if prefix_available else "cpi")
+    assert recovered[0].instruction_index == (expected[0].instruction_index if prefix_available else 0)
+    assert recovered[0].inner_instruction_index == (-1 if prefix_available else 0)
+    assert {k: v for k, v in recovered[0].payload.items() if k != EVENT_IDENTITY_KEY} == {
+        k: v for k, v in expected[0].payload.items() if k != EVENT_IDENTITY_KEY
+    }
+
+
+def test_v2_repeated_identical_cpi_events_preserve_multiplicity_and_execution_order() -> None:
+    tx = _v2(_truncated())
+    tx["transaction"]["message"]["instructions"].append(_instruction("create_pool"))
+    tx["meta"]["innerInstructions"].append({
+        "index": 1, "instructions": copy.deepcopy(tx["meta"]["innerInstructions"][0]["instructions"]),
+    })
+    complete = _without_marker(tx)
+    index, encoded = PumpSwapDecoder()._anchor._own_event_lines(complete["meta"]["logMessages"])[0]
+    complete["meta"]["logMessages"].insert(index + 1, "Program data: " + encoded)
+    expected = PumpSwapDecoder().decode(complete).events
+    recovered = PumpSwapDecoder().decode(tx).events
+    assert [event.event_id for event in recovered] == [event.event_id for event in expected]
+    assert len({event.event_id for event in recovered}) == 2
+    assert [event.payload[EVENT_IDENTITY_KEY]["ordinal"] for event in recovered] == [0, 1]
+    assert [event.payload[EVENT_IDENTITY_KEY]["origin"] for event in recovered] == ["log", "cpi"]
+    assert recovered[1].instruction_index == 1 and recovered[1].inner_instruction_index == 0
+
+
+def test_v2_available_log_subsequence_is_not_a_prefix() -> None:
+    tx = _v2(_truncated())
+    index, encoded = PumpSwapDecoder()._anchor._own_event_lines(tx["meta"]["logMessages"])[0]
+    first = base64.b64decode(encoded)
+    second = bytearray(first)
+    second[-16] ^= 1
+    tx["transaction"]["message"]["instructions"].append(_instruction("create_pool"))
+    tx["meta"]["innerInstructions"].append({"index": 1, "instructions": [_cpi(bytes(second))]})
+    # Only the second event is logged, so this is an interior gap, not a suffix.
+    tx["meta"]["logMessages"][index] = "Program data: " + base64.b64encode(second).decode()
+    with pytest.raises(AnchorDecodeError, match="verified log prefix"):
+        PumpSwapDecoder().decode(tx)
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_cpi", "extra_cpi", "foreign_cpi", "short_cpi", "short_body", "unknown_cpi",
+    "unknown_operation", "missing_later_cpi", "malformed_group", "duplicate_group",
+    "compiled_program_id", "failed_transaction", "missing_err", "missing_instructions", "duplicate_marker",
+])
+def test_v2_recovered_suffix_still_requires_full_cpi_proof(failure: str) -> None:
+    tx = _v2(_truncated())
+    payload = base64.b64decode(PumpSwapDecoder()._anchor._own_event_lines(tx["meta"]["logMessages"])[0][1])
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if failure == "missing_cpi":
+        inner.clear()
+    elif failure == "extra_cpi":
+        inner.append(copy.deepcopy(inner[0]))
+    elif failure == "foreign_cpi":
+        inner[0]["programId"] = OTHER
+    elif failure == "short_cpi":
+        inner[0]["data"] = _base58_encode(TAG + b"x")
+    elif failure == "short_body":
+        inner[0]["data"] = _base58_encode(TAG + payload[:40])
+    elif failure == "unknown_cpi":
+        inner[0]["data"] = _base58_encode(TAG + bytes([255]) * 8)
+    elif failure == "unknown_operation":
+        tx["transaction"]["message"]["instructions"][0] = _instruction("extend_account")
+    elif failure == "missing_later_cpi":
+        tx["transaction"]["message"]["instructions"].append(_instruction("buy"))
+    elif failure == "malformed_group":
+        tx["meta"]["innerInstructions"][0]["index"] = True
+    elif failure == "duplicate_group":
+        tx["meta"]["innerInstructions"].append(copy.deepcopy(tx["meta"]["innerInstructions"][0]))
+    elif failure == "compiled_program_id":
+        del inner[0]["programId"]
+        inner[0]["programIdIndex"] = 0
+    elif failure == "failed_transaction":
+        tx["meta"]["err"] = True
+    elif failure == "missing_err":
+        del tx["meta"]["err"]
+    elif failure == "missing_instructions":
+        tx["meta"]["innerInstructions"] = None
+    elif failure == "duplicate_marker":
+        tx["meta"]["logMessages"].append("Log truncated")
+    with pytest.raises(AnchorDecodeError):
+        PumpSwapDecoder().decode(tx)
+
+
+def test_v2_recovered_trade_clock_is_validated_without_any_log_clock() -> None:
+    tx = _v2(_pump_trade())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    tx["blockTime"] += 120
+    with pytest.raises(AnchorDecodeError, match="disagree"):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+
+
+@pytest.mark.parametrize("future", [True, False])
+def test_pump_create_extend_trade_contract_validates_ignored_extend(future: bool) -> None:
+    from scripts.benchmark_postgres_capacity import BorshEventEncoder
+    anchor = PumpDecoder()._anchor
+    encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
+    tx = _pump_trade()
+    timestamp = tx["blockTime"]
+    create = base64.b64decode(encoder.encode("CreateEvent", {"timestamp": timestamp}))
+    extend = base64.b64decode(encoder.encode("ExtendAccountEvent", {"timestamp": timestamp}))
+    def operation(name: str) -> dict[str, Any]:
+        definition = next(item for item in anchor.idl["instructions"] if item["name"] == name)
+        return {"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes(definition["discriminator"]))}
+    trade = tx["transaction"]["message"]["instructions"][0]
+    tx["transaction"]["message"]["instructions"] = [operation("create_v2"), operation("extend_account"), trade]
+    tx["meta"]["innerInstructions"] = [
+        {"index": 0, "instructions": [_cpi(create, program_id=PUMP_PROGRAM_ID)]},
+        {"index": 1, "instructions": [_cpi(extend, program_id=PUMP_PROGRAM_ID)]},
+        {"index": 2, "instructions": tx["meta"]["innerInstructions"][0]["instructions"]},
+    ]
+    tx["meta"]["logMessages"] = [
+        f"Program {PUMP_PROGRAM_ID} invoke [1]",
+        "Program data: " + base64.b64encode(create).decode(),
+        "Program data: " + base64.b64encode(extend).decode(),
+        "Log truncated",
+    ]
+    if future:
+        tx = _v2(tx)
+    state = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events
+    assert [event.event_type.value for event in state] == ["token_created"]
+    if future:
+        all_events = PumpDecoder().decode(tx).events
+        assert all_events[0].event_id == state[0].event_id
+        assert all_events[1].payload[EVENT_IDENTITY_KEY]["origin"] == "cpi"
+        assert all_events[1].instruction_index == 2 and all_events[1].inner_instruction_index == 0
+    bad = copy.deepcopy(tx)
+    bad["meta"]["innerInstructions"][1]["instructions"][0] = _cpi(extend[:40], program_id=PUMP_PROGRAM_ID)
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(bad)
+
+
+@pytest.mark.asyncio
+async def test_v2_stream_rpc_recovery_shares_decoder_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    tx = _v2(_truncated())
+    expected = PumpSwapDecoder().decode(_without_marker(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    gateway = _gateway()
+    async def fetch(_signature: str) -> dict[str, Any]:
+        return tx
+    monkeypatch.setattr(gateway.rpc, "get_transaction", fetch)
+    notification = {"slot": tx["slot"], "signature": tx["transaction"]["signatures"][0],
+                    "meta": {"err": None, "logMessages": ["Log truncated"]}}
+    recovered = await gateway._recover_truncated_transaction(notification)
+    assert [event.event_id for event in PumpSwapDecoder().decode(recovered).events] == [event.event_id for event in expected]
