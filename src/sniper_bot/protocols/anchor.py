@@ -107,6 +107,8 @@ class AnchorIdlDecoder:
         events by appending fields. Anything else that does not fit the IDL
         still fails closed.
         """
+        if "Log truncated" in logs:
+            raise AnchorDecodeError("truncated logs require verified CPI completeness")
         decoded: list[AnchorEvent] = []
         timestamp: int | None = None
         unknown: dict[bytes, None] = {}
@@ -151,6 +153,117 @@ class AnchorIdlDecoder:
             unknown_discriminators=tuple(unknown),
             appended_events=tuple(appended),
         )
+
+    def verified_cpi_log_prefix(
+        self,
+        transaction: Mapping[str, Any],
+        logs: list[str],
+        *,
+        event_names: frozenset[str],
+        instruction_events: Mapping[str, str],
+    ) -> list[str]:
+        """Keep original log indices only when the ledger proves completeness.
+
+        Small logs after the runtime truncation marker have lost invocation
+        boundaries. For successful jsonParsed metadata, require exactly the
+        expected event CPI inside every allowlisted own operation. All consumed
+        CPI payloads must also match the original prefix in execution order.
+        Missing events fail closed; no event key is synthesized.
+        """
+        prefix = logs[:logs.index("Log truncated")]
+        inner = transaction.get("transaction")
+        if not isinstance(inner, dict):
+            raise AnchorDecodeError("truncated logs require full transaction metadata")
+        message = inner.get("message")
+        meta = transaction.get("meta") or inner.get("meta")
+        if (
+            not isinstance(message, dict)
+            or not isinstance(meta, dict)
+            or "err" not in meta
+            or meta["err"] is not None
+        ):
+            raise AnchorDecodeError("truncated logs require successful transaction metadata")
+        outer = message.get("instructions")
+        groups = meta.get("innerInstructions")
+        if not isinstance(outer, list) or not isinstance(groups, list):
+            raise AnchorDecodeError("truncated logs require complete inner instructions")
+        grouped: dict[int, list[Any]] = {}
+        previous_index = -1
+        for group in groups:
+            if not isinstance(group, dict):
+                raise AnchorDecodeError("invalid truncated transaction instruction group")
+            index = group.get("index")
+            values = group.get("instructions")
+            if (
+                type(index) is not int
+                or not previous_index < index < len(outer)
+                or not isinstance(values, list)
+            ):
+                raise AnchorDecodeError("invalid truncated transaction instruction group")
+            previous_index = index
+            grouped[index] = values
+        names = {
+            bytes(item["discriminator"]): item["name"]
+            for item in self.idl.get("instructions", [])
+        }
+        expected: list[str] = []
+        emitted: list[int] = []
+        selected: list[bytes] = []
+        for index, root in enumerate(outer):
+            stack: list[tuple[int, str, int | None]] = []
+            for position, instruction in enumerate([root, *grouped.get(index, [])]):
+                if not isinstance(instruction, dict) or not isinstance(instruction.get("programId"), str):
+                    raise AnchorDecodeError("truncated logs require jsonParsed instruction program IDs")
+                height = 1 if position == 0 else instruction.get("stackHeight")
+                if type(height) is not int or height < 1 or (position and height < 2):
+                    raise AnchorDecodeError("truncated logs require valid instruction stack heights")
+                while stack and stack[-1][0] >= height:
+                    stack.pop()
+                if height > 1 and (not stack or stack[-1][0] != height - 1):
+                    raise AnchorDecodeError("truncated transaction instruction stack is incomplete")
+                program_id = instruction["programId"]
+                operation: int | None = None
+                if program_id == self.program_id:
+                    encoded = instruction.get("data")
+                    if not isinstance(encoded, str) or not encoded or len(encoded) > 16384:
+                        raise AnchorDecodeError("invalid own instruction in truncated transaction")
+                    payload = _base58_decode(encoded)
+                    if payload.startswith(_EVENT_IX_TAG):
+                        if not stack or stack[-1][1] != self.program_id or stack[-1][2] is None:
+                            raise AnchorDecodeError("Anchor CPI event has no own parent operation")
+                        if len(payload) < 16:
+                            raise AnchorDecodeError("truncated Anchor CPI event payload")
+                        parent = stack[-1][2]
+                        event_name = self._events.get(payload[8:16])
+                        if event_name != expected[parent] or emitted[parent]:
+                            raise AnchorDecodeError("CPI event does not cover its parent operation")
+                        emitted[parent] += 1
+                        if event_name in event_names:
+                            selected.append(payload[8:])
+                        else:
+                            # CloseUserVolumeAccumulator is evidence too: a
+                            # discriminator without its declared body is unsafe.
+                            self._decode_struct(event_name, payload[16:])
+                    else:
+                        name = names.get(payload[:8])
+                        if not isinstance(name, str) or name not in instruction_events:
+                            raise AnchorDecodeError("unverified own operation in truncated transaction")
+                        operation = len(expected)
+                        expected.append(instruction_events[name])
+                        emitted.append(0)
+                stack.append((height, program_id, operation))
+        if not expected or any(count != 1 for count in emitted):
+            raise AnchorDecodeError("CPI events do not cover truncated transaction operations")
+        logged: list[bytes] = []
+        for _, encoded in self._own_event_lines(prefix):
+            payload = _b64decode(encoded)
+            if len(payload) < 8:
+                raise AnchorDecodeError("Anchor event payload is shorter than discriminator")
+            if self._events.get(payload[:8]) in event_names:
+                logged.append(payload)
+        if logged != selected:
+            raise AnchorDecodeError("consumed events are missing from the verified log prefix")
+        return prefix
 
     def declared_fields(self, event_name: str) -> list[str]:
         definition = self._types.get(event_name)
@@ -393,3 +506,18 @@ def _base58_encode(payload: bytes) -> str:
     encoded.extend(_BASE58_ALPHABET[0] for _ in range(leading_zeroes))
     encoded.reverse()
     return encoded.decode("ascii") or "1" * leading_zeroes
+
+
+# Anchor's EVENT_IX_TAG_LE, checked before treating an instruction as an event.
+_EVENT_IX_TAG = bytes.fromhex("e445a52e51cb9a1d")
+
+
+def _base58_decode(encoded: str) -> bytes:
+    number = 0
+    for character in encoded.encode("ascii", errors="replace"):
+        digit = _BASE58_ALPHABET.find(bytes([character]))
+        if digit < 0:
+            raise AnchorDecodeError("invalid base58 in Anchor CPI instruction")
+        number = number * 58 + digit
+    leading_zeroes = len(encoded) - len(encoded.lstrip("1"))
+    return bytes(leading_zeroes) + number.to_bytes((number.bit_length() + 7) // 8, "big")

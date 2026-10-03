@@ -8,9 +8,17 @@ paper execution, reporting, Telegram command intake, and the read-only API.
 1. `HeliusStreamGateway` opens separate Pump and PumpSwap subscriptions. It asks for enhanced
    `transactionSubscribe` with compact base64 payloads (only `meta.logMessages` is decoded) and
    takes the signature and slot from the notification envelope. If that is unavailable it falls
-   back to one standard `logsSubscribe` per program. Neither path calls RPC per notification:
+   back to one standard `logsSubscribe` per program. Complete logs need no per-notification RPC:
    every Pump and PumpSwap event carries the program's `Clock::unix_timestamp`, which is the
-   slot's block time, so the decoders date each transaction from it.
+   slot's block time, so the decoders date each transaction from it. An exact runtime
+   `Log truncated` marker triggers an ordered confirmed transaction fetch, with signature,
+   slot, success and prefix checks. PumpSwap accepts the original prefix only when allowlisted
+   operations each have the expected CPI event and every consumed CPI payload matches the
+   prefix byte-for-byte in order, including repeated occurrences. Missing consumed events,
+   unknown operations or incomplete metadata still quarantine the protocol. Original log
+   indices and canonical event IDs remain unchanged; post-marker logs are never guessed.
+   Truncated transactions also route protocols found only in full instructions; Pump truncation
+   without a completeness contract stays quarantined. Failed recovery retains original evidence.
 2. Vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
    `CompleteEvent` and `CompletePumpAmmMigrationEvent`, and PumpSwap pool creation, swaps and
    liquidity changes. Bonding-curve trades and other events are only dated, never decoded.

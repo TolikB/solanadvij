@@ -718,6 +718,7 @@ class HeliusStreamGateway:
                         },
                     }
                     source = EventSource.SOLANA_WSS
+                transaction = await self._recover_truncated_transaction(transaction)
                 await self._queue_transaction(
                     transaction,
                     source,
@@ -738,6 +739,53 @@ class HeliusStreamGateway:
                 self._notification_in_flight = False
                 self._notification_queue.task_done()
                 self._sync_queue_depth()
+
+    async def _recover_truncated_transaction(
+        self, transaction: dict[str, Any]
+    ) -> dict[str, Any]:
+        inner = transaction.get("transaction")
+        meta = transaction.get("meta") or (inner.get("meta") if isinstance(inner, dict) else None)
+        logs = meta.get("logMessages") if isinstance(meta, dict) else None
+        if not isinstance(logs, list) or "Log truncated" not in logs:
+            return transaction
+        try:
+            signature = _transaction_signature(transaction)
+            if not signature:
+                raise RuntimeError("truncated transaction has no recovery signature")
+            recovered = await self.rpc.get_transaction(signature)
+            if (
+                recovered is None
+                or _transaction_signature(recovered) != signature
+                or type(recovered.get("slot")) is not int
+                or recovered.get("slot") != transaction.get("slot")
+            ):
+                raise RuntimeError("truncated transaction recovery identity does not match")
+            recovered_meta = recovered.get("meta")
+            recovered_logs = recovered_meta.get("logMessages") if isinstance(recovered_meta, dict) else None
+            prefix = logs[:logs.index("Log truncated")]
+            if (
+                not isinstance(recovered_meta, dict)
+                or "err" not in recovered_meta
+                or recovered_meta["err"] is not None
+                or not isinstance(recovered_logs, list)
+                or recovered_logs[:len(prefix)] != prefix
+            ):
+                raise RuntimeError("truncated transaction recovery metadata does not match")
+            # The notification marker must still trigger the CPI proof even
+            # if an RPC provider omits it. Enrich metadata without replacing
+            # the original log prefix or mutating the fetched response.
+            return {**recovered, "meta": {**recovered_meta, "logMessages": list(logs)}}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Retain the original evidence: the decoder quarantines an
+            # unverified prefix permanently, instead of forgetting a failed
+            # notification during a transient reconnect.
+            logger.error(
+                "Truncated transaction metadata recovery failed; original evidence retained",
+                extra={"exception_class": type(exc).__name__},
+            )
+            return transaction
 
     async def _cancel_notification_dispatcher(self) -> None:
         dispatch_task = self._notification_dispatch_task
@@ -1079,12 +1127,29 @@ def _transaction_protocols(transaction: dict[str, Any]) -> list[Protocol]:
     meta = transaction.get("meta") or transaction.get("transaction", {}).get("meta") or {}
     logs = meta.get("logMessages") or transaction.get("logs") or []
     text = "\n".join(str(line) for line in logs)
-    result: list[Protocol] = []
-    if PUMP_PROGRAM_ID in text:
-        result.append(Protocol.PUMP)
-    if PUMPSWAP_PROGRAM_ID in text:
-        result.append(Protocol.PUMPSWAP)
-    return result
+    program_ids = {program_id for program_id in (PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID)
+                   if program_id in text}
+    if "Log truncated" in logs:
+        # A protocol may first execute after the logs stopped. Route it from
+        # full jsonParsed instructions too, so incomplete Pump evidence cannot
+        # bypass quarantine just because its program ID is absent in the logs.
+        inner = transaction.get("transaction")
+        message = inner.get("message") if isinstance(inner, dict) else None
+        outer = message.get("instructions") if isinstance(message, dict) else None
+        instructions = list(outer) if isinstance(outer, list) else []
+        groups = meta.get("innerInstructions")
+        for group in groups if isinstance(groups, list) else []:
+            if isinstance(group, dict) and isinstance(group.get("instructions"), list):
+                instructions.extend(group["instructions"])
+        program_ids.update(instruction["programId"] for instruction in instructions
+                           if isinstance(instruction, dict) and isinstance(instruction.get("programId"), str))
+        if not program_ids.intersection({PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID}):
+            # Recovery failed before any subscribed program became visible:
+            # conservatively quarantine both instead of dropping the evidence.
+            return [Protocol.PUMP, Protocol.PUMPSWAP]
+    return [protocol for protocol, program_id in (
+        (Protocol.PUMP, PUMP_PROGRAM_ID), (Protocol.PUMPSWAP, PUMPSWAP_PROGRAM_ID)
+    ) if program_id in program_ids]
 
 
 def _transaction_signature(transaction: dict[str, Any]) -> str | None:

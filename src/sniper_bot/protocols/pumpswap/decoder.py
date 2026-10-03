@@ -41,6 +41,19 @@ PUMPSWAP_MINIMUM_FIELDS = {
 }
 
 
+# Only these operation/event pairs have a completeness contract for truncated
+# logs. Every other own operation remains quarantined until explicitly reviewed.
+_TRUNCATION_INSTRUCTION_EVENTS = {
+    "create_pool": "CreatePoolEvent",
+    "buy": "BuyEvent",
+    "buy_exact_quote_in": "BuyEvent",
+    "sell": "SellEvent",
+    "deposit": "DepositEvent",
+    "withdraw": "WithdrawEvent",
+    "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
+}
+
+
 class PumpSwapDecoder:
     def __init__(
         self,
@@ -70,8 +83,16 @@ class PumpSwapDecoder:
         source: EventSource = EventSource.HELIUS_WSS,
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
+        logs = list(_log_messages(transaction))
+        if "Log truncated" in logs:
+            logs = self._anchor.verified_cpi_log_prefix(
+                transaction,
+                logs,
+                event_names=self._event_names,
+                instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
+            )
         scan = self._anchor.scan_logs(
-            list(_log_messages(transaction)),
+            logs,
             event_names=self._event_names,
             minimum_fields=PUMPSWAP_MINIMUM_FIELDS,
         )
