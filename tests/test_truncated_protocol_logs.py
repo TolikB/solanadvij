@@ -453,7 +453,7 @@ def test_verified_pump_trade_preserves_ids_payloads_and_state_filter(name: str, 
 
 
 @pytest.mark.parametrize("failure", [
-    "missing_cpi", "missing_log", "short_body", "partial_append", "unknown_operation",
+    "missing_cpi", "short_body", "partial_append", "unknown_operation",
     "completion_cpi", "completion_without_cpi", "wrong_timestamp",
 ])
 def test_pump_trade_proof_rejects_incomplete_evidence_and_completion(failure: str) -> None:
@@ -462,8 +462,6 @@ def test_pump_trade_proof_rejects_incomplete_evidence_and_completion(failure: st
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
     if failure == "missing_cpi":
         inner.clear()
-    elif failure == "missing_log":
-        tx["meta"]["logMessages"].pop(1)
     elif failure in ("short_body", "partial_append"):
         payload = base64.b64decode(tx["meta"]["logMessages"][1].removeprefix("Program data: "))
         payload = payload[:100] if failure == "short_body" else payload + b"x"
@@ -497,3 +495,47 @@ def test_nested_pump_trade_is_verified_in_its_own_parent() -> None:
 
 def test_truncated_pump_sell_at_zero_token_reserves_is_not_a_buy_completion() -> None:
     assert len(PumpDecoder().decode(_pump_trade("sell_v2", is_buy=False, reserves=0)).events) == 1
+
+
+@pytest.mark.parametrize("block_time_available", [True, False])
+def test_ignored_trade_missing_from_logs_uses_verified_cpi_clock_without_event_id(
+    block_time_available: bool,
+) -> None:
+    tx = _pump_trade()
+    tx["meta"]["logMessages"].pop(1)
+    if not block_time_available:
+        del tx["blockTime"]
+    ignored = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+    assert ignored.events == []
+    assert ignored.block_time is not None
+    assert int(ignored.block_time.timestamp()) == 1_776_700_123
+    with pytest.raises(AnchorDecodeError, match="consumed events are missing"):
+        PumpDecoder().decode(tx)
+
+
+@pytest.mark.parametrize("failure", ["short_body", "partial_append", "completion", "wrong_clock"])
+def test_missing_ignored_trade_still_requires_complete_safe_cpi(failure: str) -> None:
+    tx = _pump_trade(reserves=0 if failure == "completion" else 10,
+                     layout="minimum" if failure == "partial_append" else "current")
+    payload = base64.b64decode(tx["meta"]["logMessages"].pop(1).removeprefix("Program data: "))
+    if failure == "short_body":
+        payload = payload[:100]
+    elif failure == "partial_append":
+        payload += b"x"
+    elif failure == "wrong_clock":
+        tx["blockTime"] += 120
+    tx["meta"]["innerInstructions"][0]["instructions"][0] = _cpi(payload, program_id=PUMP_PROGRAM_ID)
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+
+
+def test_unlogged_ignored_trade_cannot_hide_missing_consumed_state_event() -> None:
+    tx = _pump_trade()
+    tx["meta"]["logMessages"].pop(1)
+    anchor = PumpDecoder()._anchor
+    discriminator = next(key for key, name in anchor._events.items() if name == "CompleteEvent")
+    tx["meta"]["innerInstructions"][0]["instructions"].append(
+        _cpi(discriminator + bytes(136), program_id=PUMP_PROGRAM_ID)
+    )
+    with pytest.raises(AnchorDecodeError, match="parent operation"):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)

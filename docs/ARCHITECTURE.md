@@ -19,9 +19,11 @@ paper execution, reporting, Telegram command intake, and the read-only API.
    prefix byte-for-byte in order, including repeated occurrences. Missing consumed events,
    unknown operations or incomplete metadata still quarantine the protocol. Original log
    indices and canonical event IDs remain unchanged; post-marker logs are never guessed.
-   Truncated transactions also route protocols found only in full instructions. Pump trade CPI
-   bodies are checked through the accepted minimum layout even when live state ignores trades;
-   additional completion CPI or other Pump operations without a contract stay quarantined.
+   Truncated transactions also route protocols found only in full instructions. Ignored Pump
+   trades may be absent from logs only when their CPI body, clock and non-completion reserves
+   are verified; they produce no state event or new canonical ID. The verified CPI clock can
+   date an otherwise empty transaction. Consumed trades still require their original log.
+   Additional completion CPI or other Pump operations without a contract stay quarantined.
    Failed recovery retains original evidence.
 2. Vendored Anchor IDLs decode the events live state consumes: Pump `CreateEvent`,
    `CompleteEvent` and `CompletePumpAmmMigrationEvent`, and PumpSwap pool creation, swaps and

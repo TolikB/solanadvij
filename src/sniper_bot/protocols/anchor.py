@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -161,6 +161,8 @@ class AnchorIdlDecoder:
         *,
         event_names: frozenset[str],
         instruction_events: Mapping[str, str],
+        minimum_fields: Mapping[str, str] | None = None,
+        event_validator: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> list[str]:
         """Keep original log indices only when the ledger proves completeness.
 
@@ -238,12 +240,17 @@ class AnchorIdlDecoder:
                         if event_name != expected[parent] or emitted[parent]:
                             raise AnchorDecodeError("CPI event does not cover its parent operation")
                         emitted[parent] += 1
+                        if event_name not in event_names or event_validator is not None:
+                            # Ignored CPI events still require a valid body.
+                            minimum = (minimum_fields or {}).get(event_name)
+                            if minimum is None:
+                                fields = self._decode_struct(event_name, payload[16:])
+                            else:
+                                fields, _ = self._decode_struct_from_minimum(event_name, payload[16:], minimum)
+                            if event_validator is not None:
+                                event_validator(event_name, fields)
                         if event_name in event_names:
                             selected.append(payload[8:])
-                        else:
-                            # CloseUserVolumeAccumulator is evidence too: a
-                            # discriminator without its declared body is unsafe.
-                            self._decode_struct(event_name, payload[16:])
                     else:
                         name = names.get(payload[:8])
                         if not isinstance(name, str) or name not in instruction_events:

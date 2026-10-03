@@ -71,7 +71,9 @@ def decoded_transaction(
     )
 
 
-def check_event_timestamps(transaction: dict[str, Any], scan: AnchorLogScan) -> None:
+def check_event_timestamps(
+    transaction: dict[str, Any], scan: AnchorLogScan, *, extra_timestamps: list[int] | None = None,
+) -> None:
     """Fail closed when decoded Clock timestamps cannot be real.
 
     Appended fields decode cleanly, but a field inserted mid-struct would
@@ -86,6 +88,7 @@ def check_event_timestamps(transaction: dict[str, Any], scan: AnchorLogScan) -> 
     ]
     if scan.timestamp is not None:
         stamps.append(int(scan.timestamp))
+    stamps.extend(extra_timestamps or [])
     if not stamps:
         return
     if any(not _EARLIEST_TIMESTAMP <= stamp < _LATEST_TIMESTAMP for stamp in stamps):
@@ -126,28 +129,28 @@ class PumpDecoder:
         observed_at: datetime | None = None,
     ) -> DecodedTransaction:
         logs = list(_log_messages(transaction))
+        cpi_timestamps: list[int] = []
         if "Log truncated" in logs:
+            def validate_trade(_name: str, fields: dict[str, Any]) -> None:
+                if fields["is_buy"] and fields["real_token_reserves"] == 0:
+                    raise AnchorDecodeError("truncated Pump completion requires a separate CPI contract")
+                cpi_timestamps.append(fields["timestamp"])
+
             logs = self._anchor.verified_cpi_log_prefix(
-                transaction, logs, event_names=PUMP_EVENT_NAMES,
+                transaction, logs, event_names=self._event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
+                minimum_fields=PUMP_MINIMUM_FIELDS, event_validator=validate_trade,
             )
-            proof = self._anchor.scan_logs(
-                logs, event_names=PUMP_EVENT_NAMES, minimum_fields=PUMP_MINIMUM_FIELDS,
-            )
-            check_event_timestamps(transaction, proof)
-            if any(
-                event.name == "TradeEvent" and event.fields["is_buy"]
-                and event.fields["real_token_reserves"] == 0
-                for event in proof.events
-            ):
-                raise AnchorDecodeError("truncated Pump completion requires a separate CPI contract")
         scan = self._anchor.scan_logs(
             logs,
             event_names=self._event_names,
             minimum_fields=PUMP_MINIMUM_FIELDS,
         )
-        check_event_timestamps(transaction, scan)
-        block_time = _resolve_block_time(transaction, scan.timestamp)
+        check_event_timestamps(transaction, scan, extra_timestamps=cpi_timestamps)
+        timestamp = scan.timestamp
+        if timestamp is None and cpi_timestamps:
+            timestamp = cpi_timestamps[0]
+        block_time = _resolve_block_time(transaction, timestamp)
         if not scan.events:
             return decoded_transaction([], block_time, scan)
         signature = _signature(transaction)
