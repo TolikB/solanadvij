@@ -857,6 +857,10 @@ class Database:
         async with self.sessions.begin() as session:
             yield session
 
+    def has_event_claim(self, event_id: str) -> bool:
+        """Return whether this process retains an in-memory claim for the event."""
+        return event_id in self._event_claim_tokens
+
     def release_event_claim(self, event_id: str) -> None:
         """Forget an in-memory claim only after its outer transaction committed."""
         self._event_claim_tokens.pop(event_id, None)

@@ -530,41 +530,56 @@ class ConfirmationPipeline:
         self,
         events: list[EventEnvelope],
     ) -> None:
+        database = self.database
+        if database is None:
+            raise RuntimeError("durable worker requires a database")
+        # An existing claim belongs to an earlier batch already handed to state.
+        # Filter once: retries must still resume this operation's own claims.
+        claim_events = [
+            event for event in events
+            if not database.has_event_claim(event.event_id)
+        ]
+        claimed: list[EventEnvelope] | None = None
+        checkpoint_saved = False
+        state_handed_off = False
+        archive_handed_off = False
         while True:
             try:
-                if self.database is None:
-                    raise RuntimeError(
-                        "durable worker requires a database"
+                if claimed is None:
+                    results = await database.record_events(
+                        claim_events,
+                        resume_owned=True,
                     )
-                results = await self.database.record_events(
-                    events,
-                    resume_owned=True,
-                )
-                claimed = [
-                    event
-                    for event, result in zip(
-                        events,
-                        results,
-                        strict=True,
-                    )
-                    if result
-                ]
+                    claimed = [
+                        event
+                        for event, result in zip(
+                            claim_events,
+                            results,
+                            strict=True,
+                        )
+                        if result
+                    ]
                 if claimed:
-                    await self.database.save_stream_protocol_checkpoints(
-                        claimed,
-                        stage="durable",
-                    )
-                    await self._enqueue_stage(
-                        "state",
-                        self._state_queue,
-                        claimed,
-                    )
-                    if self.record_raw:
+                    if not checkpoint_saved:
+                        await database.save_stream_protocol_checkpoints(
+                            claimed,
+                            stage="durable",
+                        )
+                        checkpoint_saved = True
+                    if not state_handed_off:
+                        await self._enqueue_stage(
+                            "state",
+                            self._state_queue,
+                            claimed,
+                        )
+                        state_handed_off = True
+                    if self.record_raw and not archive_handed_off:
                         await self._enqueue_stage(
                             "archive",
                             self._archive_queue,
                             claimed,
                         )
+                        archive_handed_off = True
                 self.entry_gate.unblock(
                     "durable_ingest_error"
                 )

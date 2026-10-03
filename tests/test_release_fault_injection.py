@@ -7,6 +7,7 @@ without a gap and without duplicate effects.
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -395,3 +396,220 @@ async def test_state_failure_releases_a_batch_pulled_ahead_of_the_error(
         for event in first_batch + second_batch:
             database.release_event_claim(event.event_id)
         await database.close()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("coalesced", [False, True])
+async def test_inflight_notification_duplicate_is_applied_and_archived_once(
+    tmp_path: Path, coalesced: bool
+) -> None:
+    database = await _database(tmp_path, "inflight_duplicate.db")
+    pipeline = _pipeline(database, tmp_path)
+    events = [_event(0), _event(1)]
+
+    try:
+        await pipeline._apply_durable_batch(events)
+        # State is deliberately still queued when Helius repeats an event.
+        await pipeline._apply_durable_batch([_event(0)])
+        queued_state = []
+        while not pipeline._state_queue.empty():
+            item = pipeline._state_queue.get_nowait()
+            assert item is not None
+            queued_state.append(item)
+
+        assert [event.event_id for item in queued_state for event in item.events] == [
+            event.event_id for event in events
+        ]
+        if coalesced:
+            await pipeline._apply_state_batch(
+                [event for item in queued_state for event in item.events]
+            )
+        else:
+            for item in queued_state:
+                await pipeline._apply_state_batch(item.events)
+        for item in queued_state:
+            pipeline._state_queue.task_done()
+            pipeline._complete_stage("state", item)
+
+        archived_ids = []
+        while not pipeline._archive_queue.empty():
+            item = pipeline._archive_queue.get_nowait()
+            assert item is not None
+            archived_ids.extend(event.event_id for event in item.events)
+            await pipeline._apply_archive_batch(item.events)
+            pipeline._archive_queue.task_done()
+            pipeline._complete_stage("archive", item)
+
+        assert archived_ids == [event.event_id for event in events]
+        state = await _reconcile(database)
+        assert state.raw_rows == state.dedup_rows == state.processed_rows == 2
+        assert state.max_raw_sequence == state.max_archived_sequence == 2
+        assert state.durable_checkpoint == state.state_checkpoint == 2
+        assert database._event_claim_tokens == {}
+        assert pipeline._state_poisoned is False
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["raw_before", "raw_after", "checkpoint_after", "archive_before"]
+)
+async def test_mixed_inflight_batch_retry_has_one_handoff_per_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    database = await _database(tmp_path, "mixed_retry.db")
+    pipeline = _pipeline(database, tmp_path)
+    first, second = _event(0), _event(1)
+    await pipeline._apply_durable_batch([first])
+    original_record = database.record_events
+    original_checkpoint = database.save_stream_protocol_checkpoints
+    original_enqueue = pipeline._enqueue_stage
+    attempts = 0
+    claim_batches: list[list[str]] = []
+
+    async def failing_record(
+        batch: list[EventEnvelope], **kwargs: Any
+    ) -> list[Any]:
+        nonlocal attempts
+        claim_batches.append([event.event_id for event in batch])
+        if boundary == "raw_before":
+            attempts += 1
+            if attempts == 1:
+                raise InjectedFailure("raw commit did not start")
+        result = await original_record(batch, **kwargs)
+        if boundary == "raw_after":
+            attempts += 1
+            if attempts == 1:
+                raise InjectedFailure("raw commit outcome is ambiguous")
+        return result
+
+    async def failing_checkpoint(
+        batch: list[EventEnvelope], *, stage: str
+    ) -> None:
+        nonlocal attempts
+        await original_checkpoint(batch, stage=stage)
+        if boundary == "checkpoint_after" and stage == "durable":
+            attempts += 1
+            if attempts == 1:
+                raise InjectedFailure("durable checkpoint commit outcome is ambiguous")
+
+    async def failing_enqueue(
+        stage: str, queue: Any, batch: list[EventEnvelope]
+    ) -> None:
+        nonlocal attempts
+        if boundary == "archive_before" and stage == "archive":
+            attempts += 1
+            if attempts == 1:
+                raise InjectedFailure("archive handoff failed after state handoff")
+        await original_enqueue(stage, queue, batch)
+
+    monkeypatch.setattr(database, "record_events", failing_record)
+    monkeypatch.setattr(database, "save_stream_protocol_checkpoints", failing_checkpoint)
+    monkeypatch.setattr(pipeline, "_enqueue_stage", failing_enqueue)
+
+    try:
+        await pipeline._apply_durable_batch([_event(0), second])
+        assert claim_batches
+        assert all(batch == [second.event_id] for batch in claim_batches)
+        assert attempts == 2
+
+        state_ids = []
+        while not pipeline._state_queue.empty():
+            item = pipeline._state_queue.get_nowait()
+            assert item is not None
+            state_ids.extend(event.event_id for event in item.events)
+            await pipeline._apply_state_batch(item.events)
+            pipeline._state_queue.task_done()
+            pipeline._complete_stage("state", item)
+        archived_ids = []
+        while not pipeline._archive_queue.empty():
+            item = pipeline._archive_queue.get_nowait()
+            assert item is not None
+            archived_ids.extend(event.event_id for event in item.events)
+            await pipeline._apply_archive_batch(item.events)
+            pipeline._archive_queue.task_done()
+            pipeline._complete_stage("archive", item)
+
+        expected_ids = [first.event_id, second.event_id]
+        assert state_ids == archived_ids == expected_ids
+        state = await _reconcile(database)
+        assert state.raw_rows == state.dedup_rows == state.processed_rows == 2
+        assert state.max_raw_sequence == state.max_archived_sequence == 2
+        assert state.durable_checkpoint == state.state_checkpoint == 2
+        assert database._event_claim_tokens == {}
+        assert pipeline._state_poisoned is False
+        assert "durable_ingest_error" not in pipeline.entry_gate.reasons
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["raw_after", "checkpoint_after", "state_before", "archive_before"]
+)
+async def test_cancelled_durable_handoff_reconciles_after_process_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    database = await _database(tmp_path, "cancelled_handoff.db")
+    pipeline = _pipeline(database, tmp_path)
+    events = [_event(0), _event(1)]
+    original_record = database.record_events
+    original_checkpoint = database.save_stream_protocol_checkpoints
+    original_enqueue = pipeline._enqueue_stage
+
+    async def cancelled_record(
+        batch: list[EventEnvelope], **kwargs: Any
+    ) -> list[Any]:
+        result = await original_record(batch, **kwargs)
+        if boundary == "raw_after":
+            raise asyncio.CancelledError
+        return result
+
+    async def cancelled_checkpoint(
+        batch: list[EventEnvelope], *, stage: str
+    ) -> None:
+        await original_checkpoint(batch, stage=stage)
+        if boundary == "checkpoint_after" and stage == "durable":
+            raise asyncio.CancelledError
+
+    async def cancelled_enqueue(
+        stage: str, queue: Any, batch: list[EventEnvelope]
+    ) -> None:
+        if boundary == f"{stage}_before":
+            raise asyncio.CancelledError
+        await original_enqueue(stage, queue, batch)
+
+    monkeypatch.setattr(database, "record_events", cancelled_record)
+    monkeypatch.setattr(database, "save_stream_protocol_checkpoints", cancelled_checkpoint)
+    monkeypatch.setattr(pipeline, "_enqueue_stage", cancelled_enqueue)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await pipeline._apply_durable_batch(events)
+        assert (await _reconcile(database)).raw_rows == len(events)
+    finally:
+        await database.close()
+
+    # A new Database instance has no process-local tokens, as on a real restart.
+    recovered_database = Database(
+        f"sqlite+aiosqlite:///{tmp_path / 'cancelled_handoff.db'}"
+    )
+    restarted = _pipeline(recovered_database, tmp_path)
+    try:
+        pending = await recovered_database.load_unprocessed_events(
+            include_owned_processing=True
+        )
+        assert [event.event_id for event in pending] == [
+            event.event_id for event in events
+        ]
+        for event in pending:
+            await restarted.process_event(event, recovering=True)
+        await restarted.start_background_workers()
+        await restarted.stop_background_workers(timeout_seconds=5)
+
+        recovered = await _reconcile(recovered_database)
+        assert recovered.raw_rows == recovered.dedup_rows == recovered.processed_rows == 2
+        assert recovered.max_raw_sequence == recovered.max_archived_sequence == 2
+        assert recovered_database._event_claim_tokens == {}
+        assert restarted._state_poisoned is False
+    finally:
+        await recovered_database.close()
