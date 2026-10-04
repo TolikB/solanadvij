@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from ...events import (
@@ -54,12 +56,23 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "create_pool": "CreatePoolEvent",
     "buy": "BuyEvent",
     "buy_exact_quote_in": "BuyEvent",
+    "buy_exact_quote_in_v2": "BuyEvent",
+    "buy_v2": "BuyEvent",
+    "sell_v2": "SellEvent",
     "sell": "SellEvent",
     "deposit": "DepositEvent",
     "withdraw": "WithdrawEvent",
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "claim_cashback": "ClaimCashbackEvent",
 }
+# Published trade selectors from the officially recommended pump-rust-client
+# 0.2.0; event schemas match the pinned IDL (see SOURCE.md). The full CPI proof
+# still applies to each operation; other operations remain closed.
+_SUPPLEMENTAL_INSTRUCTIONS: Mapping[bytes, str] = MappingProxyType({
+    bytes.fromhex("c2ab1c46684d5b2f"): "buy_exact_quote_in_v2",
+    bytes.fromhex("b817ee6167c5d33d"): "buy_v2",
+    bytes.fromhex("5df6823ce7e940b2"): "sell_v2",
+})
 
 
 class PumpSwapDecoder:
@@ -102,6 +115,7 @@ class PumpSwapDecoder:
                 transaction, logs, event_names=event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
                 minimum_fields=PUMPSWAP_MINIMUM_FIELDS, recover_missing=v2,
+                supplemental_instructions=_SUPPLEMENTAL_INSTRUCTIONS,
             )
         else:
             scan = self._anchor.scan_logs(
