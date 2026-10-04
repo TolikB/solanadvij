@@ -913,3 +913,101 @@ def test_ignored_pump_close_requires_full_body_clock_parent_and_cardinality(fail
         inner.append({"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8), "stackHeight": 2})
     with pytest.raises(AnchorDecodeError):
         PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+
+
+
+def _swap_sell_cashback() -> dict[str, Any]:
+    """A foreign router calls PumpSwap sell and claims cashback afterward."""
+    from scripts.benchmark_postgres_capacity import BorshEventEncoder
+    from sniper_bot.registry import WSOL_MINT
+
+    fixture = _fixture()
+    timestamp = fixture["blockTime"]
+    encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pumpswap/idl.json")
+    sell = base64.b64decode(encoder.encode("SellEvent", {"timestamp": timestamp, "quote_mint": WSOL_MINT}))
+    cashback = base64.b64decode(encoder.encode("ClaimCashbackEvent", {"timestamp": timestamp, "amount": 1}))
+    assert len(cashback) == 72
+    tx = {
+        "slot": 5, "blockTime": timestamp,
+        "transaction": {"signatures": ["swap-cashback"], "message": {"instructions": [{"programId": OTHER}] * 3}},
+        "meta": {"err": None, "innerInstructions": [{"index": 2, "instructions": [
+            {**_instruction("sell"), "stackHeight": 2}, {**_cpi(sell), "stackHeight": 3},
+            {**_instruction("claim_cashback"), "stackHeight": 2}, {**_cpi(cashback), "stackHeight": 3},
+        ]}], "logMessages": [
+            f"Program {OTHER} invoke [1]", f"Program {PUMPSWAP_PROGRAM_ID} invoke [2]",
+            "Program data: " + base64.b64encode(sell).decode(), f"Program {PUMPSWAP_PROGRAM_ID} success",
+            f"Program {PUMPSWAP_PROGRAM_ID} invoke [2]", "Program data: " + base64.b64encode(cashback).decode(),
+            f"Program {PUMPSWAP_PROGRAM_ID} success", f"Program {OTHER} success", "Log truncated",
+        ]},
+    }
+    return tx
+
+
+@pytest.mark.parametrize("prefix_available", [True, False])
+def test_v2_cashback_preserves_sell_identity_and_creates_no_extra_event(prefix_available: bool) -> None:
+    tx = _v2(_swap_sell_cashback())
+    expected = PumpSwapDecoder().decode(_without_marker(tx)).events
+    if not prefix_available:
+        tx["meta"]["logMessages"] = ["Log truncated"]
+    actual = PumpSwapDecoder().decode(tx).events
+    assert len(actual) == len(expected) == 1
+    assert actual[0].event_type.value == "swap_sell"
+    assert actual[0].event_id == expected[0].event_id
+    assert {k: v for k, v in actual[0].payload.items() if k != EVENT_IDENTITY_KEY} == {
+        k: v for k, v in expected[0].payload.items() if k != EVENT_IDENTITY_KEY
+    }
+    assert actual[0].instruction_index == (expected[0].instruction_index if prefix_available else 2)
+    assert actual[0].inner_instruction_index == (-1 if prefix_available else 1)
+    assert PumpSwapDecoder(event_names=frozenset()).decode(tx).events == []
+
+
+def test_legacy_cashback_preserves_visible_sell_identity_but_rejects_missing_sell() -> None:
+    tx = _swap_sell_cashback()
+    expected = PumpSwapDecoder().decode(_without_marker(tx)).events
+    actual = PumpSwapDecoder().decode(tx).events
+    assert [event.model_dump(mode="json", exclude={"observed_at"}) for event in actual] == [
+        event.model_dump(mode="json", exclude={"observed_at"}) for event in expected
+    ]
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    with pytest.raises(AnchorDecodeError, match="consumed events are missing"):
+        PumpSwapDecoder().decode(tx)
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_cashback_cpi", "extra_cashback_cpi", "short_body", "wrong_clock",
+    "wrong_event", "wrong_parent", "unknown_late_operation",
+])
+def test_ignored_cashback_requires_full_body_clock_parent_and_cardinality(failure: str) -> None:
+    from sniper_bot.protocols.anchor import _base58_decode
+
+    tx = _v2(_swap_sell_cashback())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if failure == "missing_cashback_cpi":
+        inner.pop()
+    elif failure == "extra_cashback_cpi":
+        inner.append(copy.deepcopy(inner[-1]))
+    elif failure == "short_body":
+        inner[-1]["data"] = _base58_encode(_base58_decode(inner[-1]["data"])[:-1])
+    elif failure == "wrong_clock":
+        payload = bytearray(_base58_decode(inner[-1]["data"]))
+        struct.pack_into("<q", payload, len(TAG) + 8 + 32 + 8, tx["blockTime"] + 120)
+        inner[-1]["data"] = _base58_encode(payload)
+    elif failure == "wrong_event":
+        inner[-1] = copy.deepcopy(inner[1])
+    elif failure == "wrong_parent":
+        inner[-1]["stackHeight"] = 4
+    elif failure == "unknown_late_operation":
+        inner.append({"programId": PUMPSWAP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8), "stackHeight": 2})
+    with pytest.raises(AnchorDecodeError):
+        PumpSwapDecoder(event_names=frozenset()).decode(tx)
+
+
+def test_standalone_ignored_cashback_resolves_cpi_clock_without_state_or_identity() -> None:
+    tx = _v2(_swap_sell_cashback())
+    expected = PumpSwapDecoder().decode(tx).block_time
+    del tx["blockTime"]
+    tx["meta"]["innerInstructions"][0]["instructions"] = tx["meta"]["innerInstructions"][0]["instructions"][2:]
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    actual = PumpSwapDecoder().decode(tx)
+    assert actual.events == [] and actual.block_time == expected

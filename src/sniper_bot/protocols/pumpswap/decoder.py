@@ -58,6 +58,7 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "deposit": "DepositEvent",
     "withdraw": "WithdrawEvent",
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
+    "claim_cashback": "ClaimCashbackEvent",
 }
 
 
