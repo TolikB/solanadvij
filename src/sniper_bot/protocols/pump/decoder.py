@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from ...events import (
@@ -43,9 +45,16 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",
     "buy_exact_quote_in_v2": "TradeEvent",
+    "buy_exact_quote_in_v3": "TradeEvent",
     "sell": "TradeEvent",
     "sell_v2": "TradeEvent",
 }
+# The observed v3 selector is published by the officially recommended
+# pump-rust-client 0.2.0. Its event schemas match the pinned IDL (see SOURCE.md).
+# Other v3 operations remain unreviewed and fail closed.
+_SUPPLEMENTAL_INSTRUCTIONS: Mapping[bytes, str] = MappingProxyType({
+    bytes.fromhex("e1f7501ed5b38488"): "buy_exact_quote_in_v3",
+})
 # Last field of each consumed event as deployed at pump-public-docs 9c82f61.
 # Pump extends events by appending fields, so older payloads end here and
 # newer ones carry more; both decode.
@@ -156,6 +165,7 @@ class PumpDecoder:
             scan = self._anchor.scan_verified_cpi_events(
                 transaction, logs, event_names=event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
+                supplemental_instructions=_SUPPLEMENTAL_INSTRUCTIONS,
                 minimum_fields=PUMP_MINIMUM_FIELDS, recover_missing=v2,
                 event_validator=validate_event,
             )

@@ -8,3 +8,29 @@
 - Minimum accepted layouts are the ones deployed at commit
   `9c82f61cb711b044a17f770ab8ce9f9bdf78f333` (previously vendored); fields
   appended since then are decoded when present.
+
+## Supplemental instruction contract
+
+The pinned event IDL and adapter version remain unchanged. The truncated CPI
+scanner also recognizes only the observed `buy_exact_quote_in_v3` instruction
+selector `e1f7501ed5b38488`, requiring exactly one direct own `TradeEvent` CPI.
+
+- Primary reference: `pump-rust-client` 0.2.0, recommended by the official
+  [Pump README](https://github.com/pump-fun/pump-public-docs/blob/cb188ce08b5069196eef1f3e4a0c43b70099793b/README.md).
+- Published crate: https://static.crates.io/crates/pump-rust-client/pump-rust-client-0.2.0.crate
+- Crate SHA-256, checked against the registry checksum:
+  `4c940fb1363f719d3310201ec28eb3871ccd5929c5536dc8af10a5f30b0f7c3a`.
+- Packaged `idls/pump.json` SHA-256:
+  `ed96f86dc3bcd9abe7f19e4bba3eb78f274fc2308d33916650a243924ade2f70`.
+- Retrieved: 2026-10-04; crate VCS commit
+  `46eefb3878cbcc8283cfc5c444299996382d3ba6`.
+- Published instruction: 17 accounts, `spendable_quote_in: u64`,
+  `min_tokens_out: u64`, `partial_fill: OptionBool` (25 bytes with selector).
+- All four consumed event definitions/discriminators and the referenced
+  `Shareholder`/`OptionBool` types exactly match the pinned event IDL.
+
+The original quarantined transaction matched this selector, argument length,
+account count and direct Trade CPI; two RPCs independently matched its
+instruction/CPI data, accounts and stack heights. Event `ix_name` is not an
+instruction discriminator. `buy_v3` and `sell_v3` remain unreviewed. Existing
+body, Clock, parent, exact-one, log-prefix and buy-completion checks still apply.

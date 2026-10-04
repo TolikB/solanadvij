@@ -166,6 +166,7 @@ class AnchorIdlDecoder:
         *,
         event_names: frozenset[str],
         instruction_events: Mapping[str, str],
+        supplemental_instructions: Mapping[bytes, str] | None = None,
         minimum_fields: Mapping[str, str] | None = None,
         event_validator: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> list[str]:
@@ -173,6 +174,7 @@ class AnchorIdlDecoder:
         self.scan_verified_cpi_events(
             transaction, logs, event_names=event_names,
             instruction_events=instruction_events, minimum_fields=minimum_fields,
+            supplemental_instructions=supplemental_instructions,
             event_validator=event_validator,
         )
         return logs[:logs.index("Log truncated")]
@@ -184,6 +186,7 @@ class AnchorIdlDecoder:
         *,
         event_names: frozenset[str],
         instruction_events: Mapping[str, str],
+        supplemental_instructions: Mapping[bytes, str] | None = None,
         minimum_fields: Mapping[str, str] | None = None,
         event_validator: Callable[[str, dict[str, Any]], None] | None = None,
         recover_missing: bool = False,
@@ -195,6 +198,9 @@ class AnchorIdlDecoder:
         logs must match the ordered CPI prefix byte-for-byte with multiplicity.
         Only a caller using v2 identity may recover a missing suffix; recovered
         events carry genuine CPI coordinates instead of a guessed log index.
+
+        Supplemental ABI selectors require an explicit known event contract and
+        cannot shadow the vendored instructions or the reserved event CPI tag.
         """
         if logs.count("Log truncated") != 1:
             raise AnchorDecodeError("CPI completeness requires one truncation marker")
@@ -234,6 +240,19 @@ class AnchorIdlDecoder:
             bytes(item["discriminator"]): item["name"]
             for item in self.idl.get("instructions", [])
         }
+        for discriminator, instruction_name in (supplemental_instructions or {}).items():
+            if (
+                not isinstance(discriminator, bytes)
+                or len(discriminator) != 8
+                or discriminator == _EVENT_IX_TAG
+                or discriminator in names
+                or not isinstance(instruction_name, str)
+                or not instruction_name.strip()
+                or instruction_name in names.values()
+                or instruction_events.get(instruction_name) not in self._events.values()
+            ):
+                raise AnchorDecodeError("invalid supplemental instruction contract")
+            names[discriminator] = instruction_name
         expected: list[str] = []
         emitted: list[int] = []
         selected: list[bytes] = []
