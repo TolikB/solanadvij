@@ -825,3 +825,91 @@ def test_v2_migration_contract_rejects_incomplete_or_unreviewed_evidence(failure
         tx["meta"]["err"] = True
     with pytest.raises(AnchorDecodeError):
         PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
+
+
+
+def _pump_trade_close() -> dict[str, Any]:
+    """A foreign router calls Pump buy and then closes its volume account."""
+    from scripts.benchmark_postgres_capacity import BorshEventEncoder
+
+    tx = _pump_trade()
+    trade_log = PumpDecoder()._anchor._own_event_lines(tx["meta"]["logMessages"])[0][1]
+    encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
+    close = base64.b64decode(encoder.encode("CloseUserVolumeAccumulatorEvent", {"timestamp": tx["blockTime"]}))
+    assert len(close) == 80
+    anchor = PumpDecoder()._anchor
+    definition = next(item for item in anchor.idl["instructions"] if item["name"] == "close_user_volume_accumulator")
+    trade = {**tx["transaction"]["message"]["instructions"][0], "stackHeight": 2}
+    trade_cpi = {**tx["meta"]["innerInstructions"][0]["instructions"][0], "stackHeight": 3}
+    close_ix = {"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes(definition["discriminator"])), "stackHeight": 2}
+    tx["transaction"]["message"]["instructions"] = [{"programId": OTHER}] * 3
+    tx["meta"]["innerInstructions"] = [{"index": 2, "instructions": [
+        trade, trade_cpi, close_ix, {**_cpi(close, program_id=PUMP_PROGRAM_ID), "stackHeight": 3},
+    ]}]
+    tx["meta"]["logMessages"] = [
+        f"Program {OTHER} invoke [1]", f"Program {PUMP_PROGRAM_ID} invoke [2]",
+        "Program data: " + trade_log, f"Program {PUMP_PROGRAM_ID} success",
+        f"Program {PUMP_PROGRAM_ID} invoke [2]", "Program data: " + base64.b64encode(close).decode(),
+        f"Program {PUMP_PROGRAM_ID} success", f"Program {OTHER} success", "Log truncated",
+    ]
+    return tx
+
+
+@pytest.mark.parametrize("prefix_available", [True, False])
+def test_v2_nested_pump_close_keeps_trade_identity_and_emits_no_extra_state(prefix_available: bool) -> None:
+    tx = _v2(_pump_trade_close())
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    if not prefix_available:
+        tx["meta"]["logMessages"] = ["Log truncated"]
+    actual = PumpDecoder().decode(tx).events
+    assert len(actual) == len(expected) == 1
+    assert actual[0].event_id == expected[0].event_id
+    assert {k: v for k, v in actual[0].payload.items() if k != EVENT_IDENTITY_KEY} == {
+        k: v for k, v in expected[0].payload.items() if k != EVENT_IDENTITY_KEY
+    }
+    assert actual[0].instruction_index == (expected[0].instruction_index if prefix_available else 2)
+    assert actual[0].inner_instruction_index == (-1 if prefix_available else 1)
+    assert PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events == []
+
+
+def test_legacy_pump_close_keeps_visible_trade_identity_and_validates_ignored_clock() -> None:
+    tx = _pump_trade_close()
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    actual = PumpDecoder().decode(tx).events
+    assert [event.model_dump(mode="json", exclude={"observed_at"}) for event in actual] == [
+        event.model_dump(mode="json", exclude={"observed_at"}) for event in expected
+    ]
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    assert PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events == []
+    with pytest.raises(AnchorDecodeError, match="consumed events are missing"):
+        PumpDecoder().decode(tx)
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_close_cpi", "extra_close_cpi", "short_body", "wrong_clock",
+    "wrong_event", "wrong_parent", "unknown_late_operation",
+])
+def test_ignored_pump_close_requires_full_body_clock_parent_and_cardinality(failure: str) -> None:
+    from sniper_bot.protocols.anchor import _base58_decode
+
+    tx = _v2(_pump_trade_close())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if failure == "missing_close_cpi":
+        inner.pop()
+    elif failure == "extra_close_cpi":
+        inner.append(copy.deepcopy(inner[-1]))
+    elif failure == "short_body":
+        inner[-1]["data"] = _base58_encode(_base58_decode(inner[-1]["data"])[:-1])
+    elif failure == "wrong_clock":
+        payload = bytearray(_base58_decode(inner[-1]["data"]))
+        struct.pack_into("<q", payload, len(TAG) + 8 + 32, tx["blockTime"] + 120)
+        inner[-1]["data"] = _base58_encode(payload)
+    elif failure == "wrong_event":
+        inner[-1] = copy.deepcopy(inner[1])
+    elif failure == "wrong_parent":
+        inner[-1]["stackHeight"] = 4
+    elif failure == "unknown_late_operation":
+        inner.append({"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8), "stackHeight": 2})
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)

@@ -36,6 +36,7 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "create_v2": "CreateEvent",
     "extend_account": "ExtendAccountEvent",
     "migrate_v2": "CompletePumpAmmMigrationEvent",
+    "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "buy": "TradeEvent",
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",
