@@ -711,3 +711,117 @@ async def test_v2_stream_rpc_recovery_shares_decoder_identity(monkeypatch: pytes
                     "meta": {"err": None, "logMessages": ["Log truncated"]}}
     recovered = await gateway._recover_truncated_transaction(notification)
     assert [event.event_id for event in PumpSwapDecoder().decode(recovered).events] == [event.event_id for event in expected]
+
+
+
+def _pump_migration() -> dict[str, Any]:
+    """Emulate the observed migration with its nested PumpSwap create-pool CPI."""
+    from scripts.benchmark_postgres_capacity import BorshEventEncoder
+
+    swap = _truncated()
+    timestamp = swap["blockTime"]
+    encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
+    pool = PumpSwapDecoder().decode(swap).events[0]
+    payload = base64.b64decode(encoder.encode("CompletePumpAmmMigrationEvent", {
+        "timestamp": timestamp, "pool": pool.pool_address, "mint": pool.mint,
+        "mint_amount": 100, "sol_amount": 200, "pool_migration_fee": 3,
+    }))
+    assert len(payload) == 200
+    anchor = PumpDecoder()._anchor
+    definition = next(item for item in anchor.idl["instructions"] if item["name"] == "migrate_v2")
+    foreign = {"programId": OTHER}
+    nested = {**_instruction("create_pool"), "stackHeight": 2}
+    swap_cpi = {**swap["meta"]["innerInstructions"][0]["instructions"][0], "stackHeight": 3}
+    swap_log = PumpSwapDecoder()._anchor._own_event_lines(swap["meta"]["logMessages"])[0][1]
+    tx = {
+        "slot": 5, "blockTime": timestamp,
+        "transaction": {"signatures": ["pump-migration"], "message": {"instructions": [
+            foreign, copy.deepcopy(foreign),
+            {"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes(definition["discriminator"]))},
+        ]}},
+        "meta": {"err": None, "logMessages": [
+            f"Program {PUMP_PROGRAM_ID} invoke [1]", f"Program {PUMPSWAP_PROGRAM_ID} invoke [2]",
+            "Program data: " + swap_log, f"Program {PUMPSWAP_PROGRAM_ID} success",
+            "Program data: " + base64.b64encode(payload).decode(), f"Program {PUMP_PROGRAM_ID} success",
+            "Log truncated",
+        ], "innerInstructions": [{"index": 2, "instructions": [
+            nested, swap_cpi, _cpi(payload, program_id=PUMP_PROGRAM_ID),
+        ]}]},
+    }
+    return tx
+
+
+@pytest.mark.parametrize("prefix_available", [True, False])
+def test_v2_migration_and_nested_pool_keep_complete_log_ids_and_true_coordinates(prefix_available: bool) -> None:
+    tx = _v2(_pump_migration())
+    complete = _without_marker(tx)
+    if not prefix_available:
+        tx["meta"]["logMessages"] = ["Log truncated"]
+    for decoder, event_type, inner_index in [
+        (PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES), "migration", 2),
+        (PumpSwapDecoder(), "pool_created", 1),
+    ]:
+        expected = decoder.decode(complete).events
+        recovered = decoder.decode(tx, source=EventSource.RPC_RECOVERY).events
+        assert len(recovered) == len(expected) == 1
+        event = recovered[0]
+        assert event.event_type.value == event_type
+        assert event.event_id == expected[0].event_id
+        assert {k: v for k, v in event.payload.items() if k != EVENT_IDENTITY_KEY} == {
+            k: v for k, v in expected[0].payload.items() if k != EVENT_IDENTITY_KEY
+        }
+        assert event.payload[EVENT_IDENTITY_KEY] == {
+            "version": 2, "ordinal": 0, "origin": "log" if prefix_available else "cpi",
+        }
+        assert event.instruction_index == (expected[0].instruction_index if prefix_available else 2)
+        assert event.inner_instruction_index == (-1 if prefix_available else inner_index)
+    assert PumpDecoder().decode(tx).events[0].event_id == PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events[0].event_id
+
+
+def test_legacy_migration_preserves_existing_log_identity_and_rejects_missing_suffix() -> None:
+    tx = _pump_migration()
+    decoder = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES)
+    expected = decoder.decode(_without_marker(tx)).events
+    actual = decoder.decode(tx).events
+    assert [event.model_dump(mode="json", exclude={"observed_at"}) for event in actual] == [
+        event.model_dump(mode="json", exclude={"observed_at"}) for event in expected
+    ]
+    tx = _v2(tx)
+    tx["slot"] = EVENT_ID_V2_CUTOVER_SLOT
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    with pytest.raises(AnchorDecodeError, match="consumed events are missing"):
+        decoder.decode(tx)
+
+
+@pytest.mark.parametrize("failure", [
+    "missing_migration_cpi", "extra_migration_cpi", "short_body", "wrong_clock",
+    "wrong_event", "wrong_parent", "unknown_late_operation", "legacy_migrate", "failed_transaction",
+])
+def test_v2_migration_contract_rejects_incomplete_or_unreviewed_evidence(failure: str) -> None:
+    tx = _v2(_pump_migration())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if failure == "missing_migration_cpi":
+        inner.pop()
+    elif failure == "extra_migration_cpi":
+        inner.append(copy.deepcopy(inner[-1]))
+    elif failure == "short_body":
+        from sniper_bot.protocols.anchor import _base58_decode
+        inner[-1]["data"] = _base58_encode(_base58_decode(inner[-1]["data"])[:-1])
+    elif failure == "wrong_clock":
+        tx["blockTime"] += 120
+    elif failure == "wrong_event":
+        inner[-1] = copy.deepcopy(_pump_trade()["meta"]["innerInstructions"][0]["instructions"][0])
+    elif failure == "wrong_parent":
+        inner[-1]["stackHeight"] = 3
+    elif failure == "unknown_late_operation":
+        tx["transaction"]["message"]["instructions"].append({
+            "programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8),
+        })
+    elif failure == "legacy_migrate":
+        definition = next(item for item in PumpDecoder()._anchor.idl["instructions"] if item["name"] == "migrate")
+        tx["transaction"]["message"]["instructions"][2]["data"] = _base58_encode(bytes(definition["discriminator"]))
+    elif failure == "failed_transaction":
+        tx["meta"]["err"] = True
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)

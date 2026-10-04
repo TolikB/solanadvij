@@ -35,6 +35,7 @@ PUMP_STATE_EVENT_NAMES = PUMP_EVENT_NAMES - {"TradeEvent"}
 _TRUNCATION_INSTRUCTION_EVENTS = {
     "create_v2": "CreateEvent",
     "extend_account": "ExtendAccountEvent",
+    "migrate_v2": "CompletePumpAmmMigrationEvent",
     "buy": "TradeEvent",
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",
