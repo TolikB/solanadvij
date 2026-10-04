@@ -46,14 +46,18 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "buy_v2": "TradeEvent",
     "buy_exact_quote_in_v2": "TradeEvent",
     "buy_exact_quote_in_v3": "TradeEvent",
+    "buy_v3": "TradeEvent",
+    "sell_v3": "TradeEvent",
     "sell": "TradeEvent",
     "sell_v2": "TradeEvent",
 }
-# The observed v3 selector is published by the officially recommended
+# These trading selectors are published by the officially recommended
 # pump-rust-client 0.2.0. Its event schemas match the pinned IDL (see SOURCE.md).
-# Other v3 operations remain unreviewed and fail closed.
+# Each still requires the full CPI proof; other operations remain closed.
 _SUPPLEMENTAL_INSTRUCTIONS: Mapping[bytes, str] = MappingProxyType({
     bytes.fromhex("e1f7501ed5b38488"): "buy_exact_quote_in_v3",
+    bytes.fromhex("07051dc4f5176550"): "buy_v3",
+    bytes.fromhex("1c92de7726c469d5"): "sell_v3",
 })
 # Last field of each consumed event as deployed at pump-public-docs 9c82f61.
 # Pump extends events by appending fields, so older payloads end here and

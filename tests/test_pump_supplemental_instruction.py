@@ -22,6 +22,12 @@ TAG = bytes.fromhex("e445a52e51cb9a1d")
 SELECTOR = bytes.fromhex("e1f7501ed5b38488")
 SUPPLEMENT = {SELECTOR: "buy_exact_quote_in_v3"}
 CONTRACT = {"buy_exact_quote_in_v3": "TradeEvent"}
+V3_OPERATIONS = {
+    "buy_exact_quote_in_v3": SELECTOR,
+    "buy_v3": bytes.fromhex("07051dc4f5176550"),
+    "sell_v3": bytes.fromhex("1c92de7726c469d5"),
+}
+V3_LABELS = {"buy_exact_quote_in_v3": "buy_exact_quote_in", "buy_v3": "buy", "sell_v3": "sell"}
 
 
 def _v2(tx: dict[str, Any]) -> dict[str, Any]:
@@ -41,19 +47,21 @@ def _without_marker(tx: dict[str, Any]) -> dict[str, Any]:
 def _trade_payload(tx: dict[str, Any], **changes: Any) -> bytes:
     anchor = PumpDecoder()._anchor
     cpi = tx["meta"]["innerInstructions"][0]["instructions"][-1]
-    fields = anchor._decode_struct("TradeEvent", _base58_decode(cpi["data"])[16:])
+    fields, _ = anchor._decode_struct_from_minimum("TradeEvent", _base58_decode(cpi["data"])[16:], "real_quote_reserves")
     fields.update(changes)
     encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
     return base64.b64decode(encoder.encode("TradeEvent", fields))
 
 
-def _pump_v3() -> dict[str, Any]:
+def _pump_v3(name: str = "buy_exact_quote_in_v3", *, appended: bool = False) -> dict[str, Any]:
     stamp = 1_776_700_123
     encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
     payload = base64.b64decode(encoder.encode("TradeEvent", {
-        "timestamp": stamp, "is_buy": True, "real_token_reserves": 10,
-        "ix_name": "buy_exact_quote_in",
+        "timestamp": stamp, "is_buy": name != "sell_v3", "real_token_reserves": 10,
+        "ix_name": V3_LABELS[name],
     }))
+    if appended:
+        payload += bytes(8)
     tx = {
         "slot": 5, "blockTime": stamp,
         "transaction": {"signatures": ["pump-v3"], "message": {}},
@@ -66,7 +74,7 @@ def _pump_v3() -> dict[str, Any]:
     operation = {
         "programId": PUMP_PROGRAM_ID, "stackHeight": 2,
         "accounts": [OTHER] * 17,
-        "data": _base58_encode(SELECTOR + struct.pack("<QQB", 1, 1, 0)),
+        "data": _base58_encode(V3_OPERATIONS[name] + (struct.pack("<QQ", 1, 1) if name == "sell_v3" else struct.pack("<QQB", 1, 1, 0))),
     }
     cpi = {"programId": PUMP_PROGRAM_ID, "stackHeight": 3, "data": _base58_encode(TAG + payload)}
     # The authentic failure has outer 3 / operation inner 19 / Trade inner 23.
@@ -78,10 +86,13 @@ def _pump_v3() -> dict[str, Any]:
     return tx
 
 
+@pytest.mark.parametrize("name", V3_OPERATIONS)
+@pytest.mark.parametrize("appended", [False, True])
 @pytest.mark.parametrize("prefix_available", [True, False])
-def test_v3_nested_trade_keeps_v2_id_payload_clock_and_live_selection(prefix_available: bool) -> None:
-    tx = _v2(_pump_v3())
-    expected = PumpDecoder().decode(_without_marker(tx)).events[0]
+def test_v3_nested_trade_keeps_v2_id_payload_clock_and_live_selection(name: str, appended: bool, prefix_available: bool) -> None:
+    tx = _v2(_pump_v3(name, appended=appended))
+    complete = PumpDecoder().decode(_without_marker(tx))
+    expected = complete.events[0]
     if not prefix_available:
         tx["meta"]["logMessages"] = ["Log truncated"]
     unchanged = copy.deepcopy(tx)
@@ -90,7 +101,9 @@ def test_v3_nested_trade_keeps_v2_id_payload_clock_and_live_selection(prefix_ava
     assert {k: v for k, v in event.payload.items() if k != EVENT_IDENTITY_KEY} == {
         k: v for k, v in expected.payload.items() if k != EVENT_IDENTITY_KEY
     }
-    assert event.payload["ix_name"] == "buy_exact_quote_in"
+    assert event.payload["ix_name"] == V3_LABELS[name]
+    assert complete.appended_events == (("TradeEvent",) if appended else ())
+    assert PumpDecoder().decode(tx).appended_events == complete.appended_events
     assert event.payload[EVENT_IDENTITY_KEY] == {
         "version": 2, "ordinal": 0, "origin": "log" if prefix_available else "cpi",
     }
@@ -102,8 +115,9 @@ def test_v3_nested_trade_keeps_v2_id_payload_clock_and_live_selection(prefix_ava
     assert tx == unchanged
 
 
-def test_v3_legacy_prefix_keeps_original_id_and_missing_trade_cannot_get_v2_identity() -> None:
-    tx = _v2(_pump_v3())
+@pytest.mark.parametrize("name", V3_OPERATIONS)
+def test_v3_legacy_prefix_keeps_original_id_and_missing_trade_cannot_get_v2_identity(name: str) -> None:
+    tx = _v2(_pump_v3(name))
     tx["slot"] = EVENT_ID_V2_CUTOVER_SLOT
     expected = PumpDecoder().decode(_without_marker(tx)).events
     actual = PumpDecoder().decode(tx).events
@@ -116,12 +130,13 @@ def test_v3_legacy_prefix_keeps_original_id_and_missing_trade_cannot_get_v2_iden
     assert PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events == []
 
 
+@pytest.mark.parametrize("name", V3_OPERATIONS)
 @pytest.mark.parametrize("failure", [
     "missing", "extra", "short_body", "invalid_bool", "clock", "wrong_parent",
     "foreign_cpi", "completion", "unknown_late_operation", "altered_prefix",
 ])
-def test_v3_still_requires_complete_trade_body_clock_parent_and_exactly_one_cpi(failure: str) -> None:
-    tx = _v2(_pump_v3())
+def test_v3_still_requires_complete_trade_body_clock_parent_and_exactly_one_cpi(name: str, failure: str) -> None:
+    tx = _v2(_pump_v3(name))
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
     cpi = inner[-1]
     if failure == "missing":
@@ -141,7 +156,7 @@ def test_v3_still_requires_complete_trade_body_clock_parent_and_exactly_one_cpi(
     elif failure == "foreign_cpi":
         cpi["programId"] = OTHER
     elif failure == "completion":
-        cpi["data"] = _base58_encode(TAG + _trade_payload(tx, real_token_reserves=0))
+        cpi["data"] = _base58_encode(TAG + _trade_payload(tx, is_buy=True, real_token_reserves=0))
     elif failure == "unknown_late_operation":
         inner.append({"programId": PUMP_PROGRAM_ID, "stackHeight": 2, "data": _base58_encode(bytes([255]) * 8)})
     elif failure == "altered_prefix":
@@ -156,10 +171,10 @@ def test_v3_still_requires_complete_trade_body_clock_parent_and_exactly_one_cpi(
 
 
 @pytest.mark.parametrize("selector", [
-    bytes.fromhex("07051dc4f5176550"), bytes.fromhex("1c92de7726c469d5"),
+    bytes([255]) * 8,
     hashlib.sha256(b"global:buy_exact_quote_in").digest()[:8],
 ])
-def test_unreviewed_v3_operations_and_event_name_hash_remain_closed(selector: bytes) -> None:
+def test_unknown_selectors_and_event_name_hash_remain_closed(selector: bytes) -> None:
     tx = _v2(_pump_v3())
     own = tx["meta"]["innerInstructions"][0]["instructions"][19]
     own["data"] = _base58_encode(selector + _base58_decode(own["data"])[8:])
@@ -167,9 +182,10 @@ def test_unreviewed_v3_operations_and_event_name_hash_remain_closed(selector: by
         PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
 
 
+@pytest.mark.parametrize("name", V3_OPERATIONS)
 @pytest.mark.parametrize("supplement", [None, {}])
-def test_generic_scanner_default_does_not_admit_supplemental_pump_operation(supplement: Any) -> None:
-    tx = _pump_v3()
+def test_generic_scanner_default_does_not_admit_supplemental_pump_operation(name: str, supplement: Any) -> None:
+    tx = _pump_v3(name)
     with pytest.raises(AnchorDecodeError, match="unverified own operation"):
         PumpDecoder()._anchor.scan_verified_cpi_events(
             tx, tx["meta"]["logMessages"], event_names=PUMP_EVENT_NAMES,
@@ -235,6 +251,56 @@ def test_supplemental_contract_cannot_shadow_or_bypass_explicit_event_contract(f
 def test_pump_supplemental_contract_is_immutable() -> None:
     from sniper_bot.protocols.pump.decoder import _SUPPLEMENTAL_INSTRUCTIONS
 
-    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == SUPPLEMENT
+    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == {selector: name for name, selector in V3_OPERATIONS.items()}
     with pytest.raises(TypeError):
         _SUPPLEMENTAL_INSTRUCTIONS[SELECTOR] = "buy_v3"  # type: ignore[index]
+
+
+def test_sell_v3_zero_reserves_is_not_buy_completion() -> None:
+    tx = _v2(_pump_v3("sell_v3"))
+    cpi = tx["meta"]["innerInstructions"][0]["instructions"][-1]
+    cpi["data"] = _base58_encode(TAG + _trade_payload(tx, real_token_reserves=0))
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    actual = PumpDecoder().decode(tx).events
+    assert len(actual) == 1 and actual[0].event_type.value == "swap_sell"
+    assert actual[0].payload["real_token_reserves"] == 0
+
+
+@pytest.mark.parametrize("name", V3_OPERATIONS)
+def test_pumpswap_does_not_receive_any_pump_v3_supplement(name: str) -> None:
+    tx = _v2(_pump_v3(name))
+    tx["meta"]["innerInstructions"][0]["instructions"][19]["programId"] = PUMPSWAP_PROGRAM_ID
+    with pytest.raises(AnchorDecodeError, match="unverified own operation"):
+        PumpSwapDecoder().decode(tx)
+
+
+def test_composite_v3_buys_and_sell_preserve_per_type_ordinals_at_every_prefix() -> None:
+    parts = [_pump_v3(name) for name in V3_OPERATIONS]
+    tx = _v2(parts[0])
+    tx["transaction"]["message"]["instructions"] = [{"programId": OTHER} for _ in parts]
+    tx["meta"]["innerInstructions"] = [
+        {"index": index, "instructions": part["meta"]["innerInstructions"][0]["instructions"]}
+        for index, part in enumerate(parts)
+    ]
+    logs = [line for part in parts for line in part["meta"]["logMessages"][:-1]]
+    tx["meta"]["logMessages"] = logs + ["Log truncated"]
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    assert [event.event_type.value for event in expected] == ["swap_buy", "swap_buy", "swap_sell"]
+    assert [event.payload[EVENT_IDENTITY_KEY]["ordinal"] for event in expected] == [0, 1, 0]
+    for length in range(len(logs) + 1):
+        partial = copy.deepcopy(tx)
+        partial["meta"]["logMessages"] = logs[:length] + ["Log truncated"]
+        unchanged = copy.deepcopy(partial)
+        actual = PumpDecoder().decode(partial).events
+        assert [event.event_id for event in actual] == [event.event_id for event in expected]
+        for index, (event, complete) in enumerate(zip(actual, expected, strict=True)):
+            assert {k: v for k, v in event.payload.items() if k != EVENT_IDENTITY_KEY} == {
+                k: v for k, v in complete.payload.items() if k != EVENT_IDENTITY_KEY
+            }
+            if event.payload[EVENT_IDENTITY_KEY]["origin"] == "cpi":
+                assert event.instruction_index == index and event.inner_instruction_index == 23
+            else:
+                assert event.instruction_index == complete.instruction_index and event.inner_instruction_index == -1
+        assert PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(partial).events == []
+        assert PumpDecoder(event_names=frozenset()).decode(partial).events == []
+        assert partial == unchanged
