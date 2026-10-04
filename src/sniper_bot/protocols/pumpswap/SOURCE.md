@@ -45,3 +45,18 @@ same published ABI and synthetic contract tests; native observations of them
 are not claimed. The IDL declares the ABI, not unconditional event completeness.
 Existing body, Clock, direct-parent, exact-one and log-prefix checks remain the
 runtime gate; unknown and unreviewed control operations remain quarantined.
+
+## Reviewed ignored boost control
+
+The pinned IDL already declares `init_boost` (`8ce9215e845ac28f`, no arguments,
+14 accounts) and `InitBoostEvent` (`ae7c4af90451f611`). Its complete body is
+128 bytes: `timestamp:i64`, `mint`, `bonding_curve`, `pool` pubkeys,
+`virtual_quote_reserves:i128` and `real_quote_reserves_after:u64`. These exact
+definitions also match the published Rust SDK above. An authentic truncated
+CreatePool/InitBoost transaction contained one complete direct CPI per operation.
+
+Recognize the existing boost operation in the truncated completeness contract
+without adding it to the consumed event set. Require its full body, Clock,
+own parent and exactly one CPI; reject short or trailing bytes. Create identity,
+ordinal and selected log-prefix proof remain unchanged. Ignoring this event in
+decoder selection does not imply that the instruction has no on-chain effects.

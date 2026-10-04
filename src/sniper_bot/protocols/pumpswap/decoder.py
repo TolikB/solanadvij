@@ -64,6 +64,7 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "withdraw": "WithdrawEvent",
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "claim_cashback": "ClaimCashbackEvent",
+    "init_boost": "InitBoostEvent",
 }
 # Published trade selectors from the officially recommended pump-rust-client
 # 0.2.0; event schemas match the pinned IDL (see SOURCE.md). The full CPI proof
