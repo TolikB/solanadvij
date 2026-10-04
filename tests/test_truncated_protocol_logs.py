@@ -1011,3 +1011,171 @@ def test_standalone_ignored_cashback_resolves_cpi_clock_without_state_or_identit
     tx["meta"]["logMessages"] = ["Log truncated"]
     actual = PumpSwapDecoder().decode(tx)
     assert actual.events == [] and actual.block_time == expected
+
+
+
+def _pump_creator_fees() -> dict[str, Any]:
+    """Create, nested creator controls and a buy share one transaction."""
+    from scripts.benchmark_postgres_capacity import BorshEventEncoder
+
+    tx = _pump_trade(name="buy")
+    anchor = PumpDecoder()._anchor
+    encoder = BorshEventEncoder(Path(__file__).parents[1] / "src/sniper_bot/protocols/pump/idl.json")
+    stamp = tx["blockTime"]
+
+    def event(name: str, **fields: Any) -> bytes:
+        return base64.b64decode(encoder.encode(name, {"timestamp": stamp, **fields}))
+
+    def operation(name: str, height: int = 1) -> dict[str, Any]:
+        definition = next(item for item in anchor.idl["instructions"] if item["name"] == name)
+        return {"programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes(definition["discriminator"])),
+                "stackHeight": height}
+
+    create = event("CreateEvent")
+    extend = event("ExtendAccountEvent")
+    migrate = event("MigrateBondingCurveCreatorEvent")
+    distribute = event("DistributeCreatorFeesEvent", shareholders=[{"address": OTHER, "share_bps": 10_000}])
+    assert len(migrate) == 176 and len(distribute) == 222
+    buy = tx["transaction"]["message"]["instructions"][0]
+    trade_cpi = tx["meta"]["innerInstructions"][0]["instructions"][0]
+    trade_log = anchor._own_event_lines(tx["meta"]["logMessages"])[0][1]
+    tx["transaction"]["message"]["instructions"] = [
+        {"programId": OTHER}, {"programId": OTHER}, operation("create_v2"),
+        {"programId": OTHER}, {"programId": OTHER}, {"programId": OTHER}, buy,
+    ]
+    tx["meta"]["innerInstructions"] = [
+        {"index": 2, "instructions": [_cpi(create, program_id=PUMP_PROGRAM_ID)]},
+        {"index": 3, "instructions": [
+            operation("extend_account", 2), {**_cpi(extend, program_id=PUMP_PROGRAM_ID), "stackHeight": 3},
+            operation("migrate_bonding_curve_creator", 2), {**_cpi(migrate, program_id=PUMP_PROGRAM_ID), "stackHeight": 3},
+        ]},
+        {"index": 4, "instructions": [
+            operation("distribute_creator_fees", 2), {**_cpi(distribute, program_id=PUMP_PROGRAM_ID), "stackHeight": 3},
+        ]},
+        {"index": 6, "instructions": [trade_cpi]},
+    ]
+    logs: list[str] = []
+    for payload in (create, extend, migrate, distribute):
+        logs.extend([f"Program {PUMP_PROGRAM_ID} invoke [1]",
+                     "Program data: " + base64.b64encode(payload).decode(), f"Program {PUMP_PROGRAM_ID} success"])
+    logs.extend([f"Program {PUMP_PROGRAM_ID} invoke [1]", "Program data: " + trade_log,
+                 f"Program {PUMP_PROGRAM_ID} success", "Log truncated"])
+    tx["meta"]["logMessages"] = logs
+    return tx
+
+
+@pytest.mark.parametrize("prefix", ["complete", "controls", "empty"])
+def test_v2_creator_controls_preserve_create_trade_ids_and_live_selection(prefix: str) -> None:
+    tx = _v2(_pump_creator_fees())
+    decoder = PumpDecoder()
+    expected = decoder.decode(_without_marker(tx)).events
+    if prefix == "controls":
+        tx["meta"]["logMessages"] = tx["meta"]["logMessages"][:-4] + ["Log truncated"]
+    elif prefix == "empty":
+        tx["meta"]["logMessages"] = ["Log truncated"]
+    unchanged = copy.deepcopy(tx)
+    actual = decoder.decode(tx).events
+    live = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events
+    assert [event.event_type.value for event in actual] == ["token_created", "swap_buy"]
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+    assert [event.event_id for event in live] == [actual[0].event_id]
+    for event, complete in zip(actual, expected, strict=True):
+        assert {k: v for k, v in event.payload.items() if k != EVENT_IDENTITY_KEY} == {
+            k: v for k, v in complete.payload.items() if k != EVENT_IDENTITY_KEY
+        }
+        assert event.payload[EVENT_IDENTITY_KEY]["ordinal"] == 0
+    if prefix != "complete":
+        assert actual[1].instruction_index == 6 and actual[1].inner_instruction_index == 0
+    if prefix == "empty":
+        assert actual[0].instruction_index == 2 and actual[0].inner_instruction_index == 0
+    assert PumpDecoder(event_names=frozenset()).decode(tx).events == []
+    assert tx == unchanged
+
+
+def test_legacy_creator_controls_keep_visible_ids_and_require_consumed_trade_prefix() -> None:
+    tx = _pump_creator_fees()
+    decoder = PumpDecoder()
+    expected = decoder.decode(_without_marker(tx)).events
+    actual = decoder.decode(tx).events
+    assert [event.model_dump(mode="json", exclude={"observed_at"}) for event in actual] == [
+        event.model_dump(mode="json", exclude={"observed_at"}) for event in expected
+    ]
+    tx["meta"]["logMessages"] = tx["meta"]["logMessages"][:-4] + ["Log truncated"]
+    live = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx).events
+    assert [event.event_id for event in live] == [expected[0].event_id]
+    with pytest.raises(AnchorDecodeError, match="consumed events are missing"):
+        decoder.decode(tx)
+
+
+@pytest.mark.parametrize("operation", ["migrate", "distribute"])
+@pytest.mark.parametrize("failure", ["missing", "extra", "short", "trailing", "clock", "wrong_event", "wrong_parent"])
+def test_ignored_creator_control_requires_full_body_clock_own_parent_and_one_cpi(operation: str, failure: str) -> None:
+    from sniper_bot.protocols.anchor import _base58_decode
+
+    tx = _v2(_pump_creator_fees())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    group = tx["meta"]["innerInstructions"][1 if operation == "migrate" else 2]["instructions"]
+    index = 3 if operation == "migrate" else 1
+    if failure == "missing":
+        group.pop(index)
+    elif failure == "extra":
+        group.insert(index + 1, copy.deepcopy(group[index]))
+    elif failure in {"short", "trailing", "clock"}:
+        payload = bytearray(_base58_decode(group[index]["data"]))
+        if failure == "short":
+            payload.pop()
+        elif failure == "trailing":
+            payload.append(0)
+        else:
+            struct.pack_into("<q", payload, len(TAG) + 8, tx["blockTime"] + 120)
+        group[index]["data"] = _base58_encode(payload)
+    elif failure == "wrong_event":
+        group[index]["data"] = tx["meta"]["innerInstructions"][0]["instructions"][0]["data"]
+    elif failure == "wrong_parent":
+        group[index]["stackHeight"] = 4
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=frozenset()).decode(tx)
+
+
+@pytest.mark.parametrize("failure", ["truncated_count", "truncated_shareholder", "missing_shareholder", "zero_count", "unreasonable_count"])
+def test_ignored_fee_distribution_validates_shareholder_vector(failure: str) -> None:
+    from sniper_bot.protocols.anchor import _base58_decode
+
+    tx = _v2(_pump_creator_fees())
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    cpi = tx["meta"]["innerInstructions"][2]["instructions"][1]
+    payload = bytearray(_base58_decode(cpi["data"]))
+    count_offset = len(TAG) + 8 + 8 + 4 * 32
+    if failure == "truncated_count":
+        del payload[count_offset + 3:]
+    elif failure == "truncated_shareholder":
+        del payload[count_offset + 4 + 20:]
+    else:
+        count = 2 if failure == "missing_shareholder" else (0 if failure == "zero_count" else 0xFFFFFFFF)
+        struct.pack_into("<I", payload, count_offset, count)
+    cpi["data"] = _base58_encode(payload)
+    with pytest.raises(AnchorDecodeError):
+        PumpDecoder(event_names=frozenset()).decode(tx)
+
+
+@pytest.mark.parametrize("operation", ["migrate", "distribute"])
+def test_standalone_creator_control_dates_from_cpi_without_state_or_identity(operation: str) -> None:
+    tx = _v2(_pump_creator_fees())
+    expected = PumpDecoder().decode(tx).block_time
+    group = tx["meta"]["innerInstructions"][1 if operation == "migrate" else 2]
+    pair = group["instructions"][-2:]
+    tx["transaction"]["message"]["instructions"] = [{"programId": OTHER}]
+    tx["meta"]["innerInstructions"] = [{"index": 0, "instructions": pair}]
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    del tx["blockTime"]
+    actual = PumpDecoder().decode(tx)
+    assert actual.events == [] and actual.block_time == expected
+
+
+def test_creator_controls_do_not_allow_an_unreviewed_late_operation() -> None:
+    tx = _v2(_pump_creator_fees())
+    tx["transaction"]["message"]["instructions"].append({
+        "programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8),
+    })
+    with pytest.raises(AnchorDecodeError, match="unverified own operation"):
+        PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
