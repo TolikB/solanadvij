@@ -139,7 +139,7 @@ def test_standalone_control_dates_from_its_cpi_without_state_or_identity(
 
 @pytest.mark.parametrize(("protocol", "operation"), CASES)
 @pytest.mark.parametrize("failure", [
-    "missing", "extra", "short", "trailing", "clock", "wrong_parent", "foreign_cpi", "wrong_event",
+    "extra", "short", "trailing", "clock", "wrong_parent", "wrong_event",
     "unknown_late_operation", "clock_without_block_time", "failed_metadata",
 ])
 def test_ignored_control_requires_complete_body_clock_parent_and_exactly_one_cpi(
@@ -149,9 +149,7 @@ def test_ignored_control_requires_complete_body_clock_parent_and_exactly_one_cpi
     tx = _fixture(protocol, operation)
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
     cpi = inner[6]
-    if failure == "missing":
-        inner.pop()
-    elif failure == "extra":
+    if failure == "extra":
         inner.append(copy.deepcopy(cpi))
     elif failure in {"short", "trailing", "clock", "clock_without_block_time"}:
         raw = bytearray(_base58_decode(cpi["data"]))
@@ -167,8 +165,6 @@ def test_ignored_control_requires_complete_body_clock_parent_and_exactly_one_cpi
             tx["meta"]["logMessages"] = ["Log truncated"]
     elif failure == "wrong_parent":
         cpi["stackHeight"] = 2
-    elif failure == "foreign_cpi":
-        cpi["programId"] = OTHER
     elif failure == "wrong_event":
         cpi["data"] = inner[3]["data"]
     elif failure == "unknown_late_operation":
@@ -180,3 +176,19 @@ def test_ignored_control_requires_complete_body_clock_parent_and_exactly_one_cpi
         with pytest.raises(AnchorDecodeError):
             _decoder(protocol, selection).decode(tx)
     assert tx == unchanged
+
+
+@pytest.mark.parametrize(("protocol", "operation"), CASES)
+@pytest.mark.parametrize("change", ["missing", "foreign_cpi"])
+def test_control_without_its_event_keeps_the_creation(protocol: str, operation: str, change: str) -> None:
+    # Observed natively: sync_user_volume_accumulator often moves nothing and emits no event.
+    tx = _fixture(protocol, operation)
+    expected = _decoder(protocol).decode(_complete(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if change == "missing":
+        inner.pop()
+    else:
+        inner[6]["programId"] = OTHER
+    actual = _decoder(protocol).decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]

@@ -71,6 +71,18 @@ rung reaches the target, decision C keeps the specified strategy unchanged and a
 itself the result. Safety, execution, holder, developer, exit and sizing rules are never part
 of the ladder. A calibration window shorter than 20 hours does not decide.
 
+## Pre-calibration decode probe
+
+Every recent record calibration stopped within minutes on a protocol quarantine
+that real mainnet traffic would have shown in advance. After the release image
+is built and before the calibration starts, decode a sample of finalized blocks
+with the release's own decoders:
+
+    docker compose -p solanadvij --env-file .env run --rm --no-deps -T       -v "$PWD/artifacts:/app/probe" --entrypoint python sniper-bot       scripts/mainnet_decode_probe.py --blocks 1500 --hours 24 --output /app/probe/decode-probe.json
+
+It exits 1 and groups every transaction the stream would quarantine by cause
+and operation sequence. Start the calibration only on a clean probe.
+
 ## Calibration decisions
 
 The same soak fixes the other data-dependent settings, each by a rule written down before the

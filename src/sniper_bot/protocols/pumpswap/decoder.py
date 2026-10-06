@@ -52,7 +52,7 @@ PUMPSWAP_MINIMUM_FIELDS = {
 
 # Only these operation/event pairs have a completeness contract for truncated
 # logs. Every other own operation remains quarantined until explicitly reviewed.
-_TRUNCATION_INSTRUCTION_EVENTS = {
+_TRUNCATION_INSTRUCTION_EVENTS: dict[str, str | None] = {
     "create_pool": "CreatePoolEvent",
     "buy": "BuyEvent",
     "buy_exact_quote_in": "BuyEvent",
@@ -79,14 +79,41 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "update_admin": "UpdateAdminEvent",
     "update_creator_fee_config": "UpdateCreatorFeeConfigEvent",
     "update_fee_config": "UpdateFeeConfigEvent",
+    "sweep_creator_fee": "SweepPoolFeeEvent",
+    "sweep_protocol_fee": "SweepPoolFeeEvent",
+    # Moves creator fees to the Pump vault without an event of its own;
+    # documented to skip the transfer below the rent minimum.
+    "transfer_creator_fees_to_pump": None,
+    "transfer_creator_fees_to_pump_v2": None,
 }
-# Published trade selectors from the officially recommended pump-rust-client
-# 0.2.0; event schemas match the pinned IDL (see SOURCE.md). The full CPI proof
-# still applies to each operation; other operations remain closed.
+# Fee controls skip their event when there is nothing to move, so an ignored
+# control may prove zero or one CPI event; consumed operations still need one.
+_OPTIONAL_INSTRUCTIONS = frozenset(
+    name for name, event in _TRUNCATION_INSTRUCTION_EVENTS.items()
+    if event is not None and event not in PUMPSWAP_EVENT_NAMES
+)
+# Published selectors from the officially recommended pump-rust-client 0.2.0;
+# trade event schemas match the pinned IDL and the sweep event, absent from
+# it, is taken from the same crate (see SOURCE.md). The full CPI proof still
+# applies to each operation; other operations remain closed.
 _SUPPLEMENTAL_INSTRUCTIONS: Mapping[bytes, str] = MappingProxyType({
     bytes.fromhex("c2ab1c46684d5b2f"): "buy_exact_quote_in_v2",
     bytes.fromhex("b817ee6167c5d33d"): "buy_v2",
     bytes.fromhex("5df6823ce7e940b2"): "sell_v2",
+    bytes.fromhex("20f6bf3408c949ba"): "sweep_creator_fee",
+    bytes.fromhex("0830be07b644b7e5"): "sweep_protocol_fee",
+})
+_SUPPLEMENTAL_EVENTS: Mapping[bytes, tuple[str, Mapping[str, Any]]] = MappingProxyType({
+    bytes.fromhex("82a42461e48287a5"): ("SweepPoolFeeEvent", {"kind": "struct", "fields": [
+        {"name": "timestamp", "type": "i64"},
+        {"name": "pool", "type": "pubkey"},
+        {"name": "base_mint", "type": "pubkey"},
+        {"name": "quote_mint", "type": "pubkey"},
+        {"name": "recipient", "type": "pubkey"},
+        {"name": "payer", "type": "pubkey"},
+        {"name": "amount", "type": "u64"},
+        {"name": "bucket", "type": "u8"},
+    ]}),
 })
 
 
@@ -98,7 +125,7 @@ class PumpSwapDecoder:
         event_names: frozenset[str] = PUMPSWAP_EVENT_NAMES,
     ) -> None:
         path = Path(idl_path) if idl_path else Path(__file__).with_name("idl.json")
-        self._anchor = AnchorIdlDecoder(path)
+        self._anchor = AnchorIdlDecoder(path, supplemental_events=_SUPPLEMENTAL_EVENTS)
         if self._anchor.program_id != PUMPSWAP_PROGRAM_ID:
             raise ValueError("vendored PumpSwap IDL has unexpected program address")
         self._event_names = event_names
@@ -131,6 +158,7 @@ class PumpSwapDecoder:
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
                 minimum_fields=PUMPSWAP_MINIMUM_FIELDS, recover_missing=v2,
                 supplemental_instructions=_SUPPLEMENTAL_INSTRUCTIONS,
+                optional_instructions=_OPTIONAL_INSTRUCTIONS,
             )
         else:
             scan = self._anchor.scan_logs(

@@ -90,3 +90,18 @@ proof (`tests/test_reviewed_control_contracts.py`). Still closed on purpose:
 possible events), `transfer_creator_fees_to_pump` and its v2 (documented to skip the
 transfer, with no event of their own), `toggle_*`, `set_reserved_fee_recipients` and
 `update_buyback_config`.
+
+## Optional ignored-control events and supplemental sweeps
+
+As in the Pump adapter, every ignored control may prove zero or one CPI of its
+own event; `sync_user_volume_accumulator` and `extend_account` were observed
+without one. `transfer_creator_fees_to_pump` and its v2 have no event of their
+own (none in 4 native cases) and must prove none.
+
+`pump-rust-client` 0.2.0 publishes `sweep_creator_fee` (`20f6bf3408c949ba`) and
+`sweep_protocol_fee` (`0830be07b644b7e5`), 12 accounts each, with
+`SweepPoolFeeEvent` (`82a42461e48287a5`; 177-byte body: `timestamp:i64`, `pool`,
+`base_mint`, `quote_mint`, `recipient`, `payer` pubkeys, `amount:u64`,
+`bucket:u8`). Fourteen native CPIs matched that layout byte for byte. Anchor
+selectors hash only the instruction name, so both programs share the sweep
+selectors; each decoder binds them to its own program and event.

@@ -96,3 +96,27 @@ Still closed on purpose: `create` (a consumed event under a deprecated selector)
 `remove_quote_mint`, `toggle_*`, `set_reserved_fee_recipients`,
 `set_virtual_quote_reserves`, `set_mayhem_virtual_params`, `update_buyback_config`,
 `update_holder_reward_config`). Native observations are claimed only where stated.
+
+## Optional ignored-control events and supplemental sweeps
+
+A pre-calibration decode of 14,298 sampled successful mainnet Pump/PumpSwap
+transactions (3,744 truncated, from 4,000 finalized blocks over 24 hours) showed
+that fee controls skip their event when there is nothing to move: natively,
+`claim_cashback_v2` emitted no event in 7 of 7 cases, `claim_cashback`,
+`collect_creator_fee(_v2)` and `extend_account` in some. Twelve truncated
+transactions with an eventless `claim_cashback_v2` would each have quarantined
+the protocol under the exactly-one rule.
+
+Every ignored control (an operation whose event is not consumed) may therefore
+prove zero or one CPI of its own expected event; a second, foreign-typed, unknown
+or malformed CPI under it still fails closed, and consumed operations still need
+exactly one. Consumed events are never optional, which the scanner enforces.
+
+The same sample showed `sweep_creator_fee` (`20f6bf3408c949ba`, 13 accounts) with
+an event absent from the pinned IDL. `pump-rust-client` 0.2.0 (crate SHA-256
+above) publishes it with `sweep_protocol_fee` (`0830be07b644b7e5`) and
+`SweepBondingCurveFeeEvent` (`742b4dbd117a482b`; 145-byte body: `timestamp:i64`,
+`mint`, `bonding_curve`, `quote_mint`, `recipient` pubkeys, `amount:u64`,
+`bucket:u8`). Eleven native CPIs matched that layout byte for byte. The event is
+registered as a supplemental event that cannot shadow a pinned event, type or the
+CPI tag, and both sweeps are optional ignored controls.

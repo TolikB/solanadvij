@@ -153,7 +153,7 @@ def test_standalone_collection_dates_from_cpi_without_state_or_identity(
 
 @pytest.mark.parametrize("operation", sorted(COLLECT))
 @pytest.mark.parametrize("failure", [
-    "missing", "extra", "short", "trailing", "clock", "wrong_parent", "foreign_cpi", "wrong_event",
+    "extra", "short", "trailing", "clock", "wrong_parent", "wrong_event",
     "unknown_late_operation", "altered_trade_prefix", "clock_without_block_time", "failed_metadata",
 ])
 def test_ignored_collection_requires_complete_body_clock_parent_and_exactly_one_cpi(
@@ -162,9 +162,7 @@ def test_ignored_collection_requires_complete_body_clock_parent_and_exactly_one_
     tx = _fixture(operation)
     inner = tx["meta"]["innerInstructions"][1]["instructions"]
     cpi = inner[1]
-    if failure == "missing":
-        inner.pop()
-    elif failure == "extra":
+    if failure == "extra":
         inner.append(copy.deepcopy(cpi))
     elif failure in {"short", "trailing", "clock", "clock_without_block_time"}:
         raw = bytearray(_base58_decode(cpi["data"]))
@@ -180,8 +178,6 @@ def test_ignored_collection_requires_complete_body_clock_parent_and_exactly_one_
             tx["meta"]["logMessages"] = ["Log truncated"]
     elif failure == "wrong_parent":
         cpi["stackHeight"] = 3
-    elif failure == "foreign_cpi":
-        cpi["programId"] = OTHER
     elif failure == "wrong_event":
         cpi["data"] = tx["meta"]["innerInstructions"][0]["instructions"][-1]["data"]
     elif failure == "unknown_late_operation":
@@ -200,9 +196,27 @@ def test_ignored_collection_requires_complete_body_clock_parent_and_exactly_one_
     assert tx == unchanged
 
 
-def test_v1_selector_cannot_borrow_v2_event_twice() -> None:
+@pytest.mark.parametrize("operation", sorted(COLLECT))
+@pytest.mark.parametrize("change", ["missing", "foreign_cpi"])
+def test_collection_without_its_event_keeps_the_trade(operation: str, change: str) -> None:
+    # A collection with nothing to move emits no event (observed natively).
+    tx = _fixture(operation)
+    expected = PumpDecoder().decode(_complete(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][1]["instructions"]
+    if change == "missing":
+        inner.pop()
+    else:
+        inner[1]["programId"] = OTHER
+    actual = PumpDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+
+
+def test_one_collection_cannot_carry_the_event_of_another() -> None:
     tx = _fixture("collect_creator_fee")
+    inner = tx["meta"]["innerInstructions"][1]["instructions"]
+    inner.append(copy.deepcopy(inner[1]))
     v2 = _fixture("collect_creator_fee_v2")["transaction"]["message"]["instructions"][10]
     tx["transaction"]["message"]["instructions"].append(v2)
-    with pytest.raises(AnchorDecodeError, match="do not cover"):
+    with pytest.raises(AnchorDecodeError, match="does not cover its parent"):
         PumpDecoder().decode(tx)

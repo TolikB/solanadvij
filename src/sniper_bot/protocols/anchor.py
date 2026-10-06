@@ -72,7 +72,12 @@ class _Cursor:
 
 
 class AnchorIdlDecoder:
-    def __init__(self, idl_path: str | Path) -> None:
+    def __init__(
+        self,
+        idl_path: str | Path,
+        *,
+        supplemental_events: Mapping[bytes, tuple[str, Mapping[str, Any]]] | None = None,
+    ) -> None:
         self.idl_path = Path(idl_path)
         with self.idl_path.open("r", encoding="utf-8") as stream:
             self.idl = json.load(stream)
@@ -81,6 +86,21 @@ class AnchorIdlDecoder:
         self._events: dict[bytes, str] = {
             bytes(item["discriminator"]): item["name"] for item in self.idl.get("events", [])
         }
+        # Events published outside the pinned IDL (see each adapter's SOURCE.md)
+        # extend it without shadowing a vendored event, type or the CPI tag.
+        for discriminator, (event_name, definition) in (supplemental_events or {}).items():
+            if (
+                not isinstance(discriminator, bytes)
+                or len(discriminator) != 8
+                or discriminator == _EVENT_IX_TAG
+                or discriminator in self._events
+                or event_name in self._types
+                or event_name in self._events.values()
+                or definition.get("kind") != "struct"
+            ):
+                raise AnchorDecodeError("invalid supplemental event contract")
+            self._events[discriminator] = event_name
+            self._types[event_name] = dict(definition)
         self._timestamp_offsets: dict[str, int] = {}
         for event_name in self._events.values():
             offset = self._fixed_field_offset(event_name, "timestamp")
@@ -185,23 +205,33 @@ class AnchorIdlDecoder:
         logs: list[str],
         *,
         event_names: frozenset[str],
-        instruction_events: Mapping[str, str],
+        instruction_events: Mapping[str, str | None],
         supplemental_instructions: Mapping[bytes, str] | None = None,
         minimum_fields: Mapping[str, str] | None = None,
         event_validator: Callable[[str, dict[str, Any]], None] | None = None,
         recover_missing: bool = False,
+        optional_instructions: frozenset[str] = frozenset(),
     ) -> AnchorLogScan:
         """Prove ordered event completeness from successful jsonParsed metadata.
 
         Each reviewed own operation must contain exactly its expected event CPI.
-        Every body is validated, including ignored events. Available selected
-        logs must match the ordered CPI prefix byte-for-byte with multiplicity.
-        Only a caller using v2 identity may recover a missing suffix; recovered
-        events carry genuine CPI coordinates instead of a guessed log index.
+        An operation in ``optional_instructions`` may instead emit none (fee
+        controls skip their event when there is nothing to move), and one mapped
+        to ``None`` has no event of its own and must emit none; neither may be
+        an operation whose event is selected. Every body is validated, including
+        ignored events. Available selected logs must match the ordered CPI
+        prefix byte-for-byte with multiplicity. Only a caller using v2 identity
+        may recover a missing suffix; recovered events carry genuine CPI
+        coordinates instead of a guessed log index.
 
         Supplemental ABI selectors require an explicit known event contract and
         cannot shadow the vendored instructions or the reserved event CPI tag.
         """
+        if any(
+            name not in instruction_events or instruction_events[name] in event_names
+            for name in optional_instructions
+        ):
+            raise AnchorDecodeError("invalid optional instruction contract")
         if logs.count("Log truncated") != 1:
             raise AnchorDecodeError("CPI completeness requires one truncation marker")
         prefix = logs[:logs.index("Log truncated")]
@@ -253,8 +283,9 @@ class AnchorIdlDecoder:
             ):
                 raise AnchorDecodeError("invalid supplemental instruction contract")
             names[discriminator] = instruction_name
-        expected: list[str] = []
+        expected: list[str | None] = []
         emitted: list[int] = []
+        may_skip: list[bool] = []
         selected: list[bytes] = []
         decoded: list[AnchorEvent] = []
         timestamps: list[int] = []
@@ -285,7 +316,7 @@ class AnchorIdlDecoder:
                             raise AnchorDecodeError("truncated Anchor CPI event payload")
                         parent = stack[-1][2]
                         event_name = self._events.get(payload[8:16])
-                        if event_name != expected[parent] or emitted[parent]:
+                        if event_name is None or event_name != expected[parent] or emitted[parent]:
                             raise AnchorDecodeError("CPI event does not cover its parent operation")
                         emitted[parent] += 1
                         minimum = (minimum_fields or {}).get(event_name)
@@ -313,8 +344,12 @@ class AnchorIdlDecoder:
                         operation = len(expected)
                         expected.append(instruction_events[name])
                         emitted.append(0)
+                        may_skip.append(name in optional_instructions or instruction_events[name] is None)
                 stack.append((height, program_id, operation))
-        if not expected or any(count != 1 for count in emitted):
+        if not expected or any(
+            count != 1 and not (count == 0 and skippable)
+            for count, skippable in zip(emitted, may_skip, strict=True)
+        ):
             raise AnchorDecodeError("CPI events do not cover truncated transaction operations")
         logged: list[bytes] = []
         for _, encoded in self._own_event_lines(prefix):

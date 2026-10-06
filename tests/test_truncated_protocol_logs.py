@@ -885,8 +885,17 @@ def test_legacy_pump_close_keeps_visible_trade_identity_and_validates_ignored_cl
         PumpDecoder().decode(tx)
 
 
+def test_ignored_pump_close_without_its_event_keeps_the_trade() -> None:
+    tx = _v2(_pump_trade_close())
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    tx["meta"]["innerInstructions"][0]["instructions"].pop()
+    actual = PumpDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+
+
 @pytest.mark.parametrize("failure", [
-    "missing_close_cpi", "extra_close_cpi", "short_body", "wrong_clock",
+    "extra_close_cpi", "short_body", "wrong_clock",
     "wrong_event", "wrong_parent", "unknown_late_operation",
 ])
 def test_ignored_pump_close_requires_full_body_clock_parent_and_cardinality(failure: str) -> None:
@@ -895,9 +904,7 @@ def test_ignored_pump_close_requires_full_body_clock_parent_and_cardinality(fail
     tx = _v2(_pump_trade_close())
     tx["meta"]["logMessages"] = ["Log truncated"]
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
-    if failure == "missing_close_cpi":
-        inner.pop()
-    elif failure == "extra_close_cpi":
+    if failure == "extra_close_cpi":
         inner.append(copy.deepcopy(inner[-1]))
     elif failure == "short_body":
         inner[-1]["data"] = _base58_encode(_base58_decode(inner[-1]["data"])[:-1])
@@ -973,8 +980,17 @@ def test_legacy_cashback_preserves_visible_sell_identity_but_rejects_missing_sel
         PumpSwapDecoder().decode(tx)
 
 
+def test_ignored_cashback_without_its_event_keeps_the_sell() -> None:
+    tx = _v2(_swap_sell_cashback())
+    expected = PumpSwapDecoder().decode(_without_marker(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    tx["meta"]["innerInstructions"][0]["instructions"].pop()
+    actual = PumpSwapDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+
+
 @pytest.mark.parametrize("failure", [
-    "missing_cashback_cpi", "extra_cashback_cpi", "short_body", "wrong_clock",
+    "extra_cashback_cpi", "short_body", "wrong_clock",
     "wrong_event", "wrong_parent", "unknown_late_operation",
 ])
 def test_ignored_cashback_requires_full_body_clock_parent_and_cardinality(failure: str) -> None:
@@ -983,9 +999,7 @@ def test_ignored_cashback_requires_full_body_clock_parent_and_cardinality(failur
     tx = _v2(_swap_sell_cashback())
     tx["meta"]["logMessages"] = ["Log truncated"]
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
-    if failure == "missing_cashback_cpi":
-        inner.pop()
-    elif failure == "extra_cashback_cpi":
+    if failure == "extra_cashback_cpi":
         inner.append(copy.deepcopy(inner[-1]))
     elif failure == "short_body":
         inner[-1]["data"] = _base58_encode(_base58_decode(inner[-1]["data"])[:-1])
@@ -1108,7 +1122,18 @@ def test_legacy_creator_controls_keep_visible_ids_and_require_consumed_trade_pre
 
 
 @pytest.mark.parametrize("operation", ["migrate", "distribute"])
-@pytest.mark.parametrize("failure", ["missing", "extra", "short", "trailing", "clock", "wrong_event", "wrong_parent"])
+def test_ignored_creator_control_without_its_event_keeps_create_and_trade(operation: str) -> None:
+    tx = _v2(_pump_creator_fees())
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    group = tx["meta"]["innerInstructions"][1 if operation == "migrate" else 2]["instructions"]
+    group.pop(3 if operation == "migrate" else 1)
+    actual = PumpDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+
+
+@pytest.mark.parametrize("operation", ["migrate", "distribute"])
+@pytest.mark.parametrize("failure", ["extra", "short", "trailing", "clock", "wrong_event", "wrong_parent"])
 def test_ignored_creator_control_requires_full_body_clock_own_parent_and_one_cpi(operation: str, failure: str) -> None:
     from sniper_bot.protocols.anchor import _base58_decode
 
@@ -1116,9 +1141,7 @@ def test_ignored_creator_control_requires_full_body_clock_own_parent_and_one_cpi
     tx["meta"]["logMessages"] = ["Log truncated"]
     group = tx["meta"]["innerInstructions"][1 if operation == "migrate" else 2]["instructions"]
     index = 3 if operation == "migrate" else 1
-    if failure == "missing":
-        group.pop(index)
-    elif failure == "extra":
+    if failure == "extra":
         group.insert(index + 1, copy.deepcopy(group[index]))
     elif failure in {"short", "trailing", "clock"}:
         payload = bytearray(_base58_decode(group[index]["data"]))

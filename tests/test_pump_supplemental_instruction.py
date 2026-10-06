@@ -251,7 +251,11 @@ def test_supplemental_contract_cannot_shadow_or_bypass_explicit_event_contract(f
 def test_pump_supplemental_contract_is_immutable() -> None:
     from sniper_bot.protocols.pump.decoder import _SUPPLEMENTAL_INSTRUCTIONS
 
-    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == {selector: name for name, selector in V3_OPERATIONS.items()}
+    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == {
+        **{selector: name for name, selector in V3_OPERATIONS.items()},
+        bytes.fromhex("20f6bf3408c949ba"): "sweep_creator_fee",
+        bytes.fromhex("0830be07b644b7e5"): "sweep_protocol_fee",
+    }
     with pytest.raises(TypeError):
         _SUPPLEMENTAL_INSTRUCTIONS[SELECTOR] = "buy_v3"  # type: ignore[index]
 

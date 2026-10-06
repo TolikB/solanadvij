@@ -167,12 +167,23 @@ def test_same_global_selector_does_not_bypass_pump_trade_event_contract(name: st
         PumpDecoder().decode(tx)
 
 
-@pytest.mark.parametrize("selector", [bytes([255]) * 8, bytes.fromhex("20f6bf3408c949ba"), bytes.fromhex("0830be07b644b7e5")])
-def test_unknown_and_unreviewed_control_operations_remain_closed(selector: bytes) -> None:
+SWEEPS = {bytes.fromhex("20f6bf3408c949ba"): "sweep_creator_fee", bytes.fromhex("0830be07b644b7e5"): "sweep_protocol_fee"}
+
+
+def test_unknown_control_operations_remain_closed() -> None:
+    tx = _fixture("buy_v2")
+    own = tx["meta"]["innerInstructions"][0]["instructions"][21]
+    own["data"] = _base58_encode(bytes([255]) * 8 + _base58_decode(own["data"])[8:])
+    with pytest.raises(AnchorDecodeError, match="unverified own operation"):
+        PumpSwapDecoder().decode(tx)
+
+
+@pytest.mark.parametrize("selector", sorted(SWEEPS))
+def test_reviewed_sweep_control_cannot_claim_a_trade_event(selector: bytes) -> None:
     tx = _fixture("buy_v2")
     own = tx["meta"]["innerInstructions"][0]["instructions"][21]
     own["data"] = _base58_encode(selector + _base58_decode(own["data"])[8:])
-    with pytest.raises(AnchorDecodeError, match="unverified own operation"):
+    with pytest.raises(AnchorDecodeError, match="does not cover its parent"):
         PumpSwapDecoder().decode(tx)
 
 
@@ -180,8 +191,13 @@ def test_supplemental_map_is_immutable_and_separate_from_pump() -> None:
     from sniper_bot.protocols.pump.decoder import _SUPPLEMENTAL_INSTRUCTIONS as pump_map
     from sniper_bot.protocols.pumpswap.decoder import _SUPPLEMENTAL_INSTRUCTIONS
 
-    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == {selector: name for name, selector in OPERATIONS.items()}
-    assert not set(_SUPPLEMENTAL_INSTRUCTIONS) & set(pump_map)
+    assert dict(_SUPPLEMENTAL_INSTRUCTIONS) == {
+        **{selector: name for name, selector in OPERATIONS.items()}, **SWEEPS,
+    }
+    # Anchor selectors hash only the name, so both programs share the sweeps;
+    # each decoder still binds them to its own program and event.
+    assert set(_SUPPLEMENTAL_INSTRUCTIONS) & set(pump_map) == set(SWEEPS)
+    assert all(pump_map[selector] == name for selector, name in SWEEPS.items())
     with pytest.raises(TypeError):
         _SUPPLEMENTAL_INSTRUCTIONS[OPERATIONS["buy_v2"]] = "sell_v2"  # type: ignore[index]
 

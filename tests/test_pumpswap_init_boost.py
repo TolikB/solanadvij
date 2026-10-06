@@ -148,17 +148,15 @@ def test_standalone_boost_validates_signed_body_and_clock_without_selected_event
 
 
 @pytest.mark.parametrize("failure", [
-    "missing", "extra", "short", "partial_i128", "trailing", "clock", "wrong_parent",
-    "foreign_cpi", "wrong_event", "unknown_late_operation", "altered_create_prefix",
+    "extra", "short", "partial_i128", "trailing", "clock", "wrong_parent",
+    "wrong_event", "unknown_late_operation", "altered_create_prefix",
     "clock_without_block_time", "failed_metadata",
 ])
 def test_ignored_boost_requires_complete_body_clock_parent_and_exactly_one_cpi(failure: str) -> None:
     tx = _fixture()
     inner = tx["meta"]["innerInstructions"][0]["instructions"]
     cpi = inner[43]
-    if failure == "missing":
-        inner.pop()
-    elif failure == "extra":
+    if failure == "extra":
         inner.append(copy.deepcopy(cpi))
     elif failure in {"short", "partial_i128", "trailing", "clock", "clock_without_block_time"}:
         raw = bytearray(_base58_decode(cpi["data"]))
@@ -176,8 +174,6 @@ def test_ignored_boost_requires_complete_body_clock_parent_and_exactly_one_cpi(f
             tx["meta"]["logMessages"] = ["Log truncated"]
     elif failure == "wrong_parent":
         cpi["stackHeight"] = 2
-    elif failure == "foreign_cpi":
-        cpi["programId"] = OTHER
     elif failure == "wrong_event":
         cpi["data"] = inner[34]["data"]
     elif failure == "unknown_late_operation":
@@ -193,3 +189,17 @@ def test_ignored_boost_requires_complete_body_clock_parent_and_exactly_one_cpi(f
         with pytest.raises(AnchorDecodeError):
             PumpSwapDecoder(event_names=selection).decode(tx)
     assert tx == unchanged
+
+
+@pytest.mark.parametrize("change", ["missing", "foreign_cpi"])
+def test_boost_without_its_event_keeps_the_create(change: str) -> None:
+    tx = _fixture()
+    expected = PumpSwapDecoder().decode(_complete(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    inner = tx["meta"]["innerInstructions"][0]["instructions"]
+    if change == "missing":
+        inner.pop()
+    else:
+        inner[43]["programId"] = OTHER
+    actual = PumpSwapDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]

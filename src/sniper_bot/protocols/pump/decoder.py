@@ -61,6 +61,8 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "set_params": "SetParamsEvent",
     "set_quote_control_admin": "SetQuoteControlAdminEvent",
     "update_global_authority": "UpdateGlobalAuthorityEvent",
+    "sweep_creator_fee": "SweepBondingCurveFeeEvent",
+    "sweep_protocol_fee": "SweepBondingCurveFeeEvent",
     "buy": "TradeEvent",
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",
@@ -71,13 +73,32 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "sell": "TradeEvent",
     "sell_v2": "TradeEvent",
 }
-# These trading selectors are published by the officially recommended
-# pump-rust-client 0.2.0. Its event schemas match the pinned IDL (see SOURCE.md).
-# Each still requires the full CPI proof; other operations remain closed.
+# Fee controls skip their event when there is nothing to move, so an ignored
+# control may prove zero or one CPI event; consumed operations still need one.
+_OPTIONAL_INSTRUCTIONS = frozenset(
+    name for name, event in _TRUNCATION_INSTRUCTION_EVENTS.items() if event not in PUMP_EVENT_NAMES
+)
+# These selectors are published by the officially recommended pump-rust-client
+# 0.2.0. Its trade event schemas match the pinned IDL; the sweep event is
+# absent from it and taken from the same crate (see SOURCE.md). Each still
+# requires the full CPI proof; other operations remain closed.
 _SUPPLEMENTAL_INSTRUCTIONS: Mapping[bytes, str] = MappingProxyType({
     bytes.fromhex("e1f7501ed5b38488"): "buy_exact_quote_in_v3",
     bytes.fromhex("07051dc4f5176550"): "buy_v3",
     bytes.fromhex("1c92de7726c469d5"): "sell_v3",
+    bytes.fromhex("20f6bf3408c949ba"): "sweep_creator_fee",
+    bytes.fromhex("0830be07b644b7e5"): "sweep_protocol_fee",
+})
+_SUPPLEMENTAL_EVENTS: Mapping[bytes, tuple[str, Mapping[str, Any]]] = MappingProxyType({
+    bytes.fromhex("742b4dbd117a482b"): ("SweepBondingCurveFeeEvent", {"kind": "struct", "fields": [
+        {"name": "timestamp", "type": "i64"},
+        {"name": "mint", "type": "pubkey"},
+        {"name": "bonding_curve", "type": "pubkey"},
+        {"name": "quote_mint", "type": "pubkey"},
+        {"name": "recipient", "type": "pubkey"},
+        {"name": "amount", "type": "u64"},
+        {"name": "bucket", "type": "u8"},
+    ]}),
 })
 # Last field of each consumed event as deployed at pump-public-docs 9c82f61.
 # Pump extends events by appending fields, so older payloads end here and
@@ -154,7 +175,7 @@ class PumpDecoder:
         event_names: frozenset[str] = PUMP_EVENT_NAMES,
     ) -> None:
         path = Path(idl_path) if idl_path else Path(__file__).with_name("idl.json")
-        self._anchor = AnchorIdlDecoder(path)
+        self._anchor = AnchorIdlDecoder(path, supplemental_events=_SUPPLEMENTAL_EVENTS)
         if self._anchor.program_id != PUMP_PROGRAM_ID:
             raise ValueError("vendored Pump IDL has unexpected program address")
         self._event_names = event_names
@@ -192,6 +213,7 @@ class PumpDecoder:
                 supplemental_instructions=_SUPPLEMENTAL_INSTRUCTIONS,
                 minimum_fields=PUMP_MINIMUM_FIELDS, recover_missing=v2,
                 event_validator=validate_event,
+                optional_instructions=_OPTIONAL_INSTRUCTIONS,
             )
         else:
             scan = self._anchor.scan_logs(
