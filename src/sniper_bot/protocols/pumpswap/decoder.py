@@ -67,6 +67,18 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "claim_cashback": "ClaimCashbackEvent",
     "init_boost": "InitBoostEvent",
+    "claim_token_incentives": "ClaimTokenIncentivesEvent",
+    "collect_coin_creator_fee": "CollectCoinCreatorFeeEvent",
+    "extend_account": "ExtendAccountEvent",
+    "migrate_pool_coin_creator": "MigratePoolCoinCreatorEvent",
+    "admin_cto_pool": "AdminCtoPoolEvent",
+    "admin_update_token_incentives": "AdminUpdateTokenIncentivesEvent",
+    "create_config": "CreateConfigEvent",
+    "disable": "DisableEvent",
+    "set_boost_authority": "SetBoostAuthorityEvent",
+    "update_admin": "UpdateAdminEvent",
+    "update_creator_fee_config": "UpdateCreatorFeeConfigEvent",
+    "update_fee_config": "UpdateFeeConfigEvent",
 }
 # Published trade selectors from the officially recommended pump-rust-client
 # 0.2.0; event schemas match the pinned IDL (see SOURCE.md). The full CPI proof

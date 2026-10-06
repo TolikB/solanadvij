@@ -76,3 +76,23 @@ The pinned IDL declares `init_user_volume_accumulator` (`5e06ca73ff60e8b7`) with
 SOURCE.md). Both are recognized beside the reviewed `close_user_volume_accumulator`
 under the same full-body, Clock, own-parent and exactly-one CPI contract, outside the
 consumed event set. Native Pump observations are not claimed.
+
+## Completed reviewed control contract
+
+Calibration windows kept stopping on one newly observed pinned-IDL control at a time;
+the latest was a native `distribute_fee_to_holders` (slot 453881955) with one complete
+direct `DistributeFeeToHoldersEvent` CPI. Every remaining pinned instruction that takes
+the `event_authority` account (so emits through `emit_cpi!`) and has an event of its
+own name is now mapped to that event, and the `_v2` variants without an event of their
+own map to their v1 event (`claim_cashback_v2`, `distribute_creator_fees_v2`), as
+`collect_creator_fee_v2` was observed to do. None of these events is consumed.
+
+A mapping only names the single event each operation must prove; it never relaxes the
+proof. Full body, Clock, own parent and exactly one CPI still apply, so an operation that
+emits a different, a second or no event still fails closed.
+`tests/test_reviewed_control_contracts.py` runs that contract for every ignored entry.
+Still closed on purpose: `create` (a consumed event under a deprecated selector),
+`migrate`, and controls without an unambiguous event (`add_quote_mint`,
+`remove_quote_mint`, `toggle_*`, `set_reserved_fee_recipients`,
+`set_virtual_quote_reserves`, `set_mayhem_virtual_params`, `update_buyback_config`,
+`update_holder_reward_config`). Native observations are claimed only where stated.

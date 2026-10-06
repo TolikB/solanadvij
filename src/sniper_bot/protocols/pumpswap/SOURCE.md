@@ -79,3 +79,14 @@ Require the full body, Clock, own parent and exactly one CPI; reject short or tr
 bytes. `sync_user_volume_accumulator` is supported from the same pinned ABI and
 synthetic contract tests; a native observation is not claimed. The Pump adapter
 recognizes the identical pinned definitions.
+
+## Completed reviewed control contract
+
+The same completion as the Pump adapter: every remaining pinned instruction with the
+`event_authority` account and an event of its own name is mapped to it, outside the
+consumed set and under the unchanged full-body, Clock, own-parent and exactly-one CPI
+proof (`tests/test_reviewed_control_contracts.py`). Still closed on purpose:
+`boost_buy_and_burn` (a trade that may carry pool events), `set_coin_creator` (two
+possible events), `transfer_creator_fees_to_pump` and its v2 (documented to skip the
+transfer, with no event of their own), `toggle_*`, `set_reserved_fee_recipients` and
+`update_buyback_config`.
