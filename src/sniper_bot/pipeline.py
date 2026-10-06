@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from .candidates import Candidate, CandidateState, CandidateStateMachine
@@ -41,6 +42,7 @@ from .registry import (
     PoolStateTracker,
     TokenRegistry,
 )
+from .rejected_paths import REJECTED_PATH_LOG, RejectedPathRecorder
 from .scoring import DeveloperHistory, ScoreBreakdown, ScoreContext, ScoringEngine
 from .security import RejectReason, SecurityContext, SecurityEngine, SecurityResult
 from .stream import EntryGate
@@ -148,6 +150,7 @@ class ConfirmationPipeline:
         fatal_handler: FatalHandler | None = None,
         record_raw: bool = True,
         config: AppConfig | None = None,
+        record_rejected_paths: bool | None = None,
     ) -> None:
         self.strategy_version = strategy_version
         self.config_hash = config_hash
@@ -254,6 +257,12 @@ class ConfirmationPipeline:
         self.event_observer = event_observer
         self.fatal_handler = fatal_handler
         self.record_raw = record_raw
+        # Offline evidence of what rejected pools did next; never in replay.
+        self.rejected_paths = (
+            RejectedPathRecorder(Path(data_dir) / REJECTED_PATH_LOG)
+            if (record_raw if record_rejected_paths is None else record_rejected_paths)
+            else None
+        )
         self._pump = PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES)
         self._pumpswap = PumpSwapDecoder()
         self._maximum_pool_age = timedelta(
@@ -859,6 +868,8 @@ class ConfirmationPipeline:
             else:
                 return True
         self.metrics.chain_events_filtered_before_ingest.labels(reason=reason).inc()
+        if self.rejected_paths is not None:
+            self.rejected_paths.observe(event)
         return False
 
     def _track_new_pool(self, event: EventEnvelope) -> None:
@@ -1292,6 +1303,10 @@ class ConfirmationPipeline:
                 self.metrics.candidate_rejections.labels(
                     reason=creation_reject_reason.value
                 ).inc()
+                if persist and self.rejected_paths is not None:
+                    self.rejected_paths.start(
+                        stored, pool_record, pool_state, effective_event.block_time
+                    )
             if persist and self.database is not None:
                 await self.database.upsert_candidate(stored, self.strategy_version)
         if pool_state is not None:
@@ -1312,6 +1327,8 @@ class ConfirmationPipeline:
     async def evaluate_candidates(self, at: datetime | None = None) -> list[Candidate]:
         at = at or datetime.now(tz=timezone.utc)
         self._forget_settled_candidates(at)
+        if self.rejected_paths is not None:
+            self.rejected_paths.finalize_due(at)
         prefetched = await self._prefetch_security(at)
         changed: list[Candidate] = []
         for candidate_id, candidate in list(self.candidates.items()):
@@ -1449,6 +1466,13 @@ class ConfirmationPipeline:
             if candidate.state == CandidateState.REJECTED:
                 reason = candidate.reject_reason or RejectReason.API_UNAVAILABLE
                 self.metrics.candidate_rejections.labels(reason=reason.value).inc()
+                if self.rejected_paths is not None:
+                    self.rejected_paths.start(
+                        candidate,
+                        self.pools.pool(candidate.pool_address),
+                        self.pools.state(candidate.pool_address),
+                        candidate.rejected_at or candidate.updated_at,
+                    )
             if candidate.state == CandidateState.ENTRY_PENDING:
                 self.metrics.signals.inc()
         return candidate

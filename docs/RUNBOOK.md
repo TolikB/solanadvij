@@ -91,6 +91,14 @@ trade for 0/50/100/200 bps adverse fill, fills at the decision-time pool price (
 5x and 10x the size, and extra per-transaction fees. It shows how much of the result depends on
 the frozen fill model; it is reported next to the statistical gate, never used to change it.
 
+Ingest stops recording a pool once its candidate is rejected, so the database cannot show what a
+rejected pool did next. Outside replay the bot appends one line per rejected pool to
+`/app/data/rejected_paths.ndjson` 15 minutes after the rejection: the reject reason, the pool
+state at rejection, and 10-second buckets of the reserve price relative to it (high, low,
+close) with effective and raw quote reserves. It is offline evidence for proposing a threshold
+change under the decision rule above; it never feeds live state, and paths still open at a
+restart are not written.
+
 ## Statistical collection window
 
 The window is fixed before collection: start, OOS boundary on day 15, end on day 30. It cannot
