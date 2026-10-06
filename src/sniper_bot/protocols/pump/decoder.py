@@ -41,6 +41,8 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "migrate_bonding_curve_creator": "MigrateBondingCurveCreatorEvent",
     "distribute_creator_fees": "DistributeCreatorFeesEvent",
+    "collect_creator_fee": "CollectCreatorFeeEvent",
+    "collect_creator_fee_v2": "CollectCreatorFeeEvent",
     "buy": "TradeEvent",
     "buy_exact_sol_in": "TradeEvent",
     "buy_v2": "TradeEvent",

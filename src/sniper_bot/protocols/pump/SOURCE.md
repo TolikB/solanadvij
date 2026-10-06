@@ -46,3 +46,22 @@ contract tests; a native `buy_v3` observation is not claimed. Event `ix_name` is
 not an instruction discriminator. The IDL declares the ABI, not unconditional
 event completeness: existing body, Clock, parent, exact-one, log-prefix and
 buy-completion checks remain the runtime gate for every operation.
+
+## Reviewed ignored creator-fee collection
+
+The pinned IDL already declares `collect_creator_fee` (`1416567bc61cdb84`,
+no arguments, 5 accounts), `collect_creator_fee_v2` (`cf118af204221338`, no
+arguments, 10 accounts) and `CollectCreatorFeeEvent` (`7a027f010ebf0caf`). Its
+complete body is 80 bytes: `timestamp:i64`, `creator` pubkey, `creator_fee:u64`
+and `quote_mint` pubkey. An authentic truncated transaction (slot 453214987)
+contained an outer `buy_exact_quote_in_v2` and an outer `collect_creator_fee_v2`
+whose only own child was one complete direct `CollectCreatorFeeEvent` CPI after a
+token `transferChecked`.
+
+Recognize both collection operations in the truncated completeness contract
+without adding the event to the consumed set. Require its full body, Clock, own
+parent and exactly one CPI; reject short or trailing bytes. Trade identity,
+ordinal and the selected log-prefix proof remain unchanged. `collect_creator_fee`
+is supported from the same pinned ABI and synthetic contract tests; a native v1
+observation is not claimed. Ignoring this event in decoder selection does not
+imply that the instruction has no on-chain effects.
