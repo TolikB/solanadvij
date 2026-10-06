@@ -62,6 +62,8 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "sell": "SellEvent",
     "deposit": "DepositEvent",
     "withdraw": "WithdrawEvent",
+    "init_user_volume_accumulator": "InitUserVolumeAccumulatorEvent",
+    "sync_user_volume_accumulator": "SyncUserVolumeAccumulatorEvent",
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "claim_cashback": "ClaimCashbackEvent",
     "init_boost": "InitBoostEvent",

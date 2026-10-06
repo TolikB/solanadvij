@@ -60,3 +60,22 @@ without adding it to the consumed event set. Require its full body, Clock,
 own parent and exactly one CPI; reject short or trailing bytes. Create identity,
 ordinal and selected log-prefix proof remain unchanged. Ignoring this event in
 decoder selection does not imply that the instruction has no on-chain effects.
+
+## Reviewed ignored user volume accumulator controls
+
+The pinned IDL already declares `init_user_volume_accumulator`
+(`5e06ca73ff60e8b7`, no arguments, 6 accounts) with `InitUserVolumeAccumulatorEvent`
+(`86240d48e86582d8`; 72-byte body: `payer`, `user` pubkeys and `timestamp:i64`), and
+`sync_user_volume_accumulator` (`561fc057a3574fee`, no arguments, 5 accounts) with
+`SyncUserVolumeAccumulatorEvent` (`c57aa77c74515bff`; 56-byte body: `user` pubkey,
+`total_claimed_tokens_before:u64`, `total_claimed_tokens_after:u64`, `timestamp:i64`).
+An authentic truncated transaction (slot 453875673) contained a nested
+`init_user_volume_accumulator` with one complete direct CPI, beside the already
+reviewed sell, cashback claim, close and buy operations.
+
+Recognize both controls in the truncated completeness contract next to the reviewed
+`close_user_volume_accumulator`, without adding their events to the consumed set.
+Require the full body, Clock, own parent and exactly one CPI; reject short or trailing
+bytes. `sync_user_volume_accumulator` is supported from the same pinned ABI and
+synthetic contract tests; a native observation is not claimed. The Pump adapter
+recognizes the identical pinned definitions.

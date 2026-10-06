@@ -65,3 +65,14 @@ ordinal and the selected log-prefix proof remain unchanged. `collect_creator_fee
 is supported from the same pinned ABI and synthetic contract tests; a native v1
 observation is not claimed. Ignoring this event in decoder selection does not
 imply that the instruction has no on-chain effects.
+
+## Reviewed ignored user volume accumulator controls
+
+The pinned IDL declares `init_user_volume_accumulator` (`5e06ca73ff60e8b7`) with
+`InitUserVolumeAccumulatorEvent` (`86240d48e86582d8`, 72-byte body) and
+`sync_user_volume_accumulator` (`561fc057a3574fee`) with `SyncUserVolumeAccumulatorEvent`
+(`c57aa77c74515bff`, 56-byte body), identical to the PumpSwap definitions whose native
+`init_user_volume_accumulator` CPI was observed at slot 453875673 (see the PumpSwap
+SOURCE.md). Both are recognized beside the reviewed `close_user_volume_accumulator`
+under the same full-body, Clock, own-parent and exactly-one CPI contract, outside the
+consumed event set. Native Pump observations are not claimed.

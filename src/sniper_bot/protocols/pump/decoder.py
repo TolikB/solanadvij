@@ -38,6 +38,8 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
     "create_v2": "CreateEvent",
     "extend_account": "ExtendAccountEvent",
     "migrate_v2": "CompletePumpAmmMigrationEvent",
+    "init_user_volume_accumulator": "InitUserVolumeAccumulatorEvent",
+    "sync_user_volume_accumulator": "SyncUserVolumeAccumulatorEvent",
     "close_user_volume_accumulator": "CloseUserVolumeAccumulatorEvent",
     "migrate_bonding_curve_creator": "MigrateBondingCurveCreatorEvent",
     "distribute_creator_fees": "DistributeCreatorFeesEvent",
