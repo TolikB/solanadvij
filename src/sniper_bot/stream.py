@@ -1144,12 +1144,32 @@ def _transaction_protocols(transaction: dict[str, Any]) -> list[Protocol]:
         program_ids.update(instruction["programId"] for instruction in instructions
                            if isinstance(instruction, dict) and isinstance(instruction.get("programId"), str))
         if not program_ids.intersection({PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID}):
+            if _lists_every_instruction(outer, groups):
+                # Every executed instruction is listed and none belongs to a
+                # subscribed program, so none of their events can exist: the
+                # subscription matched a mere account mention.
+                return []
             # Recovery failed before any subscribed program became visible:
             # conservatively quarantine both instead of dropping the evidence.
             return [Protocol.PUMP, Protocol.PUMPSWAP]
     return [protocol for protocol, program_id in (
         (Protocol.PUMP, PUMP_PROGRAM_ID), (Protocol.PUMPSWAP, PUMPSWAP_PROGRAM_ID)
     ) if program_id in program_ids]
+
+
+def _lists_every_instruction(outer: Any, groups: Any) -> bool:
+    """Complete jsonParsed metadata: every outer and inner instruction names its program."""
+    if not isinstance(outer, list) or not isinstance(groups, list):
+        return False
+    instructions = list(outer)
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("instructions"), list):
+            return False
+        instructions.extend(group["instructions"])
+    return all(
+        isinstance(instruction, dict) and isinstance(instruction.get("programId"), str)
+        for instruction in instructions
+    )
 
 
 def _transaction_signature(transaction: dict[str, Any]) -> str | None:

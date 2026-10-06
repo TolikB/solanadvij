@@ -17,7 +17,7 @@ from ...events import (
     uses_event_id_v2,
 )
 from ...registry import target_mint_for_pool
-from ..anchor import AnchorDecodeError, AnchorIdlDecoder
+from ..anchor import AnchorDecodeError, AnchorIdlDecoder, EventContract, contract_events
 from ..pump.decoder import (
     DecodedTransaction,
     _log_messages,
@@ -52,7 +52,7 @@ PUMPSWAP_MINIMUM_FIELDS = {
 
 # Only these operation/event pairs have a completeness contract for truncated
 # logs. Every other own operation remains quarantined until explicitly reviewed.
-_TRUNCATION_INSTRUCTION_EVENTS: dict[str, str | None] = {
+_TRUNCATION_INSTRUCTION_EVENTS: dict[str, EventContract] = {
     "create_pool": "CreatePoolEvent",
     "buy": "BuyEvent",
     "buy_exact_quote_in": "BuyEvent",
@@ -79,6 +79,8 @@ _TRUNCATION_INSTRUCTION_EVENTS: dict[str, str | None] = {
     "update_admin": "UpdateAdminEvent",
     "update_creator_fee_config": "UpdateCreatorFeeConfigEvent",
     "update_fee_config": "UpdateFeeConfigEvent",
+    # Buys on the pool, then reports the burn: both direct CPIs, in this order.
+    "boost_buy_and_burn": ("BuyEvent", "BoostBuyAndBurnEvent"),
     "sweep_creator_fee": "SweepPoolFeeEvent",
     "sweep_protocol_fee": "SweepPoolFeeEvent",
     # Moves creator fees to the Pump vault without an event of its own;
@@ -89,8 +91,8 @@ _TRUNCATION_INSTRUCTION_EVENTS: dict[str, str | None] = {
 # Fee controls skip their event when there is nothing to move, so an ignored
 # control may prove zero or one CPI event; consumed operations still need one.
 _OPTIONAL_INSTRUCTIONS = frozenset(
-    name for name, event in _TRUNCATION_INSTRUCTION_EVENTS.items()
-    if event is not None and event not in PUMPSWAP_EVENT_NAMES
+    name for name, contract in _TRUNCATION_INSTRUCTION_EVENTS.items()
+    if contract_events(contract) and PUMPSWAP_EVENT_NAMES.isdisjoint(contract_events(contract))
 )
 # Published selectors from the officially recommended pump-rust-client 0.2.0;
 # trade event schemas match the pinned IDL and the sweep event, absent from

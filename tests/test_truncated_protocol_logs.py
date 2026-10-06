@@ -376,6 +376,36 @@ def test_truncation_without_program_identity_cannot_drop_evidence() -> None:
     ]
 
 
+def _mention_only() -> dict[str, Any]:
+    """Delivered for an account mention: complete metadata, no subscribed program ran."""
+    return {
+        "slot": 5, "transaction": {"signatures": ["mention"], "message": {
+            "accountKeys": [{"pubkey": PUMP_PROGRAM_ID, "source": "lookupTable"}],
+            "instructions": [{"programId": OTHER}, {"programId": OTHER}],
+        }},
+        "meta": {"err": None, "logMessages": [f"Program {OTHER} invoke [1]", "Log truncated"],
+                 "innerInstructions": [{"index": 1, "instructions": [{"programId": OTHER, "stackHeight": 2}]}]},
+    }
+
+
+def test_complete_metadata_without_a_subscribed_program_routes_nowhere() -> None:
+    assert _transaction_protocols(_mention_only()) == []
+
+
+@pytest.mark.parametrize("gap", ["no_inner_instructions", "unparsed_outer", "unparsed_inner", "invalid_group"])
+def test_incomplete_metadata_without_a_subscribed_program_still_quarantines_both(gap: str) -> None:
+    tx = _mention_only()
+    if gap == "no_inner_instructions":
+        tx["meta"]["innerInstructions"] = None
+    elif gap == "unparsed_outer":
+        tx["transaction"]["message"]["instructions"][0] = {"programIdIndex": 3, "data": "1"}
+    elif gap == "unparsed_inner":
+        tx["meta"]["innerInstructions"][0]["instructions"][0] = {"programIdIndex": 3, "stackHeight": 2}
+    else:
+        tx["meta"]["innerInstructions"][0] = {"index": 1}
+    assert _transaction_protocols(tx) == [Protocol.PUMP, Protocol.PUMPSWAP]
+
+
 def test_valid_unconsumed_close_event_does_not_change_selected_prefix() -> None:
     tx = _truncated()
     anchor = PumpSwapDecoder()._anchor
@@ -795,7 +825,7 @@ def test_legacy_migration_preserves_existing_log_identity_and_rejects_missing_su
 
 @pytest.mark.parametrize("failure", [
     "missing_migration_cpi", "extra_migration_cpi", "short_body", "wrong_clock",
-    "wrong_event", "wrong_parent", "unknown_late_operation", "legacy_migrate", "failed_transaction",
+    "wrong_event", "wrong_parent", "unknown_late_operation", "failed_transaction",
 ])
 def test_v2_migration_contract_rejects_incomplete_or_unreviewed_evidence(failure: str) -> None:
     tx = _v2(_pump_migration())
@@ -818,14 +848,25 @@ def test_v2_migration_contract_rejects_incomplete_or_unreviewed_evidence(failure
         tx["transaction"]["message"]["instructions"].append({
             "programId": PUMP_PROGRAM_ID, "data": _base58_encode(bytes([255]) * 8),
         })
-    elif failure == "legacy_migrate":
-        definition = next(item for item in PumpDecoder()._anchor.idl["instructions"] if item["name"] == "migrate")
-        tx["transaction"]["message"]["instructions"][2]["data"] = _base58_encode(bytes(definition["discriminator"]))
     elif failure == "failed_transaction":
         tx["meta"]["err"] = True
     with pytest.raises(AnchorDecodeError):
         PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES).decode(tx)
 
+
+
+def test_legacy_migrate_proves_the_same_migration_contract() -> None:
+    """Observed natively in a truncated mainnet transaction; same IDL docs and event as migrate_v2."""
+    tx = _v2(_pump_migration())
+    expected = PumpDecoder().decode(_without_marker(tx)).events
+    tx["meta"]["logMessages"] = ["Log truncated"]
+    definition = next(item for item in PumpDecoder()._anchor.idl["instructions"] if item["name"] == "migrate")
+    tx["transaction"]["message"]["instructions"][2]["data"] = _base58_encode(bytes(definition["discriminator"]))
+    actual = PumpDecoder().decode(tx).events
+    assert [event.event_id for event in actual] == [event.event_id for event in expected]
+    tx["meta"]["innerInstructions"][0]["instructions"].pop()
+    with pytest.raises(AnchorDecodeError, match="do not cover"):
+        PumpDecoder().decode(tx)
 
 
 def _pump_trade_close() -> dict[str, Any]:

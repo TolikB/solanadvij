@@ -22,7 +22,7 @@ import pytest
 from scripts.benchmark_postgres_capacity import BorshEventEncoder
 from sniper_bot.events import EVENT_ID_V2_CUTOVER_SLOT
 from sniper_bot.protocols import AnchorDecodeError
-from sniper_bot.protocols.anchor import AnchorIdlDecoder, _base58_decode, _base58_encode
+from sniper_bot.protocols.anchor import AnchorIdlDecoder, _base58_decode, _base58_encode, contract_events
 from sniper_bot.protocols.pump import PUMP_PROGRAM_ID, PumpDecoder
 from sniper_bot.protocols.pump import decoder as pump_decoder
 from sniper_bot.protocols.pumpswap import PUMPSWAP_PROGRAM_ID, PumpSwapDecoder
@@ -44,7 +44,7 @@ CASES = [
     (protocol, operation, event)
     for protocol, (_, _, module, consumed) in PROTOCOLS.items()
     for operation, event in sorted(module._TRUNCATION_INSTRUCTION_EVENTS.items())
-    if event is not None and event not in consumed
+    if isinstance(event, str) and event not in consumed
 ]
 EVENTLESS = [
     (protocol, operation)
@@ -52,7 +52,12 @@ EVENTLESS = [
     for operation, event in sorted(module._TRUNCATION_INSTRUCTION_EVENTS.items())
     if event is None
 ]
-CONSUMED = [("pump", "buy", "TradeEvent"), ("pumpswap", "buy", "BuyEvent"), ("pumpswap", "create_pool", "CreatePoolEvent")]
+CONSUMED = [
+    ("pump", "buy", "TradeEvent"), ("pump", "create", "CreateEvent"), ("pump", "create_v2", "CreateEvent"),
+    ("pump", "migrate", "CompletePumpAmmMigrationEvent"), ("pump", "migrate_v2", "CompletePumpAmmMigrationEvent"),
+    ("pumpswap", "buy", "BuyEvent"), ("pumpswap", "create_pool", "CreatePoolEvent"),
+    ("pumpswap", "boost_buy_and_burn", "BuyEvent"),
+]
 
 
 def _anchor(protocol: str) -> AnchorIdlDecoder:
@@ -91,14 +96,15 @@ def _event_payload(protocol: str, event: str) -> bytes:
     return discriminator + body
 
 
-def _fixture(protocol: str, operation: str, payload: bytes | None) -> dict[str, Any]:
+def _fixture(protocol: str, operation: str, payload: bytes | None, *more: bytes) -> dict[str, Any]:
     program = PROTOCOLS[protocol][1]
     inner: list[dict[str, Any]] = [
         {"programId": program, "stackHeight": 2, "data": _base58_encode(_selector(protocol, operation))},
         {"programId": OTHER, "stackHeight": 3},
     ]
-    if payload is not None:
-        inner.append({"programId": program, "stackHeight": 3, "data": _base58_encode(TAG + payload)})
+    for item in (payload, *more):
+        if item is not None:
+            inner.append({"programId": program, "stackHeight": 3, "data": _base58_encode(TAG + item)})
     return {
         "slot": EVENT_ID_V2_CUTOVER_SLOT + 1, "blockTime": TIMESTAMP,
         "transaction": {"signatures": [_base58_encode(bytes([5]) * 64)], "message": {
@@ -118,11 +124,12 @@ def test_every_reviewed_operation_names_a_known_instruction_and_event() -> None:
     assert len(CASES) >= 40 and len(EVENTLESS) >= 2
     for protocol, (_, _, module, consumed) in PROTOCOLS.items():
         anchor = _anchor(protocol)
-        for operation, event in module._TRUNCATION_INSTRUCTION_EVENTS.items():
+        for operation, contract in module._TRUNCATION_INSTRUCTION_EVENTS.items():
+            events = contract_events(contract)
             assert _selector(protocol, operation)
-            assert event is None or event in set(anchor._events.values())
-            # Only ignored controls may skip their event.
-            assert (operation in module._OPTIONAL_INSTRUCTIONS) == (event is not None and event not in consumed)
+            assert set(events) <= set(anchor._events.values())
+            # Only ignored controls may skip their events.
+            assert (operation in module._OPTIONAL_INSTRUCTIONS) == (bool(events) and consumed.isdisjoint(events))
 
 
 def _dating_cases() -> list[tuple[str, str, str, bool]]:
@@ -229,3 +236,60 @@ def test_supplemental_events_cannot_shadow_the_pinned_idl(collision: str) -> Non
     }[collision]
     with pytest.raises(AnchorDecodeError, match="invalid supplemental event contract"):
         AnchorIdlDecoder(path, supplemental_events=dict([entry]))
+
+
+def _encoded(protocol: str, event: str, **fields: Any) -> bytes:
+    encoder = BorshEventEncoder(ROOT / protocol / "idl.json")
+    return base64.b64decode(encoder.encode(event, {"timestamp": TIMESTAMP, **fields}))
+
+
+@pytest.mark.parametrize("order", ["contract", "reversed", "missing_burn", "missing_buy", "extra_burn", "neither"])
+def test_boost_buy_and_burn_proves_its_ordered_buy_and_burn(order: str) -> None:
+    from sniper_bot.registry import WSOL_MINT
+
+    buy = _encoded("pumpswap", "BuyEvent", quote_mint=WSOL_MINT) if "quote_mint" in {
+        field["name"] for field in _event_fields("pumpswap", "BuyEvent")} else _encoded("pumpswap", "BuyEvent")
+    burn = _encoded("pumpswap", "BoostBuyAndBurnEvent")
+    payloads = {
+        "contract": (buy, burn), "reversed": (burn, buy), "missing_burn": (buy,), "missing_buy": (burn,),
+        "extra_burn": (buy, burn, burn), "neither": (),
+    }[order]
+    tx = _fixture("pumpswap", "boost_buy_and_burn", *payloads) if payloads else _fixture(
+        "pumpswap", "boost_buy_and_burn", None)
+    assert "boost_buy_and_burn" not in pumpswap_decoder._OPTIONAL_INSTRUCTIONS
+    if order == "contract":
+        decoded = PumpSwapDecoder().decode(tx)
+        assert [event.event_type.value for event in decoded.events] == ["swap_buy"]
+        assert decoded.events[0].inner_instruction_index == 2
+        assert PumpSwapDecoder(event_names=frozenset()).decode(tx).events == []
+        return
+    for selection in (pumpswap_decoder.PUMPSWAP_EVENT_NAMES, frozenset()):
+        with pytest.raises(AnchorDecodeError):
+            PumpSwapDecoder(event_names=selection).decode(tx)
+
+
+@pytest.mark.parametrize("case", ["completion", "completion_without_complete", "complete_after_plain_buy",
+                                  "sell_at_zero_reserves"])
+def test_completing_buy_must_then_prove_the_completion(case: str) -> None:
+    completing = case != "complete_after_plain_buy"
+    trade = _encoded("pump", "TradeEvent", is_buy=case != "sell_at_zero_reserves",
+                     real_token_reserves=0 if completing else 10, ix_name="buy")
+    complete = _encoded("pump", "CompleteEvent")
+    payloads = {
+        "completion": (trade, complete), "completion_without_complete": (trade,),
+        "complete_after_plain_buy": (trade, complete), "sell_at_zero_reserves": (trade,),
+    }[case]
+    tx = _fixture("pump", "buy", *payloads)
+    if case == "completion":
+        decoded = PumpDecoder().decode(tx)
+        assert [event.event_type.value for event in decoded.events] == ["swap_buy", "bonding_curve_completed"]
+        state = PumpDecoder(event_names=pump_decoder.PUMP_STATE_EVENT_NAMES).decode(tx)
+        assert [event.event_type.value for event in state.events] == ["bonding_curve_completed"]
+        return
+    if case == "sell_at_zero_reserves":
+        decoded = PumpDecoder().decode(tx)
+        assert [event.event_type.value for event in decoded.events] == ["swap_sell"]
+        return
+    for selection in (pump_decoder.PUMP_EVENT_NAMES, frozenset()):
+        with pytest.raises(AnchorDecodeError):
+            PumpDecoder(event_names=selection).decode(tx)

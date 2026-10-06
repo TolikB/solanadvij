@@ -105,3 +105,10 @@ own (none in 4 native cases) and must prove none.
 `bucket:u8`). Fourteen native CPIs matched that layout byte for byte. Anchor
 selectors hash only the instruction name, so both programs share the sweep
 selectors; each decoder binds them to its own program and event.
+
+## Sequenced boost buy-and-burn
+
+`boost_buy_and_burn` emits two direct CPIs, `BuyEvent` then `BoostBuyAndBurnEvent`
+(11 of 11 native cases). Its contract is that exact ordered pair. The `BuyEvent` is
+consumed like any pool buy, so the operation is never optional, and a reversed,
+partial or extra sequence fails closed.

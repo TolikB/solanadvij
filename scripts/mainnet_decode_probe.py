@@ -4,8 +4,15 @@ Run inside the release image before a record calibration. It finds the
 transactions the stream would quarantine (an unreviewed operation, a CPI
 contract mismatch, a layout change) in minutes instead of failing a 24-hour
 window on the first one. Read-only: getSlot and getBlock through the configured
-Helius RPC, whose URL is never printed. Exits 1 when any successful routed
-transaction fails to decode, and writes a report with up to 20 such transactions.
+Helius RPC, whose URL is never printed.
+
+Only transactions the stream would receive are decoded: successful ones that
+mention a subscribed program among their account keys, as logsSubscribe
+``mentions`` does. Every complete delivered transaction is decoded a second
+time with its logs cut in half, so any operation seen in the sample is also
+checked against the truncated-log CPI contract it would meet on a long day.
+Exits 1 when any real or synthetic decode fails, and writes a report with up to
+three such transactions of every failure shape.
 
     python scripts/mainnet_decode_probe.py --blocks 1500 --hours 24 --output probe.json
 """
@@ -30,14 +37,17 @@ from sniper_bot.config import AppConfig
 from sniper_bot.events import Protocol
 from sniper_bot.protocols import AnchorDecodeError
 from sniper_bot.protocols.anchor import _base58_decode
-from sniper_bot.protocols.pump.decoder import PUMP_STATE_EVENT_NAMES, PumpDecoder
-from sniper_bot.protocols.pumpswap.decoder import PumpSwapDecoder
+from sniper_bot.protocols.pump.decoder import PUMP_PROGRAM_ID, PUMP_STATE_EVENT_NAMES, PumpDecoder
+from sniper_bot.protocols.pumpswap.decoder import PUMPSWAP_PROGRAM_ID, PumpSwapDecoder
 from sniper_bot.stream import _transaction_protocols
+
+_SUBSCRIBED = frozenset({PUMP_PROGRAM_ID, PUMPSWAP_PROGRAM_ID})
 
 _EVENT_TAG = bytes.fromhex("e445a52e51cb9a1d")
 _SLOT_SECONDS = 0.4
 _UNAVAILABLE_SLOT_CODES = {-32004, -32007, -32009}
-MAX_KEPT_FAILURES = 20
+MAX_KEPT_PER_SHAPE = 3
+MAX_KEPT_FAILURES = 60
 
 
 def _operations(decoder: Any, transaction: dict[str, Any]) -> list[str]:
@@ -60,22 +70,34 @@ def _operations(decoder: Any, transaction: dict[str, Any]) -> list[str]:
     return operations
 
 
+def mentions_subscribed_program(transaction: dict[str, Any]) -> bool:
+    """logsSubscribe ``mentions``: any static or lookup-loaded account key."""
+    message = (transaction.get("transaction") or {}).get("message") or {}
+    keys = {key.get("pubkey") if isinstance(key, dict) else key for key in message.get("accountKeys") or []}
+    loaded = (transaction.get("meta") or {}).get("loadedAddresses") or {}
+    keys.update(loaded.get("writable") or [])
+    keys.update(loaded.get("readonly") or [])
+    return not _SUBSCRIBED.isdisjoint(keys)
+
+
+def synthetic_truncation(transaction: dict[str, Any]) -> dict[str, Any] | None:
+    """The same complete transaction as if its logs had stopped halfway."""
+    meta = transaction.get("meta") or {}
+    logs = meta.get("logMessages") or []
+    if not logs or "Log truncated" in logs:
+        return None
+    return {**transaction, "meta": {**meta, "logMessages": [*logs[: len(logs) // 2], "Log truncated"]}}
+
+
 def decode_report(transactions: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Decode exactly as the pipeline does: route, then one decoder per protocol."""
     decoders = {Protocol.PUMP: PumpDecoder(event_names=PUMP_STATE_EVENT_NAMES), Protocol.PUMPSWAP: PumpSwapDecoder()}
     counts: Counter[str] = Counter()
     shapes: Counter[str] = Counter()
     kept: list[dict[str, Any]] = []
-    for transaction in transactions:
-        meta = transaction.get("meta") or {}
-        if meta.get("err") is not None:
-            continue
-        protocols = _transaction_protocols(transaction)
-        if not protocols:
-            continue
-        counts["routed"] += 1
-        counts["truncated"] += "Log truncated" in (meta.get("logMessages") or [])
-        for protocol in protocols:
+
+    def decode(transaction: dict[str, Any], kind: str) -> None:
+        for protocol in _transaction_protocols(transaction):
             decoder = decoders[protocol]
             try:
                 decoder.decode(transaction)
@@ -84,13 +106,25 @@ def decode_report(transactions: Iterable[dict[str, Any]]) -> dict[str, Any]:
             except Exception as error:  # the pipeline would crash rather than quarantine
                 reason = f"unexpected {type(error).__name__}"
             else:
-                counts[f"decoded_{protocol.value}"] += 1
+                counts[f"{kind}_decoded_{protocol.value}"] += 1
                 continue
-            counts["failures"] += 1
-            shape = f"{protocol.value}: {reason} | {_operations(decoder, transaction)}"
+            counts[f"{kind}_failures"] += 1
+            shape = f"{kind} {protocol.value}: {reason} | {_operations(decoder, transaction)}"
             shapes[shape] += 1
-            if len(kept) < MAX_KEPT_FAILURES:
+            if shapes[shape] <= MAX_KEPT_PER_SHAPE and len(kept) < MAX_KEPT_FAILURES:
                 kept.append({"shape": shape, "transaction": transaction})
+
+    for transaction in transactions:
+        meta = transaction.get("meta") or {}
+        if meta.get("err") is not None or not mentions_subscribed_program(transaction):
+            continue
+        counts["delivered"] += 1
+        counts["truncated"] += "Log truncated" in (meta.get("logMessages") or [])
+        decode(transaction, "real")
+        synthetic = synthetic_truncation(transaction)
+        if synthetic is not None:
+            decode(synthetic, "synthetic")
+    counts["failures"] = counts["real_failures"] + counts["synthetic_failures"]
     return {"counts": dict(counts), "failure_shapes": dict(shapes.most_common()), "failures": kept}
 
 

@@ -80,8 +80,12 @@ with the release's own decoders:
 
     docker compose -p solanadvij --env-file .env run --rm --no-deps -T       -v "$PWD/artifacts:/app/probe" --entrypoint python sniper-bot       scripts/mainnet_decode_probe.py --blocks 1500 --hours 24 --output /app/probe/decode-probe.json
 
-It exits 1 and groups every transaction the stream would quarantine by cause
-and operation sequence. Start the calibration only on a clean probe.
+It decodes only what the stream would receive (successful transactions that
+mention a subscribed program among their account keys), and decodes every
+complete one again with its logs cut in half, so any operation in the sample is
+checked against the truncated-log contract. It exits 1 and groups every real or
+synthetic quarantine by cause and operation sequence. Start the calibration only
+on a clean probe.
 
 ## Calibration decisions
 

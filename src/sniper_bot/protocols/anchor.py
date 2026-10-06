@@ -15,6 +15,19 @@ class AnchorDecodeError(ValueError):
     pass
 
 
+# The direct event CPIs a reviewed operation emits: one event, an ordered tuple
+# of several, or None for an operation without an event of its own.
+EventContract = str | tuple[str, ...] | None
+
+
+def contract_events(contract: EventContract) -> tuple[str, ...]:
+    if contract is None:
+        return ()
+    if isinstance(contract, str):
+        return (contract,)
+    return tuple(contract)
+
+
 class UnknownDiscriminatorError(AnchorDecodeError):
     def __init__(self, program_id: str, discriminator: bytes) -> None:
         self.program_id = program_id
@@ -205,30 +218,35 @@ class AnchorIdlDecoder:
         logs: list[str],
         *,
         event_names: frozenset[str],
-        instruction_events: Mapping[str, str | None],
+        instruction_events: Mapping[str, EventContract],
         supplemental_instructions: Mapping[bytes, str] | None = None,
         minimum_fields: Mapping[str, str] | None = None,
         event_validator: Callable[[str, dict[str, Any]], None] | None = None,
         recover_missing: bool = False,
         optional_instructions: frozenset[str] = frozenset(),
+        required_followers: Callable[[str, dict[str, Any]], tuple[str, ...]] | None = None,
     ) -> AnchorLogScan:
         """Prove ordered event completeness from successful jsonParsed metadata.
 
-        Each reviewed own operation must contain exactly its expected event CPI.
-        An operation in ``optional_instructions`` may instead emit none (fee
-        controls skip their event when there is nothing to move), and one mapped
-        to ``None`` has no event of its own and must emit none; neither may be
-        an operation whose event is selected. Every body is validated, including
-        ignored events. Available selected logs must match the ordered CPI
-        prefix byte-for-byte with multiplicity. Only a caller using v2 identity
-        may recover a missing suffix; recovered events carry genuine CPI
-        coordinates instead of a guessed log index.
+        Each reviewed own operation must contain exactly its expected direct
+        event CPIs, in order: one event, or a tuple for an operation that emits
+        several. ``required_followers`` may require more events after one it
+        has just seen (a buy that completes a curve must then emit the
+        completion). An operation in ``optional_instructions`` may instead emit
+        none (fee controls skip their event when there is nothing to move), and
+        one mapped to ``None`` has no event of its own and must emit none;
+        neither may be an operation with a selected event. Every body is
+        validated, including ignored events. Available selected logs must match
+        the ordered CPI prefix byte-for-byte with multiplicity. Only a caller
+        using v2 identity may recover a missing suffix; recovered events carry
+        genuine CPI coordinates instead of a guessed log index.
 
         Supplemental ABI selectors require an explicit known event contract and
         cannot shadow the vendored instructions or the reserved event CPI tag.
         """
         if any(
-            name not in instruction_events or instruction_events[name] in event_names
+            name not in instruction_events
+            or not event_names.isdisjoint(contract_events(instruction_events[name]))
             for name in optional_instructions
         ):
             raise AnchorDecodeError("invalid optional instruction contract")
@@ -279,11 +297,12 @@ class AnchorIdlDecoder:
                 or not isinstance(instruction_name, str)
                 or not instruction_name.strip()
                 or instruction_name in names.values()
-                or instruction_events.get(instruction_name) not in self._events.values()
+                or not contract_events(instruction_events.get(instruction_name))
+                or not set(contract_events(instruction_events.get(instruction_name))) <= set(self._events.values())
             ):
                 raise AnchorDecodeError("invalid supplemental instruction contract")
             names[discriminator] = instruction_name
-        expected: list[str | None] = []
+        expected: list[list[str]] = []
         emitted: list[int] = []
         may_skip: list[bool] = []
         selected: list[bytes] = []
@@ -315,8 +334,13 @@ class AnchorIdlDecoder:
                         if len(payload) < 16:
                             raise AnchorDecodeError("truncated Anchor CPI event payload")
                         parent = stack[-1][2]
+                        sequence = expected[parent]
                         event_name = self._events.get(payload[8:16])
-                        if event_name is None or event_name != expected[parent] or emitted[parent]:
+                        if (
+                            event_name is None
+                            or emitted[parent] >= len(sequence)
+                            or event_name != sequence[emitted[parent]]
+                        ):
                             raise AnchorDecodeError("CPI event does not cover its parent operation")
                         emitted[parent] += 1
                         minimum = (minimum_fields or {}).get(event_name)
@@ -327,6 +351,8 @@ class AnchorIdlDecoder:
                             fields, trailing = self._decode_struct_from_minimum(event_name, payload[16:], minimum)
                         if event_validator is not None:
                             event_validator(event_name, fields)
+                        if required_followers is not None:
+                            sequence.extend(required_followers(event_name, fields))
                         if type(fields.get("timestamp")) is int:
                             timestamps.append(fields["timestamp"])
                         if event_name in event_names:
@@ -342,13 +368,14 @@ class AnchorIdlDecoder:
                         if not isinstance(name, str) or name not in instruction_events:
                             raise AnchorDecodeError("unverified own operation in truncated transaction")
                         operation = len(expected)
-                        expected.append(instruction_events[name])
+                        contract = list(contract_events(instruction_events[name]))
+                        expected.append(contract)
                         emitted.append(0)
-                        may_skip.append(name in optional_instructions or instruction_events[name] is None)
+                        may_skip.append(name in optional_instructions or not contract)
                 stack.append((height, program_id, operation))
         if not expected or any(
-            count != 1 and not (count == 0 and skippable)
-            for count, skippable in zip(emitted, may_skip, strict=True)
+            count != len(sequence) and not (count == 0 and skippable)
+            for sequence, count, skippable in zip(expected, emitted, may_skip, strict=True)
         ):
             raise AnchorDecodeError("CPI events do not cover truncated transaction operations")
         logged: list[bytes] = []

@@ -120,3 +120,25 @@ above) publishes it with `sweep_protocol_fee` (`0830be07b644b7e5`) and
 `bucket:u8`). Eleven native CPIs matched that layout byte for byte. The event is
 registered as a supplemental event that cannot shadow a pinned event, type or the
 CPI tag, and both sweeps are optional ignored controls.
+
+## Completion, legacy create/migrate and the delivery filter
+
+The pre-calibration probe now decodes every complete delivered transaction a second
+time with its logs cut in half, so each operation in the sample also meets the
+truncated-log contract. That showed a buy that empties the curve emitting
+`TradeEvent` and then `CompleteEvent` as direct CPIs of the same operation. Such a
+buy previously always failed closed when truncated ("requires a separate CPI
+contract"). A completing buy (`is_buy` with `real_token_reserves == 0`) now must
+prove `CompleteEvent` as its next direct CPI; without it the transaction still fails
+closed, and a completion after a plain buy is rejected.
+
+A native `migrate` appeared in a truncated transaction. It shares the documentation
+and accounts of `migrate_v2`, so it carries the same exactly-one
+`CompletePumpAmmMigrationEvent` contract; `create` (classic SPL) carries the
+exactly-one `CreateEvent` contract of `create_v2`. Both events are consumed.
+
+The stream subscribes with `logsSubscribe` `mentions`, which matches any account key.
+A truncated transaction that merely mentions a subscribed program was routed to both
+protocols and quarantined them even when complete jsonParsed metadata proved neither
+program ran. With every outer and inner instruction listed, such a transaction now
+routes nowhere; with incomplete metadata it still quarantines both.

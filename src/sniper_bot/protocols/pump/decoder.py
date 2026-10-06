@@ -17,7 +17,7 @@ from ...events import (
     Protocol,
     uses_event_id_v2,
 )
-from ..anchor import AnchorDecodeError, AnchorIdlDecoder, AnchorLogScan
+from ..anchor import AnchorDecodeError, AnchorIdlDecoder, AnchorLogScan, EventContract, contract_events
 
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 ADAPTER_VERSION = "pump-idl-cb188ce"
@@ -34,9 +34,11 @@ PUMP_EVENT_NAMES = frozenset(_EVENT_TYPES)
 PUMP_STATE_EVENT_NAMES = PUMP_EVENT_NAMES - {"TradeEvent"}
 # Each reviewed truncated operation requires exactly its expected CPI event.
 # Additional completion events or other operations still fail closed.
-_TRUNCATION_INSTRUCTION_EVENTS = {
+_TRUNCATION_INSTRUCTION_EVENTS: dict[str, EventContract] = {
+    "create": "CreateEvent",
     "create_v2": "CreateEvent",
     "extend_account": "ExtendAccountEvent",
+    "migrate": "CompletePumpAmmMigrationEvent",
     "migrate_v2": "CompletePumpAmmMigrationEvent",
     "init_user_volume_accumulator": "InitUserVolumeAccumulatorEvent",
     "sync_user_volume_accumulator": "SyncUserVolumeAccumulatorEvent",
@@ -76,7 +78,8 @@ _TRUNCATION_INSTRUCTION_EVENTS = {
 # Fee controls skip their event when there is nothing to move, so an ignored
 # control may prove zero or one CPI event; consumed operations still need one.
 _OPTIONAL_INSTRUCTIONS = frozenset(
-    name for name, event in _TRUNCATION_INSTRUCTION_EVENTS.items() if event not in PUMP_EVENT_NAMES
+    name for name, contract in _TRUNCATION_INSTRUCTION_EVENTS.items()
+    if contract_events(contract) and PUMP_EVENT_NAMES.isdisjoint(contract_events(contract))
 )
 # These selectors are published by the officially recommended pump-rust-client
 # 0.2.0. Its trade event schemas match the pinned IDL; the sweep event is
@@ -100,6 +103,16 @@ _SUPPLEMENTAL_EVENTS: Mapping[bytes, tuple[str, Mapping[str, Any]]] = MappingPro
         {"name": "bucket", "type": "u8"},
     ]}),
 })
+
+
+def _completion_follows(name: str, fields: dict[str, Any]) -> tuple[str, ...]:
+    """A buy that empties the curve's real token reserves completes it, and the
+    same operation then emits the completion as its next direct CPI."""
+    if name == "TradeEvent" and fields["is_buy"] and fields["real_token_reserves"] == 0:
+        return ("CompleteEvent",)
+    return ()
+
+
 # Last field of each consumed event as deployed at pump-public-docs 9c82f61.
 # Pump extends events by appending fields, so older payloads end here and
 # newer ones carry more; both decode.
@@ -203,17 +216,13 @@ class PumpDecoder:
         # Count each event type before the caller's selection/admission filters.
         event_names = PUMP_EVENT_NAMES if v2 else self._event_names
         if "Log truncated" in logs:
-            def validate_event(name: str, fields: dict[str, Any]) -> None:
-                if name == "TradeEvent" and fields["is_buy"] and fields["real_token_reserves"] == 0:
-                    raise AnchorDecodeError("truncated Pump completion requires a separate CPI contract")
-
             scan = self._anchor.scan_verified_cpi_events(
                 transaction, logs, event_names=event_names,
                 instruction_events=_TRUNCATION_INSTRUCTION_EVENTS,
                 supplemental_instructions=_SUPPLEMENTAL_INSTRUCTIONS,
                 minimum_fields=PUMP_MINIMUM_FIELDS, recover_missing=v2,
-                event_validator=validate_event,
                 optional_instructions=_OPTIONAL_INSTRUCTIONS,
+                required_followers=_completion_follows,
             )
         else:
             scan = self._anchor.scan_logs(
