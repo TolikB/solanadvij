@@ -80,14 +80,20 @@ def test_every_ignored_control_names_a_declared_instruction_and_event() -> None:
         assert event in set(anchor._events.values())
 
 
-@pytest.mark.parametrize(("protocol", "operation", "event"), CASES)
-@pytest.mark.parametrize("block_time_present", [True, False])
+def _dating_cases() -> list[tuple[str, str, str, bool]]:
+    # An event without a Clock field cannot date a transaction lacking blockTime.
+    return [
+        (protocol, operation, event, block_time_present)
+        for protocol, operation, event in CASES
+        for block_time_present in (True, False)
+        if block_time_present or "timestamp" in _event_fields(protocol, event)
+    ]
+
+
+@pytest.mark.parametrize(("protocol", "operation", "event", "block_time_present"), _dating_cases())
 def test_ignored_control_alone_is_dated_by_its_cpi_without_state(
     protocol: str, operation: str, event: str, block_time_present: bool,
 ) -> None:
-    dated = "timestamp" in _event_fields(protocol, event)
-    if not block_time_present and not dated:
-        pytest.skip("an event without a Clock field cannot date the transaction")
     tx = _fixture(protocol, operation, event)
     if not block_time_present:
         del tx["blockTime"]
